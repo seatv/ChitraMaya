@@ -1,0 +1,33 @@
+# ChitraMaya pyproject.toml
+# This file declares package metadata and the ChitraMaya entry point only.
+# Runtime dependencies are defined in requirements.txt (see comments
+# there for why — primarily, PEP 621's [project.dependencies] array
+# cannot express --extra-index-url for the +cu128 PyTorch wheels we
+# require).
+#
+# Standard install:
+#   pip install -r requirements.txt
+#   pip install -e . --no-deps
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chitramaya"
+version = "0.1.0"
+description = "TensorRT-based face swapping pipeline — Rope schemes, modern stack"
+requires-python = ">=3.11"
+# Runtime dependencies are managed in requirements.txt, not here.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "polygraphy",
+]
+
+[project.scripts]
+chitramaya = "chitramaya.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["chitramaya*"]

@@ -1,0 +1,61 @@
+# ChitraMaya requirements
+# Authoritative runtime dependency list. pyproject.toml only declares
+# package metadata and the ChitraMaya entry point; runtime deps live here
+# so we can express the cu128 wheel index, hard pins, and version
+# ceilings that PEP 621 dependency syntax can't.
+#
+# Tested with Python 3.12, CUDA 12.8, PyTorch 2.11 (cu128), TensorRT 10.15.
+# Install: pip install -r requirements.txt && pip install -e . --no-deps
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# ── PyTorch (CUDA 12.8 build) ─────────────────────────────────────────
+# Hard-pinned to the cu128 wheels. The extra-index above serves them;
+# pip picks them over PyPI's CPU-only wheels because the cu128 versions
+# appear first in resolution.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# ── TensorRT + Torch-TensorRT ─────────────────────────────────────────
+# `tensorrt` is the umbrella package; it pulls tensorrt_cu13_bindings and
+# tensorrt_cu13_libs automatically. torch_tensorrt is required to load
+# the BasicVSR++ sub-engines (registers __torch__.torch.classes.tensorrt
+# .Engine for torch.export.load). TRT pinned to 10.15.x — 10.16 has not
+# been validated against the venv stack yet.
+tensorrt>=10.15.1,<10.16.0
+torch_tensorrt==2.11.0
+
+# ── CUDA runtime bindings (validate-inference helper) ─────────────────
+# Used by tools/convert_models.py to allocate device buffers and streams
+# for the post-build engine smoke test. Required to avoid PyTorch+TRT
+# CUDA-context mixing, which produces a process-killing Access Violation
+# on Blackwell (sm_120) under TRT 10.15.
+cuda-python>=12.0
+
+# ── Video codec (NVDEC / NVENC) ───────────────────────────────────────
+PyNvVideoCodec>=2.1
+
+# ── YOLO mosaic detector ──────────────────────────────────────────────
+ultralytics>=8.4
+
+# ── ONNX Runtime (for InferenceBackend = ort_cuda / ort_trt) ──────────
+# Required even if you stay on the TensorRT path — used inside
+# ChitraMaya/swap/engine.py for the face-swap ORT backends.
+onnxruntime-gpu>=1.26
+
+# ── Model conversion / sanitisation ───────────────────────────────────
+onnx>=1.21
+protobuf>=4.23
+
+# ── Image processing ──────────────────────────────────────────────────
+opencv-python>=4.13
+scikit-image>=0.26
+numpy>=2.4
+pillow>=11.0
+
+# ── UI / server ───────────────────────────────────────────────────────
+Flask>=3.1
+pywebview>=6.2
+
+# ── CLI progress bars (mosaic pipeline + batch mode) ──────────────────
+tqdm>=4.67
