@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChitraMaya</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/swap.css">
+</head>
+<body>
+
+<div class="app" id="appRoot">
+
+  <!-- ── Top Header Bar ─────────────────────────────────── -->
+  <div class="app-header">
+    <span class="header-spacer"></span>
+    <span class="logo">ChitraMaya</span>
+    <span class="header-spacer"></span>
+    <div class="config-menu-wrap">
+      <button class="header-btn" id="configBtn" title="Configuration">⚙️</button>
+      <div class="config-menu hidden" id="configMenu">
+        <button class="config-menu-item" id="cfgSave">💾 Save Settings</button>
+        <button class="config-menu-item" id="cfgLoad">📂 Load Settings</button>
+        <button class="config-menu-item" id="cfgReset">🔄 Reset Defaults</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main Three-Panel Content ───────────────────────── -->
+  <div class="main-content">
+
+    <!-- ── LEFT: Source Face Library ─────────────────────── -->
+    <div class="left-panel">
+      <div class="panel-header">
+        <button class="header-btn" id="facesBtn" title="Select faces folder">📁 Faces</button>
+        <input type="text" class="panel-path" id="facesPath" placeholder="Faces folder..."
+               title="Paste folder path and press Enter">
+        <span id="faceCount" style="font-size:11px; color:var(--text-dim);"></span>
+      </div>
+
+      <div class="face-grid" id="faceGrid">
+        <!-- Face cards populated by JS -->
+        <div class="drop-zone" id="facesDrop" style="grid-column: 1/-1; padding: 20px;">
+          <div class="icon">🧑</div>
+          <div class="sublabel">Set faces folder above</div>
+        </div>
+      </div>
+
+      <div class="left-panel-footer">
+        <div class="left-footer-row">
+          <button class="header-btn" id="outputBtn" title="Select output folder">📁 Output</button>
+          <input type="text" class="left-footer-path" id="outputPath" placeholder="Output folder..."
+                 title="Paste path and press Enter">
+        </div>
+        <div class="left-footer-row">
+          <button class="header-btn" id="tempBtn" title="Select temp folder">📁 Temp</button>
+          <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp folder..."
+                 title="Paste path and press Enter">
+        </div>
+      </div>
+    </div>
+
+    <!-- ── CENTER: Video / Preview ──────────────────────── -->
+    <div class="center-panel">
+
+      <!-- Face carousel strip -->
+      <div class="face-strip" id="faceStrip">
+
+        <!-- Apply to All (acts on Source assignment) -->
+        <div class="strip-action-col">
+          <button class="strip-action-btn" id="applyAllBtn" disabled
+                  title="Apply selected source to all targets">Apply<br>to All</button>
+        </div>
+
+        <!-- Source face -->
+        <div class="face-slot">
+          <div class="face-slot-img empty" id="sourceImg">?</div>
+          <span class="face-slot-label">Source</span>
+        </div>
+
+        <!-- Target face (detected) -->
+        <div class="face-slot">
+          <div class="face-slot-img empty" id="targetImg">?</div>
+          <span class="face-slot-label">Target</span>
+        </div>
+
+        <!-- Swapped face (result) + zoom -->
+        <div class="face-slot">
+          <div class="face-slot-img empty" id="swappedImg">?</div>
+          <div class="face-slot-label">
+            <span>Swapped</span>
+            <button class="zoom-btn" id="zoomBtn" title="Open 512×512 preview">🔍</button>
+          </div>
+        </div>
+
+        <!-- Vertical carousel nav -->
+        <div class="carousel-vert">
+          <button class="carousel-btn-v" id="prevFaceBtn" title="Previous face">▲</button>
+          <span class="carousel-counter" id="faceCounter">—</span>
+          <button class="carousel-btn-v" id="nextFaceBtn" title="Next face">▼</button>
+        </div>
+
+        <!-- Apply Settings (acts on Swapped result) -->
+        <div class="strip-action-col">
+          <button class="strip-action-btn accent" id="applySettingsBtn" disabled
+                  title="Apply settings and update swap">Apply<br>Settings</button>
+          <label class="live-toggle">
+            <input type="checkbox" id="livePreviewCheck"> Live
+          </label>
+        </div>
+
+      </div>
+
+      <!-- Center area: drop zone / video / preview -->
+      <div class="center-area" id="centerArea">
+        <!-- State 1: Drop zone -->
+        <div class="drop-zone" id="videoDrop">
+          <div class="icon">🎬</div>
+          <div class="label">Drag & Drop Video Here</div>
+          <div class="sublabel">or click to browse</div>
+        </div>
+
+        <!-- State 2: Video player (hidden initially) -->
+        <div class="video-container" id="videoContainer" style="display:none;">
+          <video id="player"
+                 disablepictureinpicture
+                 playsinline
+                 preload="auto"></video>
+        </div>
+
+        <!-- State 3: Dual 512×512 zoom preview (hidden initially) -->
+        <div class="zoom-overlay hidden" id="zoomOverlay">
+          <div class="zoom-dual">
+            <div class="zoom-panel">
+              <div class="zoom-label">Detected</div>
+              <img id="zoomOriginal" src="" alt="Original face 512×512">
+            </div>
+            <div class="zoom-panel">
+              <div class="zoom-label">Swapped</div>
+              <img id="zoomImage" src="" alt="Swapped face 512×512">
+            </div>
+            <button class="zoom-close" id="zoomClose" title="Close preview">✕</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Custom video controls bar — OUTSIDE center-area, in center-panel flow -->
+      <div class="video-controls" id="videoControls">
+        <div class="seekbar" id="seekbar">
+          <div class="seekbar-segment" id="seekbarSegment"></div>
+          <div class="seekbar-needle" id="seekbarNeedle"></div>
+        </div>
+        <div class="video-controls-row">
+          <button class="vc-btn" id="vcStartBtn" title="Seek to Start">⏮</button>
+          <button class="vc-btn" id="vcPlayBtn" title="Play / Pause (Space)">▶</button>
+          <button class="vc-btn" id="vcEndBtn" title="Seek to End">⏭</button>
+          <div style="flex:1"></div>
+          <button class="vc-btn" id="vcVolumeBtn" title="Volume (M)">🔊</button>
+          <button class="vc-btn" id="vcFsBtn" title="Fullscreen (F)">⛶</button>
+        </div>
+      </div>
+
+    </div><!-- end center-panel -->
+
+    <!-- ── RIGHT: Control Panel ─────────────────────────── -->
+    <div class="right-panel">
+      <div class="controls-header">Controls</div>
+
+      <!-- Tab strip (active tab gets accent underline; non-active is dim) -->
+      <div class="ctrl-tabs" role="tablist" id="ctrlTabs">
+        <button class="ctrl-tab active" data-tab="restoration" role="tab"
+                aria-selected="true">Restoration</button>
+      </div>
+
+      <div class="controls-body" id="controlsBody">
+
+
+        <!-- ═══ RESTORATION TAB PANEL ═════════════════════ -->
+        <div class="ctrl-tab-panel" data-tab-panel="restoration">
+
+          <!-- Mosaic Detection -->
+          <div class="ctrl-section" id="sectMosaicDetection">
+            <div class="ctrl-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+              <span class="expand-icon">▼</span> Detection
+            </div>
+            <div class="ctrl-section-body">
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Path to mosaic detection model (.pt)">Model</span>
+                <select class="ctrl-select" id="ctrlMosaicDetModel">
+                  <option value="">— select model file —</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label">Score</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicDetScore"
+                         min="5" max="100" value="25">
+                  <span class="ctrl-value" id="valMosaicDetScore">0.25</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label">Batch</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicDetBatch"
+                         min="1" max="16" value="4">
+                  <span class="ctrl-value" id="valMosaicDetBatch">4</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicDetectOnly">
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Draw detection overlay; skip restoration">Show Mask Only</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mosaic Restoration -->
+          <div class="ctrl-section" id="sectMosaicRestoration">
+            <div class="ctrl-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+              <span class="expand-icon">▼</span> Restoration
+            </div>
+            <div class="ctrl-section-body">
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Path to BasicVSR++ restoration model (.pth)">Model</span>
+                <select class="ctrl-select" id="ctrlMosaicRestModel">
+                  <option value="">— select model file —</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Frames per clip before splitting. Lower = less VRAM, more boundaries">Max Clip</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
+                         min="30" max="180" step="10" value="90">
+                  <span class="ctrl-value" id="valMosaicMaxClip">90</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Discard margin per clip boundary. Overlap zone is 2× this.">Overlap</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicOverlap"
+                         min="0" max="16" value="8">
+                  <span class="ctrl-value" id="valMosaicOverlap">8</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCrossfade" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Linear crossfade across clip-boundary overlap zones">Crossfade</span>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Frames per side to crossfade. -1 = auto (overlap/3)">Blend</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicBlend"
+                         min="-1" max="16" value="-1">
+                  <span class="ctrl-value" id="valMosaicBlend">auto</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Spatial denoising on restored crops (tuning placeholder)">Denoise</span>
+                <select class="ctrl-select" id="ctrlMosaicDenoise">
+                  <option value="none" selected>None</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicColorMatch">
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Match restored region luminance to surrounding pixels">Color Match</span>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicFp16" checked>
+                <span class="ctrl-label" style="min-width:auto;">FP16</span>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCompileTrt" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Compile / use TRT engines for restoration">Compile TRT</span>
+              </div>
+            </div>
+          </div>
+
+        </div><!-- ═══ END RESTORATION TAB PANEL ═══════════ -->
+
+      </div><!-- end controls-body -->
+
+      <!-- Encoder is intentionally outside .controls-body so it stays
+           pinned at the bottom of the right panel regardless of how much
+           the active tab's scrolling area expands. Single source of
+           truth — shared between Face Swap and Restoration. -->
+      <div class="ctrl-section ctrl-section-pinned collapsed" id="sectEncoder">
+        <div class="ctrl-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+          <span class="expand-icon">▼</span> Encoder
+        </div>
+        <div class="ctrl-section-body">
+          <div class="ctrl-row">
+            <span class="ctrl-label">Codec</span>
+            <select class="ctrl-select" id="ctrlCodec">
+              <option value="hevc" selected>HEVC</option>
+              <option value="h264">H.264</option>
+            </select>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-label">Preset</span>
+            <select class="ctrl-select" id="ctrlPreset">
+              <option value="P1">P1 (fastest)</option>
+              <option value="P3">P3</option>
+              <option value="P5" selected>P5</option>
+              <option value="P7">P7 (best)</option>
+            </select>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-label">Quality</span>
+            <div class="ctrl-dial-container">
+              <input type="range" class="ctrl-dial" id="ctrlQP" min="0" max="51" value="18">
+              <span class="ctrl-value" id="valQP">18</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- end right-panel -->
+
+  </div><!-- end main-content -->
+
+  <!-- ── Bottom Footer — Tilester-style transport ─────────── -->
+  <div class="app-footer">
+    <button id="pinBtn" class="pin-btn" title="Pin UI Elements (P)">📌 Pin</button>
+
+    <span class="current-time" id="currentTime">00:00:00.000</span>
+    <button id="copyTimeBtn" class="copy-btn" title="Copy Time to Clipboard">📋</button>
+
+    <span id="frameNum" class="footer-box w-frame" title="Current frame"><span class="box-value">—</span></span>
+
+    <button id="segMarkBtn" class="segmark-btn" title="Start/End Segment">▴</button>
+
+    <span id="fpsDisplay" class="footer-box w-fps" title="FPS"><span class="box-value">—</span></span>
+
+    <span class="footer-box" title="Skip backward seconds (←)"><span class="box-label">FB</span>
+      <input type="text" id="skipBackward" value="5" inputmode="decimal" aria-label="Skip backward seconds">
+    </span>
+
+    <span class="footer-box" title="Skip forward seconds (→)"><span class="box-label">FF</span>
+      <input type="text" id="skipForward" value="5" inputmode="decimal" aria-label="Skip forward seconds">
+    </span>
+
+    <span class="goto-frame" title="Go to frame">
+      <span class="footer-box w-gof"><input type="text" id="gotoFrame" inputmode="numeric" placeholder="Frame" aria-label="Go to frame"></span>
+      <button id="gotoFrameBtn" class="goto-act-btn" title="Go to frame">◀</button>
+    </span>
+
+    <span class="goto-time" title="Go to time">
+      <span class="footer-box w-got"><input type="text" id="gotoTime" placeholder="00:00:00.123" aria-label="Go to time"></span>
+      <button id="gotoTimeBtn" class="goto-act-btn" title="Go to time">◀</button>
+    </span>
+
+    <div class="shortcut-hints">
+      <span>◀▶ skip</span>
+      <span>,. frame</span>
+      <span>⎵ play</span>
+      <span><span class="kbd">f</span> fullscreen</span>
+    </div>
+
+    <button class="action-btn secondary" id="newBtn" title="New project — reset all">New</button>
+    <button class="action-btn secondary" id="detectBtn" data-mode="face-swap" disabled>Detect</button>
+    <button class="action-btn primary" id="swapBtn" data-mode="face-swap" disabled>Swap</button>
+    <button class="action-btn secondary" id="previewBtn" data-mode="face-swap" disabled>Preview</button>
+    <button class="action-btn primary" id="swapSaveBtn" data-mode="face-swap" disabled>Swap &amp; Save</button>
+
+    <!-- Restoration mode buttons (toggled visible by tab JS in B2) -->
+    <button class="action-btn secondary" id="restoreDetectBtn" data-mode="restoration" hidden disabled>Detect</button>
+    <button class="action-btn primary"   id="restoreBtn"       data-mode="restoration" hidden disabled>Restore</button>
+    <button class="action-btn secondary" id="restorePreviewBtn" data-mode="restoration" hidden disabled>Preview</button>
+    <button class="action-btn primary"   id="restoreSaveBtn"   data-mode="restoration" hidden disabled>Restore &amp; Save</button>
+
+    <button id="fsBtn" class="fs-btn" title="Fullscreen (F)">Fullscreen</button>
+  </div>
+
+</div><!-- end app -->
+
+<!-- ── Progress Modal ───────────────────────────────────── -->
+<div class="modal-overlay hidden" id="progressModal">
+  <div class="modal">
+    <div class="modal-title" id="progressTitle">Processing...</div>
+    <div class="progress-params" id="progressParams"></div>
+    <div class="progress-bar-container">
+      <div class="progress-bar-fill" id="progressBar"></div>
+    </div>
+    <div class="progress-info">
+      <span id="progressPercent">0%</span>
+      <span id="progressFps">— fps</span>
+      <span id="progressEta">ETA: —</span>
+    </div>
+    <button class="modal-btn" id="progressCancel">Cancel</button>
+  </div>
+</div>
+
+<!-- ── Confirm Modal ───────────────────────────────────── -->
+<div class="modal-overlay hidden" id="confirmModal">
+  <div class="modal">
+    <div class="modal-title" id="confirmTitle">Confirm</div>
+    <div class="modal-message" id="confirmMessage"></div>
+    <div class="modal-buttons">
+      <button class="modal-btn modal-btn-cancel" id="confirmNo">Cancel</button>
+      <button class="modal-btn modal-btn-confirm" id="confirmYes">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── JS Modules ───────────────────────────────────────── -->
+<script src="/static/js/state.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/player.js"></script>
+<script src="/static/js/params.js"></script>
+<script src="/static/js/init.js"></script>
+<script src="/static/js/mosaic.js"></script>
+
+</body>
+</html>
