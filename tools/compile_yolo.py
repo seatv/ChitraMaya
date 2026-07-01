@@ -1,96 +1,67 @@
 # tools/compile_yolo.py
-"""Compile a YOLO .pt checkpoint to a TensorRT .engine via ultralytics' export.
+"""Compile YOLO .pt checkpoint(s) to TensorRT .engine files via ultralytics' export.
 
 Ultralytics' AutoBackend (used by ``LadaYoloDetector``) auto-detects the file
 extension, so after compilation you can swap ``--det-model X.pt`` for
-``--det-model X.engine`` to take the TRT path. The .engine file lands next
-to the .pt with the same stem.
+``--det-model X.engine`` to take the TRT path. The .engine file lands in
+``<models>/engines/<stem>.engine``.
+
+``--det-model`` accepts EITHER a single .pt file OR a directory. When given a
+directory, every ``*.pt`` file directly inside it is compiled in turn.
 
 Usage from the ChitraMaya unified CLI:
 
     ChitraMaya -compile-det --det-model PATH/TO/YOLO.pt --det-imgsz 640
+    ChitraMaya -compile-det --det-model PATH/TO/models   --det-imgsz 640   # all *.pt
 
 Or directly:
 
     python -m tools.compile_yolo --det-model PATH/TO/YOLO.pt --det-imgsz 640
+    python -m tools.compile_yolo --det-model PATH/TO/models   --det-imgsz 640
 """
 from __future__ import annotations
 
 import argparse
-import os
+import gc
 import sys
 import time
 from pathlib import Path
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Compile a YOLO .pt to a TensorRT .engine via ultralytics.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--det-model", required=True,
-        help="Path to YOLO .pt checkpoint",
-    )
-    parser.add_argument(
-        "--det-imgsz", type=int, default=640,
-        help="OPT image size (default: 640). With --dynamic, the engine still "
-             "accepts any size from 32 to workspace*imgsz, but is optimized for "
-             "this size. Pick the size you run at most often.",
-    )
-    parser.add_argument(
-        "--fp16", action=argparse.BooleanOptionalAction, default=True,
-        help="Build fp16 engine (default: True). Use --no-fp16 for fp32. "
-             "Note: ultralytics' fp16 + static-shape export causes a cuTensor "
-             "crash at runtime warmup (FP32 input vs FP16 weights mismatch). "
-             "--dynamic=True is the workaround we use here.",
-    )
-    parser.add_argument(
-        "--dynamic", action=argparse.BooleanOptionalAction, default=True,
-        help="Build a dynamic-shape engine (default: True). One engine handles "
-             "any imgsz from 32 to workspace*imgsz and any batch from 1 to "
-             "--max-batch. With dynamic=False, the engine is locked to "
-             "(--max-batch, --det-imgsz) at compile time.",
-    )
-    parser.add_argument(
-        "--max-batch", type=int, default=16,
-        help="Maximum batch size the engine should support (default: 16). "
-             "Ultralytics requires this to be >1 when --dynamic=True. "
-             "Increase if your pipeline ever exceeds 16 frames per detection batch.",
-    )
-    parser.add_argument(
-        "--workspace", type=int, default=4,
-        help="TRT workspace in GB (default: 4). With --dynamic, this also caps "
-             "the engine's max accepted imgsz at workspace*imgsz "
-             "(e.g. 4*640=2560).",
-    )
-    parser.add_argument(
-        "--gpu-id", type=int, default=0,
-        help="CUDA GPU index (default: 0)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Recompile even if a matching .engine already exists",
-    )
-    args = parser.parse_args()
+def _free_cuda(model=None):
+    """Release PyTorch's CUDA cache so TensorRT / the next model can use the VRAM.
 
-    model_path = Path(args.det_model)
-    if not model_path.is_file():
-        print(f"[!] Model not found: {model_path}", file=sys.stderr)
-        return 1
+    ultralytics' export loads the model onto CUDA (for the ONNX trace) and
+    PyTorch's caching allocator does NOT return that memory to the driver on
+    its own. On an 8 GB card this can leave TensorRT's builder — or the next
+    model in a directory batch — without enough VRAM. Dropping the model
+    reference + emptying the cache + gc gives it back.
+    """
+    try:
+        if model is not None:
+            del model
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
+
+def compile_one(model_path: Path, args) -> int:
+    """Compile a single YOLO .pt to a TensorRT engine.
+
+    Returns 0 on success (or already-exists), non-zero on failure.
+    """
     if model_path.suffix.lower() != ".pt":
-        print(
-            f"[!] Expected a .pt file, got: {model_path}",
-            file=sys.stderr,
-        )
+        print(f"[!] Expected a .pt file, got: {model_path}", file=sys.stderr)
         return 1
 
     # Engines live in <models>/engines/<stem>.engine, mirroring the convention
-    # used for face-swap engines (convert_models.py). Ultralytics hardcodes its
-    # output to <pt_parent>/<stem>.engine, so we let it write there and move
-    # the file after — same logic for the intermediate .onnx ultralytics leaves
-    # behind.
+    # used for the detection engines. Ultralytics hardcodes its output to
+    # <pt_parent>/<stem>.engine, so we let it write there and move the file
+    # after — same logic for the intermediate .onnx ultralytics leaves behind.
     engine_dir = model_path.parent / "engines"
     engine_path = engine_dir / f"{model_path.stem}.engine"
     ultra_engine_path = model_path.with_suffix(".engine")    # where ultralytics writes
@@ -129,18 +100,6 @@ def main() -> int:
                 p.unlink()
             except FileNotFoundError:
                 pass
-
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            print(
-                "[!] CUDA not available; cannot compile TensorRT engines.",
-                file=sys.stderr,
-            )
-            return 1
-    except ImportError as e:
-        print(f"[!] Failed to import torch: {e}", file=sys.stderr)
-        return 1
 
     try:
         from ultralytics import YOLO
@@ -221,6 +180,124 @@ def main() -> int:
     print()
     print(f"[compile-yolo] Done in {elapsed:.1f}s.")
     print(f"[compile-yolo] Engine: {engine_path} ({size_mb:.1f} MB)")
+
+    # Release PyTorch's CUDA cache so a directory batch doesn't accumulate
+    # VRAM across models.
+    _free_cuda(model)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Compile YOLO .pt checkpoint(s) to TensorRT engine(s) via ultralytics.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--det-model", required=True,
+        help="Path to a YOLO .pt checkpoint, OR a directory containing .pt files "
+             "(every *.pt directly inside is compiled).",
+    )
+    parser.add_argument(
+        "--det-imgsz", type=int, default=640,
+        help="OPT image size (default: 640). With --dynamic, the engine still "
+             "accepts any size from 32 to workspace*imgsz, but is optimized for "
+             "this size. Pick the size you run at most often.",
+    )
+    parser.add_argument(
+        "--fp16", action=argparse.BooleanOptionalAction, default=True,
+        help="Build fp16 engine (default: True). Use --no-fp16 for fp32. "
+             "Note: ultralytics' fp16 + static-shape export causes a cuTensor "
+             "crash at runtime warmup (FP32 input vs FP16 weights mismatch). "
+             "--dynamic=True is the workaround we use here.",
+    )
+    parser.add_argument(
+        "--dynamic", action=argparse.BooleanOptionalAction, default=True,
+        help="Build a dynamic-shape engine (default: True). One engine handles "
+             "any imgsz from 32 to workspace*imgsz and any batch from 1 to "
+             "--max-batch. With dynamic=False, the engine is locked to "
+             "(--max-batch, --det-imgsz) at compile time.",
+    )
+    parser.add_argument(
+        "--max-batch", type=int, default=8,
+        help="Maximum batch size the engine should support (default: 8). "
+             "Ultralytics requires this to be >1 when --dynamic=True. "
+             "NOTE: larger max-batch raises the TRT builder's scratch-memory "
+             "request; on an 8GB card, batch 16 on the 22M-param (YOLO11m) "
+             "models requests ~2.1GB scratch and OVERFLOWS a 2GB --workspace, "
+             "causing 'could not find any implementation' build failures. "
+             "Batch 8 requests ~1.32GB and builds cleanly. Only raise this if "
+             "your pipeline truly needs >8 frames per detection batch AND you "
+             "also raise --workspace to fit the larger scratch.",
+    )
+    parser.add_argument(
+        "--workspace", type=int, default=4,
+        help="TRT workspace in GB (default: 4). With --dynamic, this also caps "
+             "the engine's max accepted imgsz at workspace*imgsz "
+             "(e.g. 4*640=2560).",
+    )
+    parser.add_argument(
+        "--gpu-id", type=int, default=0,
+        help="CUDA GPU index (default: 0)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Recompile even if a matching .engine already exists",
+    )
+    args = parser.parse_args()
+
+    target = Path(args.det_model)
+    if not target.exists():
+        print(f"[!] Path not found: {target}", file=sys.stderr)
+        return 1
+
+    # CUDA is required regardless of file/dir; check once up front.
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print(
+                "[!] CUDA not available; cannot compile TensorRT engines.",
+                file=sys.stderr,
+            )
+            return 1
+    except ImportError as e:
+        print(f"[!] Failed to import torch: {e}", file=sys.stderr)
+        return 1
+
+    # Resolve the list of .pt files to compile: single file or all in a dir.
+    if target.is_dir():
+        models = sorted(target.glob("*.pt"))
+        if not models:
+            print(f"[!] No *.pt files found in directory: {target}", file=sys.stderr)
+            return 1
+        print(f"[compile-yolo] Directory mode: {len(models)} .pt file(s) in {target}")
+        for m in models:
+            print(f"               - {m.name}")
+        print()
+    else:
+        models = [target]
+
+    # Compile each; keep going on failure but remember if any failed.
+    failures = []
+    for i, model_path in enumerate(models, 1):
+        if len(models) > 1:
+            print(f"===== [{i}/{len(models)}] {model_path.name} "
+                  f"=======================================")
+        rc = compile_one(model_path, args)
+        if rc != 0:
+            failures.append(model_path.name)
+        # Always release CUDA between models so a failed or successful build
+        # doesn't leave PyTorch squatting on VRAM for the next one.
+        _free_cuda()
+        if len(models) > 1:
+            print()
+
+    if failures:
+        print(f"[compile-yolo] Completed with {len(failures)} failure(s): "
+              f"{', '.join(failures)}", file=sys.stderr)
+        return 1
+
+    if len(models) > 1:
+        print(f"[compile-yolo] All {len(models)} engine(s) compiled successfully.")
     return 0
 
 
