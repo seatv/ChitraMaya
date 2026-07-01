@@ -9,9 +9,9 @@ Compile once per (model, precision, max_clip_size) combination. Engines for
 different max_clip_size values can coexist (the filename includes ``bN``),
 so you can pre-compile for several mcl ceilings if you switch often.
 
-Usage from the ChitraMaya unified CLI:
+Usage from the chitramaya unified CLI:
 
-    ChitraMaya -compile-rest --rest-model PATH/TO/MODEL.pth
+    chitramaya -compile-rest --rest-model PATH/TO/MODEL.pth
 
 Or directly:
 
@@ -74,7 +74,7 @@ def main() -> int:
         help="TRT build workspace in GB (default: 2). Bounds the scratch the "
              "builder may use, which caps the workspace the engine reserves "
              "RESIDENT at runtime. Smaller = more VRAM left for the frame store "
-             "(ChitraMaya keeps everything resident, no host offload). Raise if a "
+             "(chitramaya keeps everything resident, no host offload). Raise if a "
              "build reports it needs more scratch; lower for more headroom. "
              "Pass 0 to use the legacy 95%%-of-free behavior (unbounded).",
     )
