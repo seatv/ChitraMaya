@@ -64,7 +64,7 @@ function gatherParams() {
       enabled: document.getElementById('ctrlOrientOn').checked,
       angle: parseInt(document.getElementById('ctrlOrientAngle').value),
     },
-    mask_only: document.getElementById('ctrlShowMask').checked,
+    mask_only: (document.getElementById('ctrlShowMask')?.checked ?? false),
   };
 }
 
@@ -97,28 +97,10 @@ function buildParamsSummary() {
 // Uses control element IDs as config keys — no mapping needed.
 // Each control type (dial, select, checkbox) is handled automatically.
 
-// All configurable control IDs
+// All configurable control IDs. Mosaic controls are appended by mosaic.js
+// (MOSAIC_CONFIG_CONTROLS). Face-swap control IDs were removed here — they
+// do not exist in ChitraMaya's UI and were silently skipped on save/load.
 const CONFIG_CONTROLS = [
-  // Detection
-  'ctrlDetectType', 'ctrlDetectScore', 'ctrlShowMask',
-  // Swap
-  'ctrlResolution', 'ctrlStrength', 'ctrlThreshold', 'ctrlMergeMath',
-  // Restorer
-  'ctrlRestorerOn', 'ctrlRestorerType', 'ctrlRestorerDet', 'ctrlRestorerAlpha',
-  // Occluder
-  'ctrlOccluderOn', 'ctrlOccluderAmt',
-  // Face Parser
-  'ctrlFaceParserOn', 'ctrlFaceParserAmt', 'ctrlMouthParser',
-  // Diff
-  'ctrlDiffOn', 'ctrlDiffThresh',
-  // Orientation
-  'ctrlOrientOn', 'ctrlOrientAngle',
-  // Border & Blend
-  'ctrlBorderTop', 'ctrlBorderBot', 'ctrlBorderSides', 'ctrlBorderBlur', 'ctrlBlend',
-  // Color
-  'ctrlColorOn', 'ctrlGamma', 'ctrlRed', 'ctrlGreen', 'ctrlBlue',
-  // Face Adjustment
-  'ctrlFaceAdjOn', 'ctrlKpsX', 'ctrlKpsY', 'ctrlKpsScale', 'ctrlFaceScale',
   // Encoder
   'ctrlCodec', 'ctrlPreset', 'ctrlQP',
   // Transport
@@ -190,7 +172,7 @@ let _previewTimer = null;
 async function applySettings() {
   if (state.detectedFaces.length === 0) return;
 
-  const maskOnly = document.getElementById('ctrlShowMask').checked;
+  const maskOnly = (document.getElementById('ctrlShowMask')?.checked ?? false);
   if (!maskOnly && state.assignments[state.currentFaceIdx] === undefined) return;
 
   applySettingsBtn.disabled = true;
@@ -222,31 +204,6 @@ function requestLivePreview() {
 
 // Wire all controls to trigger live preview when enabled
 document.querySelectorAll('.ctrl-dial, .ctrl-select, .ctrl-checkbox').forEach(el => {
-  if (el.id === 'ctrlShowMask') return; // Has its own handler
   const event = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
   el.addEventListener(event, requestLivePreview);
-});
-
-// Mask checkbox also updates button states and auto-populates swapped
-document.getElementById('ctrlShowMask').addEventListener('change', async () => {
-  const maskOn = document.getElementById('ctrlShowMask').checked;
-
-  if (maskOn && state.detectedFaces.length > 0) {
-    // Clear source face assignment — mask mode doesn't need it
-    state.assignments = {};
-    _clearSlotImage('sourceImg');
-
-    // Auto-populate swapped with mask preview
-    const result = await previewSwap(state.currentFaceIdx);
-    if (result && result.image) {
-      _setSlotImage('swappedImg', result.image);
-      state.hasSwappedImage = true;
-    }
-  } else if (!maskOn) {
-    // Toggled off — clear the mask preview
-    _clearSlotImage('swappedImg');
-    state.hasSwappedImage = false;
-  }
-
-  _updateButtonStates();
 });

@@ -292,7 +292,7 @@ function _updateButtonStates() {
   const hasAssignment = Object.keys(state.assignments).length > 0;
   const hasSwapped = state.hasSwappedImage || false;
   const hasSegment = state.segmentEndTime > state.segmentStartTime;
-  const maskOnly = document.getElementById('ctrlShowMask').checked;
+  const maskOnly = (document.getElementById('ctrlShowMask')?.checked ?? false);
   const inPreview = state.previewMode || false;
 
   // (10) Detect: armed when video loaded AND not in Preview Mode
@@ -326,7 +326,7 @@ function _updateButtonStates() {
 zoomBtn.addEventListener('click', async () => {
   if (state.detectedFaces.length === 0) return;
 
-  const maskOnly = document.getElementById('ctrlShowMask').checked;
+  const maskOnly = (document.getElementById('ctrlShowMask')?.checked ?? false);
   if (!maskOnly && state.assignments[state.currentFaceIdx] === undefined) return;
 
   state.zoomOpen = true;
@@ -370,7 +370,7 @@ detectBtn.addEventListener('click', async () => {
     console.log(`[ChitraMaya] Detected ${result.faces.length} face(s)`);
 
     // Auto-populate swapped in mask mode
-    const maskOn = document.getElementById('ctrlShowMask').checked;
+    const maskOn = (document.getElementById('ctrlShowMask')?.checked ?? false);
     if (maskOn) {
       const maskResult = await previewSwap(state.currentFaceIdx);
       if (maskResult && maskResult.image) {
@@ -387,7 +387,7 @@ detectBtn.addEventListener('click', async () => {
 });
 
 swapBtn.addEventListener('click', async () => {
-  const maskOnly = document.getElementById('ctrlShowMask').checked;
+  const maskOnly = (document.getElementById('ctrlShowMask')?.checked ?? false);
   if (!state.videoPath) {
     alert('Load a video first.');
     return;
@@ -788,7 +788,16 @@ console.log('[ChitraMaya] UI ready');
         const result = await loadFacesDir(cfg.facesDir);
         if (result && !result.error) renderFaceGrid();
       }
-      if (cfg.outputDir) state.outputDir = cfg.outputDir;
+      if (cfg.outputDir) {
+        state.outputDir = cfg.outputDir;
+        // Push to the server so self.output_dir matches the loaded config
+        // even before the first Restore. The job payload (gatherMosaicParams)
+        // is the authoritative source, but this keeps server state consistent.
+        await apiPost('/api/set-output-dir', { path: cfg.outputDir });
+      }
+      if (cfg.tempDir) {
+        await apiPost('/api/set-temp-dir', { path: cfg.tempDir });
+      }
     }
   } catch (e) {
     console.warn('[ChitraMaya] Failed to load config:', e);

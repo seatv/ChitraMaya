@@ -30,14 +30,12 @@ function setActiveTab(name) {
   });
 }
 
-document.querySelectorAll('.ctrl-tab').forEach(btn => {
-  btn.addEventListener('click', () => setActiveTab(btn.dataset.tab));
-});
-
-// Initialize — face-swap is the default per the HTML markup, but call
-// setActiveTab so the body attribute and footer-button visibility are
-// in a consistent state regardless of which tab the HTML has marked.
-setActiveTab('face-swap');
+// The tab strip was removed — ChitraMaya has a single Restoration view.
+// Call setActiveTab once so the body attribute, panel visibility, and
+// footer-button visibility (restoration buttons shown, face-swap hidden)
+// land in a consistent state on load. Without this the app booted into the
+// non-existent "face-swap" mode: controls hidden, dead swap buttons shown.
+setActiveTab('restoration');
 
 
 // ── Mosaic dial value formatting ──────────────────────────
@@ -50,18 +48,6 @@ setActiveTab('face-swap');
   if (score && scoreVal) {
     const fmt = () => { scoreVal.textContent = (parseInt(score.value) / 100).toFixed(2); };
     score.addEventListener('input', fmt);
-    fmt();
-  }
-
-  // Blend frames: -1 sentinel displays as "auto"
-  const blend = document.getElementById('ctrlMosaicBlend');
-  const blendVal = document.getElementById('valMosaicBlend');
-  if (blend && blendVal) {
-    const fmt = () => {
-      const v = parseInt(blend.value);
-      blendVal.textContent = v < 0 ? 'auto' : String(v);
-    };
-    blend.addEventListener('input', fmt);
     fmt();
   }
 })();
@@ -86,9 +72,8 @@ setActiveTab('face-swap');
 const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicDetModel', 'ctrlMosaicDetScore', 'ctrlMosaicDetBatch',
   'ctrlMosaicDetectOnly',
-  'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicOverlap',
-  'ctrlMosaicCrossfade', 'ctrlMosaicBlend', 'ctrlMosaicDenoise',
-  'ctrlMosaicColorMatch', 'ctrlMosaicFp16', 'ctrlMosaicCompileTrt',
+  'ctrlMosaicRestModel', 'ctrlMosaicMaxClip',
+  'ctrlMosaicFp16', 'ctrlMosaicCompileTrt',
 ];
 
 if (typeof CONFIG_CONTROLS !== 'undefined') {
@@ -163,6 +148,83 @@ setInterval(checkSessionStatus, 60_000);
 // ═════════════════════════════════════════════════════════════════════
 
 
+// ── Compiled-engine awareness (Max Clip defaulting/constraint) ────────────
+// Compiled clip sizes per restoration model, keyed by model path:
+//   { "<path>": { fp16: [60], fp32: [] }, ... }
+// Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
+let _mosaicRestEngines = {};
+
+// True when Compile TRT is on but no compiled engine set exists for the
+// selected restoration model at the current precision. Restore is blocked
+// (the server would otherwise hard-fail with FileNotFoundError).
+let _restTrtUnavailable = false;
+
+// Max Clip range when TRT is NOT constraining it (PyTorch chunks arbitrarily).
+const MAX_CLIP_FREE = { min: 30, max: 180, step: 10 };
+
+// Default / constrain the Max Clip slider to what is actually compiled for the
+// selected restoration model + precision. Mirrors the server-side snap, so the
+// value the user sees matches what will run. With TRT off, the range is free.
+function updateMaxClipConstraints() {
+  const slider = document.getElementById('ctrlMosaicMaxClip');
+  const valSpan = document.getElementById('valMosaicMaxClip');
+  if (!slider) return;
+
+  const restModel = document.getElementById('ctrlMosaicRestModel').value;
+  const fp16 = document.getElementById('ctrlMosaicFp16').checked;
+  const useTrt = document.getElementById('ctrlMosaicCompileTrt').checked;
+
+  _restTrtUnavailable = false;
+
+  if (!useTrt) {
+    // PyTorch path — clip size is free.
+    slider.min = MAX_CLIP_FREE.min;
+    slider.max = MAX_CLIP_FREE.max;
+    slider.step = MAX_CLIP_FREE.step;
+    slider.disabled = false;
+    if (valSpan) valSpan.textContent = slider.value;
+    _updateRestorationButtonStates();
+    return;
+  }
+
+  const info = _mosaicRestEngines[restModel];
+  const avail = info ? (fp16 ? info.fp16 : info.fp32) : [];
+
+  if (!avail || avail.length === 0) {
+    // TRT requested but nothing compiled for this model + precision.
+    _restTrtUnavailable = !!restModel;
+    slider.disabled = false;
+    if (valSpan) valSpan.textContent = slider.value;
+    _updateRestorationButtonStates();
+    return;
+  }
+
+  if (avail.length === 1) {
+    // Single compiled size — lock the slider to it.
+    const only = avail[0];
+    slider.min = only; slider.max = only; slider.step = 1;
+    slider.value = only;
+    slider.disabled = true;
+    if (valSpan) valSpan.textContent = String(only);
+  } else {
+    // Multiple compiled sizes — allow the compiled range; snap the current
+    // value to the nearest available <= current. The server snaps anything
+    // in between as a backstop.
+    const lo = avail[0];
+    const hi = avail[avail.length - 1];
+    slider.min = lo; slider.max = hi; slider.step = 1;
+    slider.disabled = false;
+    const cur = parseInt(slider.value);
+    const le = avail.filter(n => n <= cur);
+    const pick = le.length ? le[le.length - 1] : lo;
+    slider.value = pick;
+    if (valSpan) valSpan.textContent = String(pick);
+  }
+
+  _updateRestorationButtonStates();
+}
+
+
 // ── Model dropdown population ─────────────────────────────
 // Calls /api/list-mosaic-models on init. Detection (.pt) and restoration
 // (.pth) models live in ./models/ — scanned server-side.
@@ -193,8 +255,15 @@ async function populateMosaicModelDropdowns() {
     }
   }
 
+  // Cache compiled clip sizes so Max Clip can default/constrain to them.
+  _mosaicRestEngines = {};
+  for (const item of data.restoration || []) {
+    if (item.engines) _mosaicRestEngines[item.path] = item.engines;
+  }
+
   fill(detSel, data.detection);
   fill(restSel, data.restoration);
+  updateMaxClipConstraints();
   _updateRestorationButtonStates();
 }
 
@@ -205,7 +274,17 @@ async function populateMosaicModelDropdowns() {
 
 function gatherMosaicParams() {
   const score = parseInt(document.getElementById('ctrlMosaicDetScore').value);
+  // Output/temp dirs travel in the job payload so the value in the box at
+  // submit-time is authoritative — the server no longer depends on a prior
+  // /api/set-output-dir call having fired (which only happened on Enter or
+  // the folder dialog, so a typed-but-not-committed path was silently lost).
+  const outDir = (typeof outputPath !== 'undefined' && outputPath && outputPath.value)
+    ? outputPath.value.trim() : '';
+  const tmpDir = (typeof tempPath !== 'undefined' && tempPath && tempPath.value)
+    ? tempPath.value.trim() : '';
   return {
+    output_dir: outDir,
+    temp_dir: tmpDir,
     mosaic: {
       detection_model: document.getElementById('ctrlMosaicDetModel').value,
       restoration_model: document.getElementById('ctrlMosaicRestModel').value,
@@ -213,11 +292,6 @@ function gatherMosaicParams() {
       mosaic_detection_batch_size: parseInt(document.getElementById('ctrlMosaicDetBatch').value),
       mosaic_detect_only: document.getElementById('ctrlMosaicDetectOnly').checked,
       mosaic_max_clip_size: parseInt(document.getElementById('ctrlMosaicMaxClip').value),
-      mosaic_temporal_overlap: parseInt(document.getElementById('ctrlMosaicOverlap').value),
-      mosaic_crossfade: document.getElementById('ctrlMosaicCrossfade').checked,
-      mosaic_blend_frames: parseInt(document.getElementById('ctrlMosaicBlend').value),
-      mosaic_denoise: document.getElementById('ctrlMosaicDenoise').value,
-      mosaic_color_match: document.getElementById('ctrlMosaicColorMatch').checked,
       mosaic_fp16: document.getElementById('ctrlMosaicFp16').checked,
       mosaic_compile_trt: document.getElementById('ctrlMosaicCompileTrt').checked,
     },
@@ -241,12 +315,9 @@ function buildMosaicParamsSummary() {
   } else {
     const restName = document.getElementById('ctrlMosaicRestModel').selectedOptions[0]?.textContent || '—';
     parts.push(`Rest: ${restName}`);
-    parts.push(`Clip: ${m.mosaic_max_clip_size}/${m.mosaic_temporal_overlap}`);
-    if (m.mosaic_crossfade) {
-      const bf = m.mosaic_blend_frames < 0 ? 'auto' : m.mosaic_blend_frames;
-      parts.push(`Crossfade: ${bf}`);
-    }
-    if (m.mosaic_color_match) parts.push('Color Match');
+    parts.push(`Clip: ${m.mosaic_max_clip_size}`);
+    parts.push(m.mosaic_fp16 ? 'FP16' : 'FP32');
+    parts.push(m.mosaic_compile_trt ? 'TRT' : 'PyTorch');
   }
   parts.push(`Enc: ${p.encoder.codec.toUpperCase()}/${p.encoder.preset}/QP${p.encoder.qp}`);
   return parts.join(' · ');
@@ -263,16 +334,30 @@ function _updateRestorationButtonStates() {
   const hasModels = detModel && (detectOnly || restModel);
   const hasSegment = state.segmentEndTime > state.segmentStartTime;
   const inPreview = state.previewMode || false;
+  // TRT engines missing for the chosen restoration model + precision blocks a
+  // real restore (detect-only doesn't need the restorer).
+  const restBlocked = _restTrtUnavailable && !detectOnly;
 
   const restoreBtn = document.getElementById('restoreBtn');
   const restoreSaveBtn = document.getElementById('restoreSaveBtn');
   const restorePreviewBtn = document.getElementById('restorePreviewBtn');
 
+  const blockTip = restBlocked
+    ? 'No compiled TRT engines for this restoration model at the current precision. '
+      + 'Compile via Manage Models, or uncheck Compile TRT to use PyTorch.'
+    : '';
+
   // Restore (segment scope): needs video + models + segment marked.
-  if (restoreBtn) restoreBtn.disabled = !hasVideo || !hasModels || !hasSegment || inPreview;
+  if (restoreBtn) {
+    restoreBtn.disabled = !hasVideo || !hasModels || !hasSegment || inPreview || restBlocked;
+    restoreBtn.title = blockTip;
+  }
 
   // Restore & Save (full video): only needs video + models.
-  if (restoreSaveBtn) restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview;
+  if (restoreSaveBtn) {
+    restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview || restBlocked;
+    restoreSaveBtn.title = blockTip;
+  }
 
   // Preview: enabled + highlighted when a restored preview is ready.
   // state.previewReady is shared with face-swap; clearSegment() in
@@ -336,6 +421,13 @@ if (typeof loadVideo === 'function') {
 ['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicDetectOnly'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateRestorationButtonStates);
+});
+
+// Controls that affect which compiled engine set applies re-evaluate the
+// Max Clip constraint (which also refreshes button states).
+['ctrlMosaicRestModel', 'ctrlMosaicFp16', 'ctrlMosaicCompileTrt'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', updateMaxClipConstraints);
 });
 
 
@@ -565,6 +657,19 @@ document.getElementById('restorePreviewBtn').addEventListener('click', () => {
 const restoreDetectBtn = document.getElementById('restoreDetectBtn');
 if (restoreDetectBtn) {
   restoreDetectBtn.title = 'Coming soon — use the Show Mask Only checkbox + Restore for now';
+}
+
+
+// ── Manage Models button ──────────────────────────────────
+// No-op placeholder. A later increment replaces this with a modal for
+// downloading source checkpoints (.pt / .pth) and compiling TRT engines.
+// The "Use Tensor" checkboxes (increment 2) will route here when a
+// requested engine is missing and no source checkpoint is present.
+const manageModelsBtn = document.getElementById('manageModelsBtn');
+if (manageModelsBtn) {
+  manageModelsBtn.addEventListener('click', () => {
+    console.info('[ChitraMaya] Manage Models: model download/compile modal is not implemented yet.');
+  });
 }
 
 

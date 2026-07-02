@@ -154,9 +154,11 @@ class SwapServer:
         # Get metadata via ffprobe (no GPU needed)
         self.video_info = self._probe_video(path)
 
-        # Set default output dir to same as input
-        if not self.output_dir:
-            self.output_dir = str(Path(path).parent)
+        # NOTE: output_dir is NOT pinned to the input directory here. The job
+        # payload (params.output_dir) is authoritative at submit-time; mosaic_full
+        # falls back to self.output_dir, then to the input's parent. Pinning here
+        # caused a blank output box to silently write next to the input even after
+        # the user set a directory.
 
         # Clear detection state
         self.detected_kpss = []
@@ -384,6 +386,35 @@ class SwapServer:
         """
         from chitramaya.mosaic.pipeline import MosaicPipeline
 
+        # If TRT restoration is requested but the requested clip size has no
+        # compiled sub-engine set, snap to the nearest AVAILABLE compiled size
+        # (prefer the largest that is <= requested; else the smallest available).
+        # This prevents a stale UI/config clip size from hard-failing with a
+        # FileNotFoundError. When nothing is compiled the request is left
+        # unchanged so the build raises the clean "compile first" error.
+        if (mosaic_cfg.mosaic_compile_trt and mosaic_cfg.restoration_model
+                and not mosaic_cfg.mosaic_detect_only):
+            import dataclasses
+            from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
+                list_basicvsrpp_compiled_clip_sizes,
+            )
+            avail = list_basicvsrpp_compiled_clip_sizes(
+                mosaic_cfg.restoration_model, bool(mosaic_cfg.mosaic_fp16),
+            )
+            req = int(mosaic_cfg.mosaic_max_clip_size)
+            if avail and req not in avail:
+                le = [n for n in avail if n <= req]
+                snapped = max(le) if le else min(avail)
+                logger.warning(
+                    "[mosaic] Max clip %d has no compiled TRT engines for %s "
+                    "(fp16=%s); snapping to %d (available: %s)",
+                    req, mosaic_cfg.restoration_model,
+                    mosaic_cfg.mosaic_fp16, snapped, avail,
+                )
+                mosaic_cfg = dataclasses.replace(
+                    mosaic_cfg, mosaic_max_clip_size=snapped,
+                )
+
         key = (
             mosaic_cfg.detection_model,
             mosaic_cfg.restoration_model,
@@ -455,7 +486,11 @@ class SwapServer:
         if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_detect_only:
             raise RuntimeError("Restoration model path not set")
 
-        # Output path
+        # Output path. Priority: payload output_dir (the value in the UI box at
+        # submit-time) -> persisted self.output_dir -> input's parent directory.
+        payload_out = str(params.get("output_dir", "") or "").strip()
+        if payload_out:
+            self.output_dir = payload_out
         input_path = Path(self.video_path)
         out_dir = self.output_dir or str(input_path.parent)
         os.makedirs(out_dir, exist_ok=True)
@@ -531,7 +566,11 @@ class SwapServer:
         if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_detect_only:
             raise RuntimeError("Restoration model path not set")
 
-        # Temp files
+        # Temp files. Priority: payload temp_dir -> persisted self.temp_dir ->
+        # the OS temp directory.
+        payload_temp = str(params.get("temp_dir", "") or "").strip()
+        if payload_temp:
+            self.temp_dir = payload_temp
         temp_dir = self.temp_dir if self.temp_dir else tempfile.gettempdir()
         os.makedirs(temp_dir, exist_ok=True)
         seg_input = os.path.join(temp_dir, "chitramaya_mosaic_seg_input.mp4")
@@ -767,6 +806,10 @@ def api_list_mosaic_models():
     detection: list[dict] = []
     restoration: list[dict] = []
 
+    from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
+        list_basicvsrpp_compiled_clip_sizes,
+    )
+
     if models_dir.exists() and models_dir.is_dir():
         for p in sorted(models_dir.iterdir()):
             if not p.is_file():
@@ -775,7 +818,17 @@ def api_list_mosaic_models():
             if ext == ".pt":
                 detection.append({"path": str(p).replace("\\", "/"), "label": p.stem})
             elif ext == ".pth":
-                restoration.append({"path": str(p).replace("\\", "/"), "label": p.stem})
+                mp = str(p)
+                # Compiled clip sizes per precision, so the UI can default and
+                # constrain Max Clip to what actually exists on disk.
+                restoration.append({
+                    "path": mp.replace("\\", "/"),
+                    "label": p.stem,
+                    "engines": {
+                        "fp16": list_basicvsrpp_compiled_clip_sizes(mp, True),
+                        "fp32": list_basicvsrpp_compiled_clip_sizes(mp, False),
+                    },
+                })
 
     return jsonify({"detection": detection, "restoration": restoration})
 
@@ -935,11 +988,6 @@ def api_default_config():
         # Restoration
         "ctrlMosaicRestModel": m.restoration_model,
         "ctrlMosaicMaxClip": str(m.mosaic_max_clip_size),
-        "ctrlMosaicOverlap": str(m.mosaic_temporal_overlap),
-        "ctrlMosaicCrossfade": m.mosaic_crossfade,
-        "ctrlMosaicBlend": str(m.mosaic_blend_frames),
-        "ctrlMosaicDenoise": m.mosaic_denoise,
-        "ctrlMosaicColorMatch": m.mosaic_color_match,
         "ctrlMosaicFp16": m.mosaic_fp16,
         "ctrlMosaicCompileTrt": m.mosaic_compile_trt,
 

@@ -164,12 +164,12 @@
 
     <!-- ── RIGHT: Control Panel ─────────────────────────── -->
     <div class="right-panel">
-      <div class="controls-header">Controls</div>
-
-      <!-- Tab strip (active tab gets accent underline; non-active is dim) -->
-      <div class="ctrl-tabs" role="tablist" id="ctrlTabs">
-        <button class="ctrl-tab active" data-tab="restoration" role="tab"
-                aria-selected="true">Restoration</button>
+      <div class="controls-header"
+           style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <span>Controls</span>
+        <button class="header-btn" id="manageModelsBtn"
+                title="Download and compile detection / restoration models (coming soon)"
+                style="text-transform:none; letter-spacing:0; font-size:11px; padding:2px 8px;">Manage Models</button>
       </div>
 
       <div class="controls-body" id="controlsBody">
@@ -191,7 +191,8 @@
                 </select>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label">Score</span>
+                <span class="ctrl-label"
+                      title="Detection confidence threshold. Lower = more (looser) detections, higher = fewer (stricter)">Score</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetScore"
                          min="5" max="100" value="25">
@@ -199,7 +200,8 @@
                 </div>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label">Batch</span>
+                <span class="ctrl-label"
+                      title="Frames detected per GPU batch. Higher = faster but more VRAM">Batch</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetBatch"
                          min="1" max="16" value="4">
@@ -235,43 +237,9 @@
                 </div>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="Discard margin per clip boundary. Overlap zone is 2× this.">Overlap</span>
-                <div class="ctrl-dial-container">
-                  <input type="range" class="ctrl-dial" id="ctrlMosaicOverlap"
-                         min="0" max="16" value="8">
-                  <span class="ctrl-value" id="valMosaicOverlap">8</span>
-                </div>
-              </div>
-              <div class="ctrl-row">
-                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCrossfade" checked>
-                <span class="ctrl-label" style="min-width:auto;"
-                      title="Linear crossfade across clip-boundary overlap zones">Crossfade</span>
-              </div>
-              <div class="ctrl-row">
-                <span class="ctrl-label" title="Frames per side to crossfade. -1 = auto (overlap/3)">Blend</span>
-                <div class="ctrl-dial-container">
-                  <input type="range" class="ctrl-dial" id="ctrlMosaicBlend"
-                         min="-1" max="16" value="-1">
-                  <span class="ctrl-value" id="valMosaicBlend">auto</span>
-                </div>
-              </div>
-              <div class="ctrl-row">
-                <span class="ctrl-label" title="Spatial denoising on restored crops (tuning placeholder)">Denoise</span>
-                <select class="ctrl-select" id="ctrlMosaicDenoise">
-                  <option value="none" selected>None</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
-              </div>
-              <div class="ctrl-row">
-                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicColorMatch">
-                <span class="ctrl-label" style="min-width:auto;"
-                      title="Match restored region luminance to surrounding pixels">Color Match</span>
-              </div>
-              <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicFp16" checked>
-                <span class="ctrl-label" style="min-width:auto;">FP16</span>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
               </div>
               <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCompileTrt" checked>
@@ -295,14 +263,14 @@
         </div>
         <div class="ctrl-section-body">
           <div class="ctrl-row">
-            <span class="ctrl-label">Codec</span>
+            <span class="ctrl-label" title="Output video codec (NVENC)">Codec</span>
             <select class="ctrl-select" id="ctrlCodec">
               <option value="hevc" selected>HEVC</option>
               <option value="h264">H.264</option>
             </select>
           </div>
           <div class="ctrl-row">
-            <span class="ctrl-label">Preset</span>
+            <span class="ctrl-label" title="NVENC speed/quality preset. P1 fastest … P7 best quality">Preset</span>
             <select class="ctrl-select" id="ctrlPreset">
               <option value="P1">P1 (fastest)</option>
               <option value="P3">P3</option>
@@ -311,7 +279,7 @@
             </select>
           </div>
           <div class="ctrl-row">
-            <span class="ctrl-label">Quality</span>
+            <span class="ctrl-label" title="Constant quantization parameter. Lower = higher quality, larger file (0-51)">Quality</span>
             <div class="ctrl-dial-container">
               <input type="range" class="ctrl-dial" id="ctrlQP" min="0" max="51" value="18">
               <span class="ctrl-value" id="valQP">18</span>

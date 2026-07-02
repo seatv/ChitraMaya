@@ -1,3 +1,4 @@
+# chitramaya/models.py
 """Core data models for the mosaic restoration pipeline.
 
 All models are frozen dataclasses:
