@@ -1,4 +1,4 @@
-# gRestorer/cli/pipeline.py
+# chitramaya/pipeline.py
 # --------------------------------------------------------------------------
 # CHANGES vs original:
 #   [CHANGE 3] max_clip_length default: 9 -> 30  (better temporal stability)
