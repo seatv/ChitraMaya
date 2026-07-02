@@ -13,6 +13,7 @@ Faithful port of Jasna's engine_paths.py (BasicVSR++ subset only).
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -77,3 +78,34 @@ def all_basicvsrpp_sub_engines_exist(
             model_weights_path, fp16, max_clip_size,
         ).values()
     )
+
+
+def list_basicvsrpp_compiled_clip_sizes(
+    model_weights_path: str, fp16: bool,
+) -> list[int]:
+    """Return the clip sizes that have a COMPLETE compiled sub-engine set.
+
+    Scans the checkpoint's ``<stem>_sub_engines`` directory for
+    ``preprocess_b<N>`` engines matching the given precision + OS, then
+    verifies the full set (loop bodies + upsample) exists for each ``N``.
+    Used by the UI to default/constrain the Max Clip control to what is
+    actually compiled, and by the server to snap a stale request to an
+    available size instead of hard-failing. Returns a sorted ascending list;
+    empty if nothing is compiled for this checkpoint+precision.
+    """
+    engine_dir = _basicvsrpp_sub_engine_dir(model_weights_path)
+    if not os.path.isdir(engine_dir):
+        return []
+    prec = engine_precision_name(fp16=fp16)
+    suf = engine_system_suffix()
+    pat = re.compile(
+        r"^preprocess_b(\d+)\.trt_" + re.escape(prec) + re.escape(suf) + r"\.engine$"
+    )
+    sizes: set[int] = set()
+    for name in os.listdir(engine_dir):
+        m = pat.match(name)
+        if m:
+            n = int(m.group(1))
+            if all_basicvsrpp_sub_engines_exist(model_weights_path, fp16, n):
+                sizes.add(n)
+    return sorted(sizes)
