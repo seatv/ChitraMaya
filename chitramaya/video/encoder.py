@@ -13,6 +13,7 @@ Output: H.264/HEVC elementary stream → ffmpeg remux to MP4/MKV with audio.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -104,6 +105,41 @@ def _fps_to_rational(fps: float) -> str:
     return f"{frac.numerator}/{frac.denominator}"
 
 
+def _derive_ffprobe(ffmpeg_path: str) -> str:
+    """Best-effort ffprobe path derived from the configured ffmpeg path.
+
+    "ffmpeg" -> "ffprobe"; "C:/x/ffmpeg.exe" -> "C:/x/ffprobe.exe".
+    """
+    p = str(ffmpeg_path)
+    base = os.path.basename(p)
+    if "ffmpeg" in base.lower():
+        d = os.path.dirname(p)
+        probe = base.lower().replace("ffmpeg", "ffprobe")
+        return os.path.join(d, probe) if d else probe
+    return "ffprobe"
+
+
+def _probe_stream_start_seconds(ffprobe: str, path: str, stream: str) -> Optional[float]:
+    """Return a stream's start_time in seconds via ffprobe.
+
+    Returns None if the stream is absent, reports 'N/A', or the probe fails.
+    """
+    try:
+        cmd = [
+            ffprobe, "-v", "error", "-select_streams", stream,
+            "-show_entries", "stream=start_time",
+            "-of", "default=nw=1:nk=1", path,
+        ]
+        out = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+        s = (out.stdout or "").strip()
+        return float(s) if s else None
+    except Exception:
+        return None
+
+
 class Encoder:
     """NVENC video encoder with ffmpeg remux.
 
@@ -139,7 +175,9 @@ class Encoder:
         tune: str = "",
         spatial_aq: bool = False,
         aq_strength: int = 0,
-        bf: int = -1,                # -1 = don't set; 0 explicitly disables B-frames
+        bf: int = 0,                 # 0 = no B-frames (clean PTS=DTS so the
+                                     #     start offset survives remux); -1 =
+                                     #     don't set (NVENC default, may reorder)
         bref: str = "",
         rc_lookahead: int = 0,
         multipass: str = "disabled",
@@ -292,6 +330,31 @@ class Encoder:
 
         print(f"[Encoder] Done: {self.output_path}")
 
+    def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg") -> bool:
+        """Run one ffmpeg command; return True on rc==0. Shared by both remux
+        passes. UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames."""
+        print(f"[Encoder] {label}: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=300,
+            )
+            if result.returncode != 0:
+                print(f"[Encoder] {label} failed (rc={result.returncode})")
+                if result.stderr:
+                    for line in result.stderr.strip().split("\n")[-5:]:
+                        print(f"  {line}")
+                return False
+            print(f"[Encoder] {label} OK")
+            return True
+        except Exception as e:
+            print(f"[Encoder] {label} error: {e}")
+            return False
+
     def _remux(self) -> bool:
         """Remux raw bitstream with audio from input using ffmpeg. Returns True on success."""
         raw_path = Path(self._raw_path)
@@ -303,89 +366,124 @@ class Encoder:
 
         input_fmt = _ffmpeg_input_fmt(self.codec)
 
-        # Build ffmpeg command
-        cmd = [self.ffmpeg_path, "-hide_banner", "-y", "-loglevel", "warning"]
-
-        # Input: raw video bitstream
-        # -fflags +genpts: generate PTS for demuxed packets
-        # -analyzeduration/-probesize: give ffmpeg time to find VPS/SPS/PPS in NVENC output
-        cmd += ["-fflags", "+genpts",
-                "-analyzeduration", "10M",
-                "-probesize", "50M",
-                "-r", self.fps_str,
-                "-f", input_fmt,
-                "-i", str(raw_path)]
-
-        # Input: original file for audio (if available)
-        has_audio_source = False
+        # Reintroduce the source's start-PTS offset between audio and video.
+        # NVDEC numbers frames from 0 and NVENC emits a raw elementary stream
+        # with no start offset, so the remux regenerates video PTS from t=0.
+        # But source containers usually carry a small offset between their video
+        # and audio streams (e.g. video start_time=0.033, audio start_time=0.000
+        # => audio leads video by 33ms). Collapsing that to 0/0 shifts A/V by a
+        # constant amount from the very first frame. Probe the source and delay
+        # whichever stream started later, matching lada's -itsoffset behaviour.
+        video_delay = 0.0
+        audio_delay = 0.0
         if self.mux_audio and self.input_path and Path(self.input_path).exists():
-            cmd += ["-i", self.input_path]
-            has_audio_source = True
+            ffprobe = _derive_ffprobe(self.ffmpeg_path)
+            v_start = _probe_stream_start_seconds(ffprobe, self.input_path, "v:0")
+            a_start = _probe_stream_start_seconds(ffprobe, self.input_path, "a:0")
+            if v_start is not None and a_start is not None:
+                rel = v_start - a_start
+                if rel > 1e-4:
+                    video_delay = rel        # audio led video in the source
+                elif rel < -1e-4:
+                    audio_delay = -rel       # video led audio (rare)
+                if video_delay or audio_delay:
+                    print(
+                        f"[Encoder] Restoring source A/V start offset: "
+                        f"v_start={v_start:.6f}s a_start={a_start:.6f}s "
+                        f"-> video_delay={video_delay:.6f}s audio_delay={audio_delay:.6f}s"
+                    )
 
-        # Video: copy (already encoded)
-        cmd += ["-map", "0:v:0", "-c:v", "copy"]
+        has_audio_source = bool(
+            self.mux_audio and self.input_path and Path(self.input_path).exists()
+        )
 
-        # Video tag for MP4 compatibility
+        # Reusable arg groups.
+        tag_args: List[str] = []
         if self._container == "mp4":
             if self.codec in ("hevc", "h265"):
-                cmd += ["-tag:v", "hvc1"]
+                tag_args = ["-tag:v", "hvc1"]
             elif self.codec in ("h264", "avc"):
-                cmd += ["-tag:v", "avc1"]
+                tag_args = ["-tag:v", "avc1"]
 
-        # Audio: copy from source if available
-        if has_audio_source:
-            cmd += ["-map", "1:a?", "-c:a", "copy"]
+        timescale_args = (
+            ["-video_track_timescale", "90000"] if self._container == "mp4" else []
+        )
+        faststart_args = (
+            ["-movflags", "+faststart"] if self._container == "mp4" else []
+        )
 
-        # Container options
-        if self._container == "mp4":
-            cmd += ["-movflags", "+faststart"]
-            # Force the standard 90 kHz video timescale. NVENC's raw stream
-            # carries a non-standard timebase (observed 1/15360); with -c:v copy
-            # ffmpeg preserves it into the MP4 instead of normalizing. Some
-            # players (notably VR/headset players) mis-reconcile a non-90 kHz
-            # video clock against the 44.1 kHz audio clock, producing
-            # progressive A/V drift over long files even when per-frame PTS is
-            # evenly spaced. 90000 is evenly divisible for common rates
-            # (90000/60 = 1500) and is what virtually all MP4s use, so players
-            # are optimized for it. This matches gRestorer's remux.
-            cmd += ["-video_track_timescale", "90000"]
-
-        # Set output duration to match our video (avoid -shortest which
-        # fails with raw bitstreams that lack proper timestamps)
+        # Cap output near the (possibly delayed) video length so trailing audio
+        # doesn't extend the file, without clipping the delayed video's tail.
+        # (Avoids -shortest, which fails with raw bitstreams lacking timestamps.)
+        dur_args: List[str] = []
         if self._frames_encoded > 0 and self.fps > 0:
-            duration = self._frames_encoded / self.fps
-            cmd += ["-t", f"{duration:.3f}"]
+            duration = video_delay + (self._frames_encoded / self.fps)
+            dur_args = ["-t", f"{duration:.3f}"]
 
-        cmd += [str(out_path)]
-
-        print(f"[Encoder] Remuxing: {' '.join(cmd)}")
+        ff = self.ffmpeg_path
+        temp_video: Optional[Path] = None
         try:
-            # Force UTF-8 decoding of ffmpeg output. Without encoding=, Python
-            # falls back to the system codepage (cp1252 on Windows), which
-            # crashes when the input video filename contains non-ASCII
-            # characters (e.g. CJK). errors='replace' is defensive against
-            # any genuinely malformed bytes in ffmpeg's progress lines.
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=300,
-            )
-            if result.returncode != 0:
-                print(f"[Encoder] Remux failed (rc={result.returncode})")
-                if result.stderr:
-                    lines = result.stderr.strip().split("\n")
-                    for line in lines[-5:]:
-                        print(f"  {line}")
-                return False
-            else:
-                print(f"[Encoder] Remux OK: {out_path}")
-                return True
-        except Exception as e:
-            print(f"[Encoder] Remux error: {e}")
-            return False
+            if video_delay > 0:
+                # -itsoffset is silently DROPPED on a raw annexb input when
+                # ffmpeg CFR-stamps it from frame 0 (confirmed: output video
+                # start_time stayed 0.000). So first bounce the raw stream into
+                # a temp CONTAINER (lossless copy) to give it real timestamps,
+                # then apply -itsoffset on that container in the audio-mux pass.
+                # -itsoffset on a container input is reliable (lada's pattern).
+                temp_video = Path(str(out_path) + ".vtmp" + out_path.suffix)
+
+                step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                         "-fflags", "+genpts",
+                         "-analyzeduration", "10M", "-probesize", "50M",
+                         "-r", self.fps_str,
+                         "-f", input_fmt, "-i", str(raw_path),
+                         "-map", "0:v:0", "-c:v", "copy"]
+                step1 += tag_args + timescale_args + [str(temp_video)]
+                if not self._run_ffmpeg(step1, "video-container"):
+                    return False
+
+                # Mux with lada's input ordering: the un-delayed AUDIO source is
+                # input 0, the delayed restored VIDEO is input 1. ffmpeg baselines
+                # output timestamps against input 0 (audio @ 0), so the video's
+                # +offset survives as an edit list. With the delayed video as
+                # input 0 instead, ffmpeg re-zeroed it and the offset was lost
+                # (confirmed: output start_time stayed 0.000).
+                if has_audio_source:
+                    step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                             "-i", self.input_path,
+                             "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
+                             "-map", "1:v:0", "-c:v", "copy"] + tag_args
+                    step2 += ["-map", "0:a?", "-c:a", "copy"]
+                else:
+                    step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                             "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
+                             "-map", "0:v:0", "-c:v", "copy"] + tag_args
+                step2 += faststart_args + timescale_args + dur_args + [str(out_path)]
+                return self._run_ffmpeg(step2, "remux")
+
+            # No video delay: single pass raw -> final. audio_delay (rare: source
+            # video led its audio) is applied on the audio CONTAINER input, which
+            # is reliable.
+            cmd = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                   "-fflags", "+genpts",
+                   "-analyzeduration", "10M", "-probesize", "50M",
+                   "-r", self.fps_str,
+                   "-f", input_fmt, "-i", str(raw_path)]
+            if has_audio_source:
+                if audio_delay > 0:
+                    cmd += ["-itsoffset", f"{audio_delay:.6f}"]
+                cmd += ["-i", self.input_path]
+            cmd += ["-map", "0:v:0", "-c:v", "copy"] + tag_args
+            if has_audio_source:
+                cmd += ["-map", "1:a?", "-c:a", "copy"]
+            cmd += faststart_args + timescale_args + dur_args + [str(out_path)]
+            return self._run_ffmpeg(cmd, "remux")
+        finally:
+            if temp_video is not None:
+                try:
+                    Path(temp_video).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def __enter__(self):
         return self
