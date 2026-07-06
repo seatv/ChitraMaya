@@ -1335,8 +1335,11 @@ class MosaicPipelineConfig:
     temporal_overlap: int = 0        # INERT: no temporal-overlap implementation
     crossfade: bool = False          # INERT: no crossfade implementation
     blend_frames: int = 0            # INERT: no crossfade implementation
-    detect_only: bool = False
-    fp16: bool = True
+    mask_preview: bool = False
+    mask_color: tuple = (255, 0, 255)
+    mask_opacity: float = 0.70
+    detection_fp16: bool = True
+    restoration_fp16: bool = True
     use_trt: bool = True
     color_match: bool = False        # INERT: no color-match implementation
     codec: str = "hevc"
@@ -1352,6 +1355,10 @@ class MosaicPipelineConfig:
     store_max_frames: int = 0
     det_imgsz: int = 640
     det_iou: float = 0.70
+    roi_dilate: int = 0
+    use_seg_masks: bool = True
+    feather_radius: int = 0
+    blendmask: str = "none"
 
 
 class MosaicPipeline:
@@ -1375,8 +1382,13 @@ class MosaicPipeline:
         # run()). Borrow its proven _build_detector/_build_restorer so the
         # warm models are byte-identical to what the CLI builds.
         self._host = Pipeline(self._build_base_config())
-        self._detector = None if cfg.detect_only else self._host._build_detector()
-        self._restorer = None if cfg.detect_only else self._host._build_restorer()
+        # Delegate to the host builders. mode drives everything: "real" ->
+        # BasicVSR++, "pseudo" -> PseudoClipRestorer (flat fill), "none" ->
+        # no restorer. The detector is always built (needed by real + pseudo).
+        # This replaces the old detect_only guards, which wrongly nulled the
+        # detector and let run() rebuild a restorer anyway.
+        self._detector = self._host._build_detector()
+        self._restorer = self._host._build_restorer()
 
     # -- config construction -------------------------------------------------
 
@@ -1387,24 +1399,32 @@ class MosaicPipeline:
         data: dict = {
             "input": str(input_path),
             "output": str(output_path),
-            "mode": "real",
+            "mode": ("pseudo" if bool(getattr(c, "mask_preview", False)) else "real"),
+            "visualization": {
+                "fill_color": list(getattr(c, "mask_color", (255, 0, 255))),
+                "fill_opacity": float(getattr(c, "mask_opacity", 0.70)),
+            },
             "store_max_frames": int(getattr(c, "store_max_frames", 0)),
             "sbs_enabled": bool(getattr(c, "sbs_enabled", False)),
             "sbs_layout": str(getattr(c, "sbs_layout", "lr")),
             "sbs_det_split": bool(getattr(c, "sbs_det_split", False)),
+            "roi_dilate": int(getattr(c, "roi_dilate", 0)),
+            "use_seg_masks": bool(getattr(c, "use_seg_masks", True)),
             "detection": {
                 "model_path": c.detection_model,
                 "conf_threshold": float(c.detection_score),
                 "iou_threshold": float(getattr(c, "det_iou", 0.70)),
                 "imgsz": int(getattr(c, "det_imgsz", 640)),
-                "fp16": bool(c.fp16),
+                "fp16": bool(getattr(c, "detection_fp16", True)),
                 "batch_size": int(c.detection_batch_size),
             },
             "restoration": {
                 "rest_model_path": c.restoration_model,
-                "fp16": bool(c.fp16),
+                "fp16": bool(getattr(c, "restoration_fp16", True)),
                 "max_clip_length": int(c.max_clip_size),
                 "backend": ("trt" if c.use_trt else "pytorch"),
+                "feather_radius": int(getattr(c, "feather_radius", 0)),
+                "blendmask": str(getattr(c, "blendmask", "none")),
             },
             "encoder": {
                 "codec": str(c.codec),
@@ -1414,10 +1434,9 @@ class MosaicPipeline:
             },
             "decoder": {"gpu_id": self.gpu_id},
         }
-        # detect_only: tracker/restorer disabled by leaving restoration model
-        # empty would error; instead the bridge simply doesn't inject a
-        # restorer (handled in process_file), and mode stays "real" so
-        # detection + store still run.
+        # Mask Preview maps to mode="pseudo": the host builds the detector +
+        # PseudoClipRestorer (flat fill), so detection + compositing run but
+        # BasicVSR++ does not. mode="real" restores normally.
         return Config(data=data)
 
     # -- live config update (server applies non-load-affecting deltas) -------
@@ -1475,12 +1494,9 @@ class MosaicPipeline:
         # Push current live detection score before running.
         self._set_detection_score(float(self.config.detection_score))
 
-        detect_only = bool(getattr(self.config, "detect_only", False))
-        restorer = None if detect_only else self._restorer
-
         metrics = self._host.run(
             detector_override=self._detector,
-            restorer_override=restorer,
+            restorer_override=self._restorer,
             progress_cb=progress_cb,
             cancel_flag=cancel_flag,
         )
