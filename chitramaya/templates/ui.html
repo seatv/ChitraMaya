@@ -191,6 +191,16 @@
                 </select>
               </div>
               <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicDetTrt" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Use the compiled TensorRT engine for detection if available (faster). Unchecked = PyTorch .pt.">Use Tensor</span>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicDetFp16" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Use FP16 precision for detection (selects the fp16 detection engine)">FP16</span>
+              </div>
+              <div class="ctrl-row">
                 <span class="ctrl-label"
                       title="Detection confidence threshold. Lower = more (looser) detections, higher = fewer (stricter)">Score</span>
                 <div class="ctrl-dial-container">
@@ -201,17 +211,21 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
+                      title="Detection NMS IoU threshold. Lower = more aggressive overlap suppression">IoU</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicDetIou"
+                         min="5" max="100" value="70">
+                  <span class="ctrl-value" id="valMosaicDetIou">0.70</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label"
                       title="Frames detected per GPU batch. Higher = faster but more VRAM">Batch</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetBatch"
                          min="1" max="16" value="4">
                   <span class="ctrl-value" id="valMosaicDetBatch">4</span>
                 </div>
-              </div>
-              <div class="ctrl-row">
-                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicDetectOnly">
-                <span class="ctrl-label" style="min-width:auto;"
-                      title="Draw detection overlay; skip restoration">Show Mask Only</span>
               </div>
             </div>
           </div>
@@ -229,6 +243,16 @@
                 </select>
               </div>
               <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicRestTrt" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Use TensorRT engines for restoration (much faster). Unchecked = PyTorch. Needs compiled sub-engines for this model + precision + clip size.">Use Tensor</span>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicRestFp16" checked>
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
+              </div>
+              <div class="ctrl-row">
                 <span class="ctrl-label" title="Frames per clip before splitting. Lower = less VRAM, more boundaries">Max Clip</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
@@ -237,14 +261,60 @@
                 </div>
               </div>
               <div class="ctrl-row">
-                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicFp16" checked>
-                <span class="ctrl-label" style="min-width:auto;"
-                      title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
+                <span class="ctrl-label"
+                      title="Grow each detected region by N pixels before restoring (0 = off)">ROI Dilate</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicRoiDilate"
+                         min="0" max="64" value="0">
+                  <span class="ctrl-value" id="valMosaicRoiDilate">0</span>
+                </div>
               </div>
               <div class="ctrl-row">
-                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCompileTrt" checked>
+                <span class="ctrl-label"
+                      title="Soften the restored-region mask edge by N pixels (0 = hard edge)">Feather</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicFeather"
+                         min="0" max="64" value="0">
+                  <span class="ctrl-value" id="valMosaicFeather">0</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Compositor blend-mask mode">Blend Mask</span>
+                <select class="ctrl-select" id="ctrlMosaicBlendMask">
+                  <option value="none" selected>None</option>
+                  <option value="facefusion">FaceFusion</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicSegMasks" checked>
                 <span class="ctrl-label" style="min-width:auto;"
-                      title="Compile / use TRT engines for restoration">Compile TRT</span>
+                      title="Use per-pixel segmentation masks (vs bounding boxes) for restoration">Use Seg Masks</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mask Preview (pseudo flat-fill; fast coverage check) -->
+          <div class="ctrl-section" id="sectMaskPreview">
+            <div class="ctrl-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
+              <span class="expand-icon">▼</span> Mask Preview
+            </div>
+            <div class="ctrl-section-body">
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicMaskPreview">
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Skip restoration; fill detected regions with a flat colour (fast). Any leftover mosaic = a detection miss.">Preview Mask Only</span>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Flat fill colour for detected regions">Mask Colour</span>
+                <input type="color" class="ctrl-color" id="ctrlMosaicMaskColor" value="#ff00ff">
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Fill opacity (0 = invisible, 1 = solid)">Mask Opacity</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicMaskOpacity"
+                         min="0" max="100" value="70">
+                  <span class="ctrl-value" id="valMosaicMaskOpacity">0.70</span>
+                </div>
               </div>
             </div>
           </div>
@@ -372,6 +442,17 @@
     <div class="modal-buttons">
       <button class="modal-btn modal-btn-cancel" id="confirmNo">Cancel</button>
       <button class="modal-btn modal-btn-confirm" id="confirmYes">OK</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay hidden" id="tensorModal">
+  <div class="modal">
+    <div class="modal-title" id="tensorModalTitle">TensorRT engine not found</div>
+    <div class="modal-message" id="tensorModalMessage"></div>
+    <div class="modal-buttons">
+      <button class="modal-btn modal-btn-cancel" id="tensorModalManage">Manage Models</button>
+      <button class="modal-btn modal-btn-confirm" id="tensorModalContinue">Continue on PyTorch</button>
     </div>
   </div>
 </div>

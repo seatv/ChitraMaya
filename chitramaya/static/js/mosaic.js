@@ -42,14 +42,18 @@ setActiveTab('restoration');
 // Per-control overrides on top of the generic handler in params.js.
 
 (function attachMosaicDialFormatting() {
-  // Score slider: 5-100 displays as 0.05-1.00
-  const score = document.getElementById('ctrlMosaicDetScore');
-  const scoreVal = document.getElementById('valMosaicDetScore');
-  if (score && scoreVal) {
-    const fmt = () => { scoreVal.textContent = (parseInt(score.value) / 100).toFixed(2); };
-    score.addEventListener('input', fmt);
-    fmt();
-  }
+  // Score + IoU sliders: 5-100 display as 0.05-1.00
+  [['ctrlMosaicDetScore', 'valMosaicDetScore'],
+   ['ctrlMosaicDetIou', 'valMosaicDetIou'],
+   ['ctrlMosaicMaskOpacity', 'valMosaicMaskOpacity']].forEach(([ctrlId, valId]) => {
+    const dial = document.getElementById(ctrlId);
+    const valSpan = document.getElementById(valId);
+    if (dial && valSpan) {
+      const fmt = () => { valSpan.textContent = (parseInt(dial.value) / 100).toFixed(2); };
+      dial.addEventListener('input', fmt);
+      fmt();
+    }
+  });
 })();
 
 
@@ -70,10 +74,12 @@ setActiveTab('restoration');
 // duplicating the save/load infrastructure.
 
 const MOSAIC_CONFIG_CONTROLS = [
-  'ctrlMosaicDetModel', 'ctrlMosaicDetScore', 'ctrlMosaicDetBatch',
-  'ctrlMosaicDetectOnly',
-  'ctrlMosaicRestModel', 'ctrlMosaicMaxClip',
-  'ctrlMosaicFp16', 'ctrlMosaicCompileTrt',
+  'ctrlMosaicDetModel', 'ctrlMosaicDetScore', 'ctrlMosaicDetIou',
+  'ctrlMosaicDetBatch', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
+  'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
+  'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
+  'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
+  'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
 ];
 
 if (typeof CONFIG_CONTROLS !== 'undefined') {
@@ -154,10 +160,10 @@ setInterval(checkSessionStatus, 60_000);
 // Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
 let _mosaicRestEngines = {};
 
-// True when Compile TRT is on but no compiled engine set exists for the
-// selected restoration model at the current precision. Restore is blocked
-// (the server would otherwise hard-fail with FileNotFoundError).
-let _restTrtUnavailable = false;
+// Detection engine availability, keyed by detection model (.pt) path:
+//   { "<path>": true|false }  (true = models/engines/<stem>.engine exists)
+// Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
+let _mosaicDetEngines = {};
 
 // Max Clip range when TRT is NOT constraining it (PyTorch chunks arbitrarily).
 const MAX_CLIP_FREE = { min: 30, max: 180, step: 10 };
@@ -171,10 +177,8 @@ function updateMaxClipConstraints() {
   if (!slider) return;
 
   const restModel = document.getElementById('ctrlMosaicRestModel').value;
-  const fp16 = document.getElementById('ctrlMosaicFp16').checked;
-  const useTrt = document.getElementById('ctrlMosaicCompileTrt').checked;
-
-  _restTrtUnavailable = false;
+  const fp16 = document.getElementById('ctrlMosaicRestFp16').checked;
+  const useTrt = document.getElementById('ctrlMosaicRestTrt').checked;
 
   if (!useTrt) {
     // PyTorch path — clip size is free.
@@ -191,8 +195,9 @@ function updateMaxClipConstraints() {
   const avail = info ? (fp16 ? info.fp16 : info.fp32) : [];
 
   if (!avail || avail.length === 0) {
-    // TRT requested but nothing compiled for this model + precision.
-    _restTrtUnavailable = !!restModel;
+    // TRT requested but nothing compiled for this model + precision. Leave the
+    // slider free; the submit-time modal handles the no-engine case (Continue
+    // on PyTorch / Manage Models), so we don't block the button here.
     slider.disabled = false;
     if (valSpan) valSpan.textContent = slider.value;
     _updateRestorationButtonStates();
@@ -222,6 +227,108 @@ function updateMaxClipConstraints() {
   }
 
   _updateRestorationButtonStates();
+}
+
+
+// ── Use Tensor availability + "engine not found" modal ────
+// The Use Tensor / FP16 checkboxes are just hardware preferences — they never
+// pop a dialog on toggle. Availability is verified at SUBMIT time (Restore /
+// Restore & Save), which is robust to engines renamed after the UI loaded.
+function _tensorEngineAvailable(kind) {
+  if (kind === 'det') {
+    const m = document.getElementById('ctrlMosaicDetModel').value;
+    if (!m) return false;
+    if (/\.engine$/i.test(m)) return true;      // already an engine
+    return _mosaicDetEngines[m] === true;
+  }
+  // restoration: any compiled set for the current precision counts — the Max
+  // Clip constraint pins the clip to a compiled size, and the server snaps.
+  const m = document.getElementById('ctrlMosaicRestModel').value;
+  const fp16 = document.getElementById('ctrlMosaicRestFp16').checked;
+  const info = _mosaicRestEngines[m];
+  const avail = info ? (fp16 ? info.fp16 : info.fp32) : [];
+  return Array.isArray(avail) && avail.length > 0;
+}
+
+// Re-fetch engine availability from the server (no dropdown changes). Called at
+// submit time so a stale cache (engine renamed/added since load) can't slip a
+// missing engine past the check — or falsely flag a present one.
+async function _refreshEngineCaches() {
+  const data = await apiGet('/api/list-mosaic-models');
+  if (!data || data.error) return;
+  _mosaicRestEngines = {};
+  for (const item of data.restoration || []) {
+    if (item.engines) _mosaicRestEngines[item.path] = item.engines;
+  }
+  _mosaicDetEngines = {};
+  for (const item of data.detection || []) {
+    _mosaicDetEngines[item.path] = !!item.has_engine;
+  }
+}
+
+// Custom in-app modal (no window.confirm — OS-inconsistent). Resolves to
+// 'continue' (run missing stages on PyTorch) or 'manage' (abort; opens Manage
+// Models). Dismiss via backdrop = 'manage' (safe: abort).
+function showTensorModal(missing) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('tensorModal');
+    const msgEl = document.getElementById('tensorModalMessage');
+    const contBtn = document.getElementById('tensorModalContinue');
+    const mngBtn = document.getElementById('tensorModalManage');
+    const stages = missing.map(k => k === 'det' ? 'detection' : 'restoration').join(' and ');
+    const slow = missing.includes('rest')
+      ? ' Restoration on PyTorch is much slower (it is the main bottleneck).'
+      : '';
+    msgEl.textContent =
+      'No compiled TensorRT engine was found for the ' + stages +
+      ' model at the current settings.\n\nContinue on PyTorch for the ' + stages +
+      ' stage, or open Manage Models to compile?' + slow;
+    overlay.classList.remove('hidden');
+
+    function cleanup(result) {
+      overlay.classList.add('hidden');
+      contBtn.removeEventListener('click', onCont);
+      mngBtn.removeEventListener('click', onMng);
+      overlay.removeEventListener('click', onBackdrop);
+      resolve(result);
+    }
+    function onCont() { cleanup('continue'); }
+    function onMng() { cleanup('manage'); }
+    function onBackdrop(e) { if (e.target === overlay) cleanup('manage'); }
+
+    contBtn.addEventListener('click', onCont);
+    mngBtn.addEventListener('click', onMng);
+    overlay.addEventListener('click', onBackdrop);
+  });
+}
+
+// Submit-time gate. Returns {proceed, override} where override marks which
+// stages to force onto PyTorch for this run. Mask Preview skips the restoration
+// check (pseudo needs no restoration engine).
+async function checkTensorBeforeRun() {
+  await _refreshEngineCaches();
+  const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
+  const missing = [];
+  if (document.getElementById('ctrlMosaicDetTrt').checked && !_tensorEngineAvailable('det')) {
+    missing.push('det');
+  }
+  if (!maskPreview && document.getElementById('ctrlMosaicRestTrt').checked
+      && !_tensorEngineAvailable('rest')) {
+    missing.push('rest');
+  }
+  if (missing.length === 0) return { proceed: true, override: null };
+
+  const choice = await showTensorModal(missing);
+  if (choice === 'continue') {
+    return {
+      proceed: true,
+      override: { det: missing.includes('det'), rest: missing.includes('rest') },
+    };
+  }
+  // 'manage' -> abort now; Manage Models modal lands in a later increment.
+  const b = document.getElementById('manageModelsBtn');
+  if (b) b.click();
+  return { proceed: false, override: null };
 }
 
 
@@ -261,6 +368,12 @@ async function populateMosaicModelDropdowns() {
     if (item.engines) _mosaicRestEngines[item.path] = item.engines;
   }
 
+  // Cache detection engine availability for the Use Tensor toggle.
+  _mosaicDetEngines = {};
+  for (const item of data.detection || []) {
+    _mosaicDetEngines[item.path] = !!item.has_engine;
+  }
+
   fill(detSel, data.detection);
   fill(restSel, data.restoration);
   updateMaxClipConstraints();
@@ -289,11 +402,20 @@ function gatherMosaicParams() {
       detection_model: document.getElementById('ctrlMosaicDetModel').value,
       restoration_model: document.getElementById('ctrlMosaicRestModel').value,
       mosaic_detection_score: score / 100.0,
+      mosaic_iou: parseInt(document.getElementById('ctrlMosaicDetIou').value) / 100.0,
       mosaic_detection_batch_size: parseInt(document.getElementById('ctrlMosaicDetBatch').value),
-      mosaic_detect_only: document.getElementById('ctrlMosaicDetectOnly').checked,
+      mosaic_detection_fp16: document.getElementById('ctrlMosaicDetFp16').checked,
+      mosaic_detection_trt: document.getElementById('ctrlMosaicDetTrt').checked,
+      mosaic_mask_preview: document.getElementById('ctrlMosaicMaskPreview').checked,
+      mosaic_mask_color: document.getElementById('ctrlMosaicMaskColor').value,
+      mosaic_mask_opacity: parseInt(document.getElementById('ctrlMosaicMaskOpacity').value) / 100.0,
       mosaic_max_clip_size: parseInt(document.getElementById('ctrlMosaicMaxClip').value),
-      mosaic_fp16: document.getElementById('ctrlMosaicFp16').checked,
-      mosaic_compile_trt: document.getElementById('ctrlMosaicCompileTrt').checked,
+      mosaic_restoration_fp16: document.getElementById('ctrlMosaicRestFp16').checked,
+      mosaic_roi_dilate: parseInt(document.getElementById('ctrlMosaicRoiDilate').value),
+      mosaic_feather_radius: parseInt(document.getElementById('ctrlMosaicFeather').value),
+      mosaic_blend_mask: document.getElementById('ctrlMosaicBlendMask').value,
+      mosaic_use_seg_masks: document.getElementById('ctrlMosaicSegMasks').checked,
+      mosaic_restoration_trt: document.getElementById('ctrlMosaicRestTrt').checked,
     },
     encoder: {
       codec: document.getElementById('ctrlCodec').value,
@@ -310,14 +432,17 @@ function buildMosaicParamsSummary() {
   const detName = document.getElementById('ctrlMosaicDetModel').selectedOptions[0]?.textContent || '—';
   parts.push(`Det: ${detName}`);
   parts.push(`Score: ${m.mosaic_detection_score.toFixed(2)}`);
-  if (m.mosaic_detect_only) {
-    parts.push('⬛ DETECT ONLY');
+  if (m.mosaic_mask_preview) {
+    parts.push('MASK PREVIEW');
   } else {
     const restName = document.getElementById('ctrlMosaicRestModel').selectedOptions[0]?.textContent || '—';
     parts.push(`Rest: ${restName}`);
     parts.push(`Clip: ${m.mosaic_max_clip_size}`);
-    parts.push(m.mosaic_fp16 ? 'FP16' : 'FP32');
-    parts.push(m.mosaic_compile_trt ? 'TRT' : 'PyTorch');
+    parts.push(m.mosaic_restoration_fp16 ? 'FP16' : 'FP32');
+    parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
+    if (m.mosaic_roi_dilate > 0) parts.push(`Dilate:${m.mosaic_roi_dilate}`);
+    if (m.mosaic_feather_radius > 0) parts.push(`Feather:${m.mosaic_feather_radius}`);
+    if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') parts.push(`Blend:${m.mosaic_blend_mask}`);
   }
   parts.push(`Enc: ${p.encoder.codec.toUpperCase()}/${p.encoder.preset}/QP${p.encoder.qp}`);
   return parts.join(' · ');
@@ -330,33 +455,28 @@ function _updateRestorationButtonStates() {
   const hasVideo = !!state.videoPath;
   const detModel = document.getElementById('ctrlMosaicDetModel').value;
   const restModel = document.getElementById('ctrlMosaicRestModel').value;
-  const detectOnly = document.getElementById('ctrlMosaicDetectOnly').checked;
-  const hasModels = detModel && (detectOnly || restModel);
+  const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
+  const hasModels = detModel && (maskPreview || restModel);
   const hasSegment = state.segmentEndTime > state.segmentStartTime;
   const inPreview = state.previewMode || false;
-  // TRT engines missing for the chosen restoration model + precision blocks a
-  // real restore (detect-only doesn't need the restorer).
-  const restBlocked = _restTrtUnavailable && !detectOnly;
 
   const restoreBtn = document.getElementById('restoreBtn');
   const restoreSaveBtn = document.getElementById('restoreSaveBtn');
   const restorePreviewBtn = document.getElementById('restorePreviewBtn');
 
-  const blockTip = restBlocked
-    ? 'No compiled TRT engines for this restoration model at the current precision. '
-      + 'Compile via Manage Models, or uncheck Compile TRT to use PyTorch.'
-    : '';
-
+  // A missing TRT engine no longer blocks Restore — the submit-time modal
+  // offers Continue-on-PyTorch or Manage Models. So buttons key off video +
+  // models (+ segment) only.
   // Restore (segment scope): needs video + models + segment marked.
   if (restoreBtn) {
-    restoreBtn.disabled = !hasVideo || !hasModels || !hasSegment || inPreview || restBlocked;
-    restoreBtn.title = blockTip;
+    restoreBtn.disabled = !hasVideo || !hasModels || !hasSegment || inPreview;
+    restoreBtn.title = '';
   }
 
   // Restore & Save (full video): only needs video + models.
   if (restoreSaveBtn) {
-    restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview || restBlocked;
-    restoreSaveBtn.title = blockTip;
+    restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview;
+    restoreSaveBtn.title = '';
   }
 
   // Preview: enabled + highlighted when a restored preview is ready.
@@ -418,17 +538,27 @@ if (typeof loadVideo === 'function') {
 }
 
 // Re-check on relevant changes
-['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicDetectOnly'].forEach(id => {
+['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateRestorationButtonStates);
 });
 
 // Controls that affect which compiled engine set applies re-evaluate the
 // Max Clip constraint (which also refreshes button states).
-['ctrlMosaicRestModel', 'ctrlMosaicFp16', 'ctrlMosaicCompileTrt'].forEach(id => {
+['ctrlMosaicRestModel', 'ctrlMosaicRestFp16'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', updateMaxClipConstraints);
 });
+
+// Use Tensor toggles run the availability / compile-permission check, then
+// refresh the relevant constraints + button states.
+// Use Tensor toggles are plain preferences — no dialog on toggle. Detection
+// affects nothing but button state; restoration re-runs the Max Clip
+// constraint. Availability is checked at submit time.
+const _detTrtEl = document.getElementById('ctrlMosaicDetTrt');
+if (_detTrtEl) _detTrtEl.addEventListener('change', _updateRestorationButtonStates);
+const _restTrtEl = document.getElementById('ctrlMosaicRestTrt');
+if (_restTrtEl) _restTrtEl.addEventListener('change', updateMaxClipConstraints);
 
 
 // ── Action button handlers ────────────────────────────────
@@ -447,7 +577,9 @@ function _showProgressModal(title, summary) {
 function _pollMosaicProgress({onComplete, onError}) {
   return setInterval(async () => {
     const prog = await apiGet('/api/progress');
-    if (!prog || prog.error) return;
+    // Bail only on a TRANSPORT error (apiGet returns {error} with no status).
+    // A job error is {status:"error", error:"..."} and must reach onError.
+    if (!prog || (prog.error && !prog.status)) return;
 
     const pct = prog.total > 0 ? Math.round((prog.frame / prog.total) * 100) : 0;
     progressBar.style.width = pct + '%';
@@ -493,6 +625,15 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
     return;
   }
   console.log(`[ChitraMaya] Restore segment: ${startTime.toFixed(2)}s → ${endTime.toFixed(2)}s`);
+
+  // Verify TRT engines at submit time. If missing, the modal offers Continue
+  // (PyTorch for that stage) or Manage Models (abort).
+  const gate = await checkTensorBeforeRun();
+  if (!gate.proceed) { _updateRestorationButtonStates(); return; }
+  if (gate.override) {
+    if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
+    if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
+  }
 
   const result = await apiPost('/api/mosaic-segment', {
     params, start_time: startTime, end_time: endTime,
@@ -567,6 +708,14 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
 
   const params = gatherMosaicParams();
   console.log('[ChitraMaya] Restore & Save:', params);
+
+  // Verify TRT engines at submit time (see segment handler).
+  const gate = await checkTensorBeforeRun();
+  if (!gate.proceed) { _updateRestorationButtonStates(); return; }
+  if (gate.override) {
+    if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
+    if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
+  }
 
   const result = await apiPost('/api/mosaic-full', { params });
   if (result.error) {
