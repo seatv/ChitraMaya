@@ -111,7 +111,6 @@ function gatherFullConfig() {
   const cfg = {};
 
   // Folder paths
-  cfg.facesDir = facesPath.value || '';
   cfg.outputDir = outputPath.value || '';
   cfg.tempDir = tempPath.value || '';
 
@@ -140,7 +139,6 @@ function applyConfig(cfg) {
   };
 
   // Folder paths
-  if (cfg.facesDir !== undefined) facesPath.value = cfg.facesDir;
   if (cfg.outputDir !== undefined) outputPath.value = cfg.outputDir;
   if (cfg.tempDir !== undefined) tempPath.value = cfg.tempDir;
 
@@ -161,49 +159,3 @@ function applyConfig(cfg) {
 
 // getDefaultConfig removed — defaults come from server /api/default-config
 // which derives them from models.py dataclasses (single source of truth)
-
-// ── Apply Settings / Live Preview ─────────────────────────
-// Two modes:
-// 1. Live OFF (default): user adjusts dials, clicks [Apply Settings]
-// 2. Live ON: auto-update on every dial change (debounced 50ms)
-
-let _previewTimer = null;
-
-async function applySettings() {
-  if (state.detectedFaces.length === 0) return;
-
-  const maskOnly = (document.getElementById('ctrlShowMask')?.checked ?? false);
-  if (!maskOnly && state.assignments[state.currentFaceIdx] === undefined) return;
-
-  applySettingsBtn.disabled = true;
-  applySettingsBtn.innerHTML = 'Applying<br>...';
-
-  const result = await previewSwap(state.currentFaceIdx);
-
-  if (result && result.image) {
-    // Update swapped thumbnail in carousel
-    _setSlotImage('swappedImg', result.image);
-    state.hasSwappedImage = true;
-
-    // Update zoom preview if open
-    if (state.zoomOpen) {
-      zoomImage.src = 'data:image/jpeg;base64,' + result.image;
-    }
-  }
-
-  applySettingsBtn.innerHTML = 'Apply<br>Settings';
-  applySettingsBtn.disabled = false;
-}
-
-function requestLivePreview() {
-  if (!livePreviewCheck || !livePreviewCheck.checked) return;
-  if (state.assignments[state.currentFaceIdx] === undefined) return;
-  if (_previewTimer) clearTimeout(_previewTimer);
-  _previewTimer = setTimeout(() => applySettings(), 50);
-}
-
-// Wire all controls to trigger live preview when enabled
-document.querySelectorAll('.ctrl-dial, .ctrl-select, .ctrl-checkbox').forEach(el => {
-  const event = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
-  el.addEventListener(event, requestLivePreview);
-});
