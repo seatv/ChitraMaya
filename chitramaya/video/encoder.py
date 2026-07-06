@@ -341,7 +341,7 @@ class Encoder:
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=300,
+                timeout=900,
             )
             if result.returncode != 0:
                 print(f"[Encoder] {label} failed (rc={result.returncode})")
