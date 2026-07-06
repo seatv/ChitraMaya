@@ -392,14 +392,14 @@ class SwapServer:
         # This prevents a stale UI/config clip size from hard-failing with a
         # FileNotFoundError. When nothing is compiled the request is left
         # unchanged so the build raises the clean "compile first" error.
-        if (mosaic_cfg.mosaic_compile_trt and mosaic_cfg.restoration_model
-                and not mosaic_cfg.mosaic_detect_only):
+        if (mosaic_cfg.mosaic_restoration_trt and mosaic_cfg.restoration_model
+                and not mosaic_cfg.mosaic_mask_preview):
             import dataclasses
             from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
                 list_basicvsrpp_compiled_clip_sizes,
             )
             avail = list_basicvsrpp_compiled_clip_sizes(
-                mosaic_cfg.restoration_model, bool(mosaic_cfg.mosaic_fp16),
+                mosaic_cfg.restoration_model, bool(mosaic_cfg.mosaic_restoration_fp16),
             )
             req = int(mosaic_cfg.mosaic_max_clip_size)
             if avail and req not in avail:
@@ -409,20 +409,48 @@ class SwapServer:
                     "[mosaic] Max clip %d has no compiled TRT engines for %s "
                     "(fp16=%s); snapping to %d (available: %s)",
                     req, mosaic_cfg.restoration_model,
-                    mosaic_cfg.mosaic_fp16, snapped, avail,
+                    mosaic_cfg.mosaic_restoration_fp16, snapped, avail,
                 )
                 mosaic_cfg = dataclasses.replace(
                     mosaic_cfg, mosaic_max_clip_size=snapped,
                 )
 
+        # Tensor Detection: if requested and a compiled .engine exists for the
+        # selected detection .pt, run detection on the engine (TRT). If the
+        # engine is missing, fall back to the .pt (PyTorch) gracefully — the UI
+        # warns on toggle, but detection is fast either way so we don't hard-fail.
+        if mosaic_cfg.mosaic_detection_trt and mosaic_cfg.detection_model:
+            det = str(mosaic_cfg.detection_model)
+            if det.lower().endswith(".pt"):
+                eng = _detection_engine_path(det)
+                if eng and os.path.isfile(eng):
+                    import dataclasses
+                    mosaic_cfg = dataclasses.replace(
+                        mosaic_cfg, detection_model=eng.replace("\\", "/"),
+                    )
+                else:
+                    logger.warning(
+                        "[mosaic] Tensor Detection requested but no engine for %s; "
+                        "using PyTorch (.pt).", det,
+                    )
+
         key = (
             mosaic_cfg.detection_model,
             mosaic_cfg.restoration_model,
-            bool(mosaic_cfg.mosaic_fp16),
-            bool(mosaic_cfg.mosaic_compile_trt),
+            bool(mosaic_cfg.mosaic_detection_trt),
+            bool(mosaic_cfg.mosaic_detection_fp16),
+            bool(mosaic_cfg.mosaic_restoration_fp16),
+            bool(mosaic_cfg.mosaic_restoration_trt),
             int(mosaic_cfg.mosaic_max_clip_size),
-            bool(mosaic_cfg.mosaic_detect_only),
+            bool(mosaic_cfg.mosaic_mask_preview),
             int(mosaic_cfg.mosaic_detection_batch_size),
+            round(float(mosaic_cfg.mosaic_iou), 4),
+            int(mosaic_cfg.mosaic_roi_dilate),
+            int(mosaic_cfg.mosaic_feather_radius),
+            str(mosaic_cfg.mosaic_blend_mask),
+            bool(mosaic_cfg.mosaic_use_seg_masks),
+            str(mosaic_cfg.mosaic_mask_color),
+            round(float(mosaic_cfg.mosaic_mask_opacity), 4),
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
 
@@ -483,7 +511,7 @@ class SwapServer:
         encoder_dict = params.get("encoder", {})
         if not mosaic_cfg.detection_model:
             raise RuntimeError("Detection model path not set")
-        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_detect_only:
+        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
             raise RuntimeError("Restoration model path not set")
 
         # Output path. Priority: payload output_dir (the value in the UI box at
@@ -494,7 +522,7 @@ class SwapServer:
         input_path = Path(self.video_path)
         out_dir = self.output_dir or str(input_path.parent)
         os.makedirs(out_dir, exist_ok=True)
-        suffix = "-detect" if mosaic_cfg.mosaic_detect_only else "-restored"
+        suffix = "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored"
         output_path = str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4")
 
         info = self.video_info or {}
@@ -510,7 +538,7 @@ class SwapServer:
             "restorations": 0,
             "buffered": 0,
             "output_path": output_path,
-            "mosaic_mode": "detect-only" if mosaic_cfg.mosaic_detect_only else "restore",
+            "mosaic_mode": "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore",
         }
 
         pipeline = self._ensure_mosaic_pipeline(mosaic_cfg, encoder_dict=encoder_dict)
@@ -563,7 +591,7 @@ class SwapServer:
         encoder_dict = params.get("encoder", {})
         if not mosaic_cfg.detection_model:
             raise RuntimeError("Detection model path not set")
-        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_detect_only:
+        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
             raise RuntimeError("Restoration model path not set")
 
         # Temp files. Priority: payload temp_dir -> persisted self.temp_dir ->
@@ -589,7 +617,7 @@ class SwapServer:
             "detections": 0,
             "restorations": 0,
             "buffered": 0,
-            "mosaic_mode": "detect-only" if mosaic_cfg.mosaic_detect_only else "restore",
+            "mosaic_mode": "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore",
         }
 
         # ── Phase 1: ffmpeg extract ─────────────────────────────────────
@@ -792,6 +820,19 @@ def api_session_status():
     })
 
 
+def _detection_engine_path(pt_path: str) -> str:
+    """Map a detection ``.pt`` checkpoint to its compiled TRT engine path.
+
+    Mirrors tools/compile_yolo.py: the engine lands in
+    ``<models>/engines/<stem>.engine``.
+    """
+    try:
+        p = Path(pt_path)
+        return str(p.parent / "engines" / f"{p.stem}.engine")
+    except Exception:
+        return ""
+
+
 @app.route("/api/list-mosaic-models", methods=["GET"])
 def api_list_mosaic_models():
     """Scan the project's ``models/`` directory for mosaic models.
@@ -816,7 +857,12 @@ def api_list_mosaic_models():
                 continue
             ext = p.suffix.lower()
             if ext == ".pt":
-                detection.append({"path": str(p).replace("\\", "/"), "label": p.stem})
+                eng = _detection_engine_path(str(p))
+                detection.append({
+                    "path": str(p).replace("\\", "/"),
+                    "label": p.stem,
+                    "has_engine": bool(eng and os.path.isfile(eng)),
+                })
             elif ext == ".pth":
                 mp = str(p)
                 # Compiled clip sizes per precision, so the UI can default and
@@ -982,14 +1028,25 @@ def api_default_config():
         # Detection
         "ctrlMosaicDetModel": m.detection_model,
         "ctrlMosaicDetScore": str(int(m.mosaic_detection_score * 100)),
+        "ctrlMosaicDetIou": str(int(m.mosaic_iou * 100)),
         "ctrlMosaicDetBatch": str(m.mosaic_detection_batch_size),
-        "ctrlMosaicDetectOnly": m.mosaic_detect_only,
+        "ctrlMosaicDetFp16": m.mosaic_detection_fp16,
+        "ctrlMosaicDetTrt": m.mosaic_detection_trt,
 
         # Restoration
         "ctrlMosaicRestModel": m.restoration_model,
         "ctrlMosaicMaxClip": str(m.mosaic_max_clip_size),
-        "ctrlMosaicFp16": m.mosaic_fp16,
-        "ctrlMosaicCompileTrt": m.mosaic_compile_trt,
+        "ctrlMosaicRestFp16": m.mosaic_restoration_fp16,
+        "ctrlMosaicRoiDilate": str(m.mosaic_roi_dilate),
+        "ctrlMosaicFeather": str(m.mosaic_feather_radius),
+        "ctrlMosaicBlendMask": m.mosaic_blend_mask,
+        "ctrlMosaicSegMasks": m.mosaic_use_seg_masks,
+        "ctrlMosaicRestTrt": m.mosaic_restoration_trt,
+
+        # Mask Preview
+        "ctrlMosaicMaskPreview": m.mosaic_mask_preview,
+        "ctrlMosaicMaskColor": m.mosaic_mask_color,
+        "ctrlMosaicMaskOpacity": str(int(m.mosaic_mask_opacity * 100)),
 
         # Encoder
         "ctrlCodec": "hevc",

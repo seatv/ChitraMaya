@@ -17,7 +17,9 @@ class PseudoClipRestorer(BaseClipRestorer):
       - clip crop/resize/pad mapping
       - compositor paste-back ordering
 
-    Output is clip-sized float32 frames in [0,1].
+    Output is clip-sized uint8 HWC (BGR) frames in [0,255], matching what the
+    real BasicVSR++ restorer emits and what the compositor consumes. (Earlier
+    this returned [0,1] floats, which the compositor read as ~0 => black fill.)
     """
 
     def __init__(
@@ -28,7 +30,10 @@ class PseudoClipRestorer(BaseClipRestorer):
     ) -> None:
         super().__init__(device=device)
         b, g, r = [int(x) for x in fill_color_bgr]
-        self.fill_color = torch.tensor([b, g, r], device=device, dtype=torch.float32) / 255.0
+        # Keep the fill in [0,255] to match the compositor, which treats
+        # restored frames as uint8-range. (Was /255 -> [0,1], which the
+        # compositor then blended as ~0 and produced a near-black fill.)
+        self.fill_color = torch.tensor([b, g, r], device=device, dtype=torch.float32)
         self.fill_opacity = float(fill_opacity)
         # Compositor reads this to know which dtype to do blending math in.
         # Pseudo doesn't have a real model; float32 is fine here.
@@ -37,18 +42,22 @@ class PseudoClipRestorer(BaseClipRestorer):
     def restore_clip(self, clip: Clip) -> List[torch.Tensor]:
         out: List[torch.Tensor] = []
 
-        # Each clip frame is float32 HWC in [0,1] on the decode device.
+        # Each clip frame is uint8 HWC (BGR) in [0,255] on the decode device.
         for frm, m in zip(clip.frames, clip.masks):
             # m: uint8 HW, 0..255
             if m is None:
                 out.append(frm)
                 continue
 
-            a = (m.to(dtype=torch.float32) / 255.0) * self.fill_opacity  # HW
-            a3 = a.unsqueeze(-1)  # HW1
+            f = frm.to(dtype=torch.float32)                         # [0,255]
+            fill = self.fill_color.to(f.device).view(1, 1, 3)       # [0,255] BGR
+            a = (m.to(device=f.device, dtype=torch.float32) / 255.0) * self.fill_opacity  # HW
+            a3 = a.unsqueeze(-1)                                     # HW1
 
-            # Blend within mask
-            y = frm * (1.0 - a3) + self.fill_color.view(1, 1, 3) * a3
+            # Blend within mask, then round+clamp back to uint8 like the real
+            # restorer so the compositor receives [0,255] values.
+            y = f * (1.0 - a3) + fill * a3
+            y = y.round_().clamp_(0, 255).to(torch.uint8)
             out.append(y)
 
         return out
