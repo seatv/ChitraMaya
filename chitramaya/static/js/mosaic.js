@@ -57,17 +57,6 @@ setActiveTab('restoration');
 })();
 
 
-// ── Exclude mosaic controls from face-swap live preview ───
-// params.js attaches requestLivePreview to every dial/select/checkbox by
-// default. Mosaic controls shouldn't trigger swap preview, so unbind them.
-//
-// We can't easily unbind, but we can short-circuit: requestLivePreview
-// already checks `state.assignments[state.currentFaceIdx] === undefined`
-// and returns early. As long as the user isn't in a swap context, mosaic
-// dial changes will silently no-op. No explicit unbind needed here — leaving
-// this comment as a tripwire for future maintainers who might wonder.
-
-
 // ── Extend unified config system with mosaic controls ─────
 // CONFIG_CONTROLS is defined in params.js; extending here keeps mosaic
 // controls auto-persisted via Save Settings / Load Settings without
@@ -76,6 +65,7 @@ setActiveTab('restoration');
 const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicDetModel', 'ctrlMosaicDetScore', 'ctrlMosaicDetIou',
   'ctrlMosaicDetBatch', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
+  'ctrlMosaicSbsSplit',
   'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
@@ -406,6 +396,7 @@ function gatherMosaicParams() {
       mosaic_detection_batch_size: parseInt(document.getElementById('ctrlMosaicDetBatch').value),
       mosaic_detection_fp16: document.getElementById('ctrlMosaicDetFp16').checked,
       mosaic_detection_trt: document.getElementById('ctrlMosaicDetTrt').checked,
+      mosaic_sbs_split: document.getElementById('ctrlMosaicSbsSplit').checked,
       mosaic_mask_preview: document.getElementById('ctrlMosaicMaskPreview').checked,
       mosaic_mask_color: document.getElementById('ctrlMosaicMaskColor').value,
       mosaic_mask_opacity: parseInt(document.getElementById('ctrlMosaicMaskOpacity').value) / 100.0,
@@ -694,7 +685,7 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
 });
 
 
-// Restore & Save (full video, no preview)
+// Restore & Save (full video). On completion, Preview plays the full output.
 document.getElementById('restoreSaveBtn').addEventListener('click', async () => {
   if (!state.videoPath) {
     alert('Load a video first.');
@@ -737,6 +728,9 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
         `Done — ${prog.frame} frames, ${prog.detections || 0} det, ${prog.restorations || 0} res`;
       progressBar.style.width = '100%';
       progressCancel.textContent = 'Close';
+      // Server pointed preview at the full output — enable Preview so clicking
+      // it plays the completed file (same mechanism as segment preview).
+      state.previewReady = true;
       _updateRestorationButtonStates();
       console.log('[ChitraMaya] Restore & Save complete:', prog);
     },

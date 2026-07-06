@@ -22,76 +22,6 @@ function showConfirm(title, message) {
   });
 }
 
-// ── Faces Folder ─────────────────────────────────────────
-
-facesBtn.addEventListener('click', async () => {
-  const path = await selectFolder();
-  if (!path) return;
-
-  facesPath.value = path;
-  console.log('[ChitraMaya] Loading faces from:', path);
-  const result = await loadFacesDir(path);
-  console.log('[ChitraMaya] Faces result:', result);
-  if (result && !result.error) renderFaceGrid();
-});
-
-function renderFaceGrid() {
-  faceGrid.innerHTML = '';
-
-  if (state.sourceFaces.length === 0) {
-    faceGrid.innerHTML = `
-      <div class="drop-zone" style="grid-column:1/-1; padding:20px;">
-        <div class="icon">🧑</div>
-        <div class="sublabel">No faces found in folder</div>
-      </div>`;
-    faceCount.textContent = '';
-    return;
-  }
-
-  faceCount.textContent = `(${state.sourceFaces.length})`;
-
-  state.sourceFaces.forEach((face, idx) => {
-    const card = document.createElement('div');
-    card.className = 'face-card';
-    card.dataset.idx = idx;
-
-    // Highlight if assigned to current target
-    if (state.assignments[state.currentFaceIdx] === idx) {
-      card.classList.add('assigned');
-    }
-
-    card.innerHTML = `
-      <img src="data:image/jpeg;base64,${face.thumb_b64}" alt="${face.name}">
-      <span class="face-name">${face.name}</span>
-    `;
-
-    card.addEventListener('click', () => onSourceFaceClick(idx));
-    faceGrid.appendChild(card);
-  });
-}
-
-async function onSourceFaceClick(sourceIdx) {
-  if (state.detectedFaces.length === 0) return;
-
-  console.log(`[ChitraMaya] Assigning source ${sourceIdx} to target ${state.currentFaceIdx}`);
-  const result = await assignFace(state.currentFaceIdx, sourceIdx);
-  console.log('[ChitraMaya] Assignment result:', result);
-  console.log('[ChitraMaya] JS assignments:', JSON.stringify(state.assignments));
-
-  // Clear old preview state — new assignment means previous preview is stale
-  state.previewReady = false;
-  state.previewMode = false;
-  previewBtn.disabled = true;
-  previewBtn.classList.remove('highlight', 'primary');
-  previewBtn.textContent = 'Preview';
-
-  updateSourceDisplay();
-  updateSwappedDisplay(result);
-  state.hasSwappedImage = !!(result && result.swapped_thumb_b64);
-  renderFaceGrid();
-  _updateButtonStates();
-}
-
 // ── Output Folder ────────────────────────────────────────
 
 outputBtn.addEventListener('click', async () => {
@@ -103,16 +33,6 @@ outputBtn.addEventListener('click', async () => {
 });
 
 // Allow paste + Enter on path fields
-facesPath.addEventListener('keydown', async (e) => {
-  if (e.key === 'Enter') {
-    const path = facesPath.value.trim();
-    if (path) {
-      const result = await loadFacesDir(path);
-      if (result) renderFaceGrid();
-    }
-  }
-});
-
 outputPath.addEventListener('keydown', async (e) => {
   if (e.key === 'Enter') {
     const path = outputPath.value.trim();
@@ -135,27 +55,6 @@ tempPath.addEventListener('keydown', async (e) => {
     const path = tempPath.value.trim();
     if (path) await apiPost('/api/set-temp-dir', { path });
   }
-});
-
-// ── Apply Settings ───────────────────────────────────────
-
-applySettingsBtn.addEventListener('click', () => applySettings());
-
-// ── Apply to All ─────────────────────────────────────────
-
-applyAllBtn.addEventListener('click', async () => {
-  if (state.detectedFaces.length === 0) return;
-  // Use the source assigned to face index 0, or the currently selected source
-  const sourceIdx = state.assignments[state.currentFaceIdx];
-  if (sourceIdx === undefined) return;
-
-  // Assign this source to ALL detected faces
-  for (let i = 0; i < state.detectedFaces.length; i++) {
-    await assignFace(i, sourceIdx);
-  }
-
-  renderFaceGrid();
-  updateCarousel();
 });
 
 // ── Video Load (called from player.js via chitramayaSetVideoFromPath) ───
@@ -200,45 +99,19 @@ async function onVideoLoad(path) {
 // Expose for player.js
 window.onVideoLoad = onVideoLoad;
 
-// ── Face Carousel ────────────────────────────────────────
-
-prevFaceBtn.addEventListener('click', () => {
-  if (state.detectedFaces.length === 0) return;
-  state.currentFaceIdx = Math.max(0, state.currentFaceIdx - 1);
-  updateCarousel();
-});
-
-nextFaceBtn.addEventListener('click', () => {
-  if (state.detectedFaces.length === 0) return;
-  state.currentFaceIdx = Math.min(state.detectedFaces.length - 1, state.currentFaceIdx + 1);
-  updateCarousel();
-});
-
+// ── Detected-region thumbnail ────────────────────────────
+// Up/down nav removed. updateCarousel now just refreshes the Mosaic
+// (Detected) thumbnail from the current detection. Drop 3 rewires the whole
+// detect/preview flow into the FOI preview.
 function updateCarousel() {
   const total = state.detectedFaces.length;
   const idx = state.currentFaceIdx;
-
-  faceCounter.textContent = total > 0 ? `${idx + 1}/${total}` : '—';
-
-  // Update target face
   if (total > 0 && state.detectedFaces[idx]) {
     _setSlotImage('targetImg', state.detectedFaces[idx].crop_b64);
   } else {
     _clearSlotImage('targetImg');
   }
-
-  updateSourceDisplay();
   updateSwappedDisplay(null);
-  renderFaceGrid(); // Update highlights
-}
-
-function updateSourceDisplay() {
-  const sourceIdx = state.assignments[state.currentFaceIdx];
-  if (sourceIdx !== undefined && state.sourceFaces[sourceIdx]) {
-    _setSlotImage('sourceImg', state.sourceFaces[sourceIdx].thumb_b64);
-  } else {
-    _clearSlotImage('sourceImg');
-  }
 }
 
 function updateSwappedDisplay(assignResult) {
@@ -298,13 +171,7 @@ function _updateButtonStates() {
   // (10) Detect: armed when video loaded AND not in Preview Mode
   detectBtn.disabled = !hasVideo || inPreview;
 
-  // (1) Apply to All: armed when there is at least one assignment
-  applyAllBtn.disabled = !hasAssignment;
-
-  // Apply Settings: armed when swapped is populated (assignment or mask mode)
-  applySettingsBtn.disabled = !(hasAssignment || (hasDetected && maskOnly));
-
-  // (5) Magnifier: armed whenever Swapped is populated
+  // (5) Magnifier: armed whenever Restored is populated
   zoomBtn.disabled = !hasSwapped;
 
   // (9) Swap: armed when Swapped Face AND segment selected, OR mask mode with detection + segment
@@ -379,7 +246,6 @@ detectBtn.addEventListener('click', async () => {
       }
     }
   } else {
-    faceCounter.textContent = '0';
     console.log('[ChitraMaya] No faces detected');
   }
 
@@ -708,14 +574,9 @@ async function resetProject() {
   videoDrop.style.display = 'flex';
   videoContainer.style.display = 'none';
 
-  // Clear face carousel
-  _clearSlotImage('sourceImg');
+  // Clear thumbnails
   _clearSlotImage('targetImg');
   _clearSlotImage('swappedImg');
-  faceCounter.textContent = '—';
-
-  // Clear face grid highlights
-  renderFaceGrid();
 
   // Clear zoom
   zoomOverlay.classList.add('hidden');
@@ -784,10 +645,6 @@ console.log('[ChitraMaya] UI ready');
     }
     if (cfg && !cfg.error) {
       applyConfig(cfg);
-      if (cfg.facesDir) {
-        const result = await loadFacesDir(cfg.facesDir);
-        if (result && !result.error) renderFaceGrid();
-      }
       if (cfg.outputDir) {
         state.outputDir = cfg.outputDir;
         // Push to the server so self.output_dir matches the loaded config
@@ -832,10 +689,6 @@ async function loadConfig() {
   const cfg = await apiGet('/api/load-config');
   if (cfg && !cfg.error && Object.keys(cfg).length > 0) {
     applyConfig(cfg);
-    if (cfg.facesDir && cfg.facesDir !== state.facesDir) {
-      const result = await loadFacesDir(cfg.facesDir);
-      if (result && !result.error) renderFaceGrid();
-    }
     if (cfg.outputDir) {
       state.outputDir = cfg.outputDir;
       await apiPost('/api/set-output-dir', { path: cfg.outputDir });

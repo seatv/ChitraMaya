@@ -13,9 +13,15 @@
 
   <!-- ── Top Header Bar ─────────────────────────────────── -->
   <div class="app-header">
-    <span class="header-spacer"></span>
     <span class="logo">ChitraMaya</span>
-    <span class="header-spacer"></span>
+    <div style="display:flex; align-items:center; gap:6px; flex:1; margin:0 14px; min-width:0;">
+      <button class="header-btn" id="outputBtn" title="Select output folder">📁 Output</button>
+      <input type="text" class="left-footer-path" id="outputPath" placeholder="Output folder..."
+             title="Paste path and press Enter" style="flex:1; min-width:80px;">
+      <button class="header-btn" id="tempBtn" title="Select temp folder">📁 Temp</button>
+      <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp folder..."
+             title="Paste path and press Enter" style="flex:1; min-width:80px;">
+    </div>
     <div class="config-menu-wrap">
       <button class="header-btn" id="configBtn" title="Configuration">⚙️</button>
       <div class="config-menu hidden" id="configMenu">
@@ -29,84 +35,25 @@
   <!-- ── Main Three-Panel Content ───────────────────────── -->
   <div class="main-content">
 
-    <!-- ── LEFT: Source Face Library ─────────────────────── -->
-    <div class="left-panel">
-      <div class="panel-header">
-        <button class="header-btn" id="facesBtn" title="Select faces folder">📁 Faces</button>
-        <input type="text" class="panel-path" id="facesPath" placeholder="Faces folder..."
-               title="Paste folder path and press Enter">
-        <span id="faceCount" style="font-size:11px; color:var(--text-dim);"></span>
-      </div>
-
-      <div class="face-grid" id="faceGrid">
-        <!-- Face cards populated by JS -->
-        <div class="drop-zone" id="facesDrop" style="grid-column: 1/-1; padding: 20px;">
-          <div class="icon">🧑</div>
-          <div class="sublabel">Set faces folder above</div>
-        </div>
-      </div>
-
-      <div class="left-panel-footer">
-        <div class="left-footer-row">
-          <button class="header-btn" id="outputBtn" title="Select output folder">📁 Output</button>
-          <input type="text" class="left-footer-path" id="outputPath" placeholder="Output folder..."
-                 title="Paste path and press Enter">
-        </div>
-        <div class="left-footer-row">
-          <button class="header-btn" id="tempBtn" title="Select temp folder">📁 Temp</button>
-          <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp folder..."
-                 title="Paste path and press Enter">
-        </div>
-      </div>
-    </div>
-
     <!-- ── CENTER: Video / Preview ──────────────────────── -->
     <div class="center-panel">
 
-      <!-- Face carousel strip -->
+      <!-- Detected / Restored thumbnails -->
       <div class="face-strip" id="faceStrip">
 
-        <!-- Apply to All (acts on Source assignment) -->
-        <div class="strip-action-col">
-          <button class="strip-action-btn" id="applyAllBtn" disabled
-                  title="Apply selected source to all targets">Apply<br>to All</button>
-        </div>
-
-        <!-- Source face -->
-        <div class="face-slot">
-          <div class="face-slot-img empty" id="sourceImg">?</div>
-          <span class="face-slot-label">Source</span>
-        </div>
-
-        <!-- Target face (detected) -->
+        <!-- Detected mosaic region -->
         <div class="face-slot">
           <div class="face-slot-img empty" id="targetImg">?</div>
-          <span class="face-slot-label">Target</span>
+          <span class="face-slot-label">Mosaic</span>
         </div>
 
-        <!-- Swapped face (result) + zoom -->
+        <!-- Restored region + zoom -->
         <div class="face-slot">
           <div class="face-slot-img empty" id="swappedImg">?</div>
           <div class="face-slot-label">
-            <span>Swapped</span>
+            <span>Restored</span>
             <button class="zoom-btn" id="zoomBtn" title="Open 512×512 preview">🔍</button>
           </div>
-        </div>
-
-        <!-- Vertical carousel nav -->
-        <div class="carousel-vert">
-          <button class="carousel-btn-v" id="prevFaceBtn" title="Previous face">▲</button>
-          <span class="carousel-counter" id="faceCounter">—</span>
-          <button class="carousel-btn-v" id="nextFaceBtn" title="Next face">▼</button>
-        </div>
-
-        <!-- Apply Settings (acts on Swapped result) -->
-        <div class="strip-action-col">
-          <button class="strip-action-btn accent" id="applySettingsBtn" disabled
-                  title="Apply settings and update swap">Apply<br>Settings</button>
-          <label class="live-toggle">
-            <input type="checkbox" id="livePreviewCheck"> Live
-          </label>
         </div>
 
       </div>
@@ -136,8 +83,8 @@
               <img id="zoomOriginal" src="" alt="Original face 512×512">
             </div>
             <div class="zoom-panel">
-              <div class="zoom-label">Swapped</div>
-              <img id="zoomImage" src="" alt="Swapped face 512×512">
+              <div class="zoom-label">Restored</div>
+              <img id="zoomImage" src="" alt="Restored region 512×512">
             </div>
             <button class="zoom-close" id="zoomClose" title="Close preview">✕</button>
           </div>
@@ -226,6 +173,11 @@
                          min="1" max="16" value="4">
                   <span class="ctrl-value" id="valMosaicDetBatch">4</span>
                 </div>
+              </div>
+              <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicSbsSplit">
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Side-by-side stereo (VR): split each eye, detect separately, merge, and keep restorations from crossing the seam.">Split SBS</span>
               </div>
             </div>
           </div>

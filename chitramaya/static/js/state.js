@@ -2,34 +2,22 @@
 const appRoot = document.getElementById('appRoot');
 
 // Header
-const facesBtn = document.getElementById('facesBtn');
-const facesPath = document.getElementById('facesPath');
 const configBtn = document.getElementById('configBtn');
 const configMenu = document.getElementById('configMenu');
 const cfgSave = document.getElementById('cfgSave');
 const cfgLoad = document.getElementById('cfgLoad');
 const cfgReset = document.getElementById('cfgReset');
 
-// Left panel
-const faceGrid = document.getElementById('faceGrid');
-const facesDrop = document.getElementById('facesDrop');
-const faceCount = document.getElementById('faceCount');
+// Folder fields (in header)
 const outputBtn = document.getElementById('outputBtn');
 const outputPath = document.getElementById('outputPath');
 const tempBtn = document.getElementById('tempBtn');
 const tempPath = document.getElementById('tempPath');
 
-// Face strip
-const applyAllBtn = document.getElementById('applyAllBtn');
-const sourceImg = document.getElementById('sourceImg');
+// Detected / Restored thumbnails + zoom
 const targetImg = document.getElementById('targetImg');
 const swappedImg = document.getElementById('swappedImg');
-const prevFaceBtn = document.getElementById('prevFaceBtn');
-const nextFaceBtn = document.getElementById('nextFaceBtn');
-const faceCounter = document.getElementById('faceCounter');
 const zoomBtn = document.getElementById('zoomBtn');
-const applySettingsBtn = document.getElementById('applySettingsBtn');
-const livePreviewCheck = document.getElementById('livePreviewCheck');
 
 // Center
 const centerArea = document.getElementById('centerArea');
