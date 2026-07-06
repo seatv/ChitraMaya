@@ -111,6 +111,12 @@ class MosaicConfig:
     mosaic_detection_fp16: bool = True  # detection engine precision
     mosaic_detection_trt: bool = True   # use TRT .engine for detection if available (else .pt)
 
+    # SBS / stereo (side-by-side): one switch. When on, the frame is split at
+    # the midline, each eye detected separately then merged, and restorations
+    # are kept from crossing the seam. Layout (lr/rl) is irrelevant — the
+    # split/merge is position-preserving, so we always split at w//2.
+    mosaic_sbs_split: bool = False
+
     # Restoration
     mosaic_max_clip_size: int = 90
     mosaic_temporal_overlap: int = 8
@@ -168,6 +174,9 @@ class MosaicConfig:
             use_seg_masks=bool(self.mosaic_use_seg_masks),
             feather_radius=int(self.mosaic_feather_radius),
             blendmask=str(self.mosaic_blend_mask),
+            sbs_enabled=bool(self.mosaic_sbs_split),
+            sbs_layout="lr",
+            sbs_det_split=bool(self.mosaic_sbs_split),
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),

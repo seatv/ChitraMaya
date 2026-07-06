@@ -95,6 +95,10 @@ class SwapServer:
         self.output_dir: str = ""
         self.temp_dir: str = ""
         self.preview_path: str | None = None
+        # True when preview_path is a disposable temp file (segment preview);
+        # False when it points at a real deliverable (full Restore & Save
+        # output), which must NOT be deleted by /api/clear-preview.
+        self._preview_is_temp: bool = True
 
         # Load saved folder paths from config
         self._load_ui_config()
@@ -370,6 +374,7 @@ class SwapServer:
         self._current_frame = None
         self._current_frame_num = -1
         self.preview_path = None
+        self._preview_is_temp = True
         self._cancel_flag.clear()
         self._progress = {}
 
@@ -451,6 +456,7 @@ class SwapServer:
             bool(mosaic_cfg.mosaic_use_seg_masks),
             str(mosaic_cfg.mosaic_mask_color),
             round(float(mosaic_cfg.mosaic_mask_opacity), 4),
+            bool(mosaic_cfg.mosaic_sbs_split),
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
 
@@ -565,6 +571,11 @@ class SwapServer:
             self._progress["restorations"] = result.restorations
             if result.diag_path:
                 self._progress["diag_path"] = result.diag_path
+            # Let Preview play the full output. It's a real deliverable, so mark
+            # it non-temp — /api/clear-preview must not delete it.
+            if Path(output_path).exists():
+                self.preview_path = output_path
+                self._preview_is_temp = False
 
         logger.info("mosaic_full: %d frames, %d det, %d res → %s",
                     result.frames, result.detections, result.restorations, output_path)
@@ -603,6 +614,7 @@ class SwapServer:
         os.makedirs(temp_dir, exist_ok=True)
         seg_input = os.path.join(temp_dir, "chitramaya_mosaic_seg_input.mp4")
         self.preview_path = os.path.join(temp_dir, "chitramaya_mosaic_preview.mp4")
+        self._preview_is_temp = True   # segment preview is a disposable temp file
 
         info = self.video_info or {}
         vid_fps = float(info.get("fps", 30.0))
@@ -947,14 +959,17 @@ def api_new_project():
 
 @app.route("/api/clear-preview", methods=["POST"])
 def api_clear_preview():
-    """Delete preview temp file and clear preview state."""
+    """Clear preview state. Deletes the preview file only when it's a temp
+    file (segment preview) — never a real Restore & Save output."""
     server = _get_server()
-    if server.preview_path and Path(server.preview_path).exists():
+    if (server._preview_is_temp and server.preview_path
+            and Path(server.preview_path).exists()):
         try:
             os.unlink(server.preview_path)
         except Exception:
             pass
     server.preview_path = None
+    server._preview_is_temp = True
     return jsonify({"ok": True})
 
 
@@ -1032,6 +1047,7 @@ def api_default_config():
         "ctrlMosaicDetBatch": str(m.mosaic_detection_batch_size),
         "ctrlMosaicDetFp16": m.mosaic_detection_fp16,
         "ctrlMosaicDetTrt": m.mosaic_detection_trt,
+        "ctrlMosaicSbsSplit": m.mosaic_sbs_split,
 
         # Restoration
         "ctrlMosaicRestModel": m.restoration_model,

@@ -556,6 +556,8 @@ class Pipeline:
                 print(f"[SBS] Warning: width {w} is not even; splitting by floor(w/2).")
             if self.sbs_layout not in ("lr", "rl"):
                 raise ValueError(f"Invalid --sbs-layout: {self.sbs_layout!r}")
+            _sbs_mode = "ON (per-eye)" if self.sbs_det_split else "OFF (whole frame)"
+            print(f"[SBS] Enabled: layout={self.sbs_layout}, per-eye detection {_sbs_mode}")
 
         # ChitraMaya's Encoder has a slimmer signature than gRestorer's.
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
@@ -731,6 +733,10 @@ class Pipeline:
                 detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
             elif detector is not None:
                 if self.sbs_enabled and self.sbs_det_split:
+                    if not getattr(self, "_sbs_split_logged", False):
+                        print(f"[SBS] Per-eye detection path ACTIVE: splitting {w}x{h} into L|R halves "
+                              f"(layout={self.sbs_layout}), detecting each half, merging boxes/masks.")
+                        self._sbs_split_logged = True
                     left_frames: List[torch.Tensor] = []
                     right_frames: List[torch.Tensor] = []
                     half_w = w // 2
