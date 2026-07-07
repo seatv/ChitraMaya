@@ -119,6 +119,11 @@ class PipelineMetrics:
     # diagnose detection-vs-restoration miss rates.
     frames_restored: set = field(default_factory=set)
 
+    # Restorer workload: one entry per restored clip = its frame count. Restore
+    # cost tracks clips x clip-length far better than box count, so this is
+    # what explains restore-time differences between detection configs.
+    clip_lengths: list = field(default_factory=list)
+
     # Tracking: frames with no detection AND no active scene AND no new
     # clips. These are LEGITIMATE passthroughs — clean frames the eye
     # would expect to see passed through untouched. NOT a detection miss.
@@ -504,6 +509,7 @@ class Pipeline:
         restorer_override=None,
         progress_cb=None,
         cancel_flag=None,
+        foi_capture=None,
     ):
         """Run the pipeline over the configured input/output.
 
@@ -528,6 +534,18 @@ class Pipeline:
         """
         inp = Path(self.input_path)
         out = Path(self.output_path)
+
+        # FOI preview capture: when foi_capture is a dict with 'target_frame',
+        # we snapshot that frame's boxes, the pre-composite (original) frame,
+        # and the post-composite (paste-back) frame during the normal run. The
+        # encode/mux still happens (to a temp output the caller discards) so the
+        # detect/track/restore/composite path is byte-identical to a real run.
+        _foi_target = None
+        if foi_capture is not None:
+            try:
+                _foi_target = int(foi_capture.get("target_frame"))
+            except (TypeError, ValueError):
+                _foi_target = None
         out.parent.mkdir(parents=True, exist_ok=True)
 
         metrics = PipelineMetrics()
@@ -829,9 +847,21 @@ class Pipeline:
 
                 metrics.det_stats.add(boxes, w=w, h=h, frame_num=frame_num)
 
+                # FOI: snapshot the target frame's finalized boxes/masks.
+                if _foi_target is not None and frame_num == _foi_target:
+                    foi_capture["boxes"] = list(boxes)
+                    foi_capture["masks"] = masks_list
+                    foi_capture["frame_w"] = int(w)
+                    foi_capture["frame_h"] = int(h)
+
                 # [CHANGE 4] Store frame with PTS
                 frame_pts = batch_pts[i] if i < len(batch_pts) else None
                 store.put(frame_num, bgr_u8, pts=frame_pts)
+
+                # FOI: snapshot the ORIGINAL (pre-composite) target frame. The
+                # compositor mutates store frames in place, so clone now.
+                if _foi_target is not None and frame_num == _foi_target:
+                    foi_capture["original"] = bgr_u8.detach().clone()
 
                 t0 = time.perf_counter()
                 step = tracker.step_frame(frame_num, bgr_u8, boxes, masks_list)
@@ -848,7 +878,18 @@ class Pipeline:
                             model_dtype=restorer.model_dtype,
                         )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
+                        metrics.clip_lengths.append(int(len(clip.frame_nums)))
                         metrics.t_restore += (time.perf_counter() - t0)
+
+                        # FOI: snapshot the target frame AFTER paste-back. If a
+                        # later overlapping clip touches it again, this updates
+                        # to the last composite (correct final state).
+                        if (_foi_target is not None
+                                and int(_foi_target) in clip.frame_nums
+                                and int(_foi_target) in store.frames_bgr_u8):
+                            foi_capture["composited"] = (
+                                store.frames_bgr_u8[int(_foi_target)].detach().clone()
+                            )
 
                 # safe_before = min(tracker watermark, frame_num+1)
                 min_start = tracker.min_active_start()
@@ -1089,6 +1130,7 @@ class Pipeline:
                         model_dtype=restorer.model_dtype,
                     )
                     metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
+                    metrics.clip_lengths.append(int(len(clip.frame_nums)))
 
             drain_store_to_encoder(
                 store=store,
@@ -1205,6 +1247,22 @@ class Pipeline:
             gap_fill_bonus = len(gap_fill_set)
             visible_miss = len(miss_set)
 
+            # Restorer workload — clips x clip-length drives restore cost far
+            # better than box count. total_clip_frames = frames actually fed to
+            # the restorer (overlapping clips counted), which is why two configs
+            # with similar box counts can differ a lot in t_restore.
+            clip_lens = sorted(int(x) for x in metrics.clip_lengths)
+            n_clips = len(clip_lens)
+            total_clip_frames = int(sum(clip_lens))
+            if n_clips:
+                clip_min = clip_lens[0]
+                clip_max = clip_lens[-1]
+                clip_med = clip_lens[n_clips // 2]
+                clip_mean = round(total_clip_frames / n_clips, 1)
+            else:
+                clip_min = clip_max = clip_med = 0
+                clip_mean = 0.0
+
             print(
                 f"[RestStats] restored={fr}/{ft} "
                 f"detected_and_restored={detected_and_restored} "
@@ -1212,6 +1270,10 @@ class Pipeline:
                 f"legit_passthrough={legit} "
                 f"visible_miss={visible_miss} "
                 f"restoration_miss={restoration_miss}"
+            )
+            print(
+                f"[ClipStats] clips={n_clips} total_clip_frames={total_clip_frames} "
+                f"len_min={clip_min} len_med={clip_med} len_max={clip_max} len_mean={clip_mean}"
             )
 
             # Write misses JSON next to the output. Lists are sorted for
@@ -1250,6 +1312,14 @@ class Pipeline:
                         "restoration_miss": int(restoration_miss),
                         "early_passthrough_count": int(metrics.early_passthrough_frames),
                     },
+                    "clips": {
+                        "count": int(n_clips),
+                        "total_clip_frames": int(total_clip_frames),
+                        "len_min": int(clip_min),
+                        "len_median": int(clip_med),
+                        "len_max": int(clip_max),
+                        "len_mean": float(clip_mean),
+                    },
                     "visible_miss_frames": sorted(miss_set),
                     "restoration_miss_frames": sorted(restoration_miss_set),
                     "gap_fill_frames": sorted(gap_fill_set),
@@ -1283,6 +1353,13 @@ class Pipeline:
                 pbar.close()
             except Exception:
                 pass
+
+        # FOI: if the target frame was a passthrough (no clip touched it), its
+        # composited form equals the original. Also flag whether we saw it.
+        if foi_capture is not None:
+            foi_capture["found"] = ("original" in foi_capture)
+            if foi_capture.get("composited") is None and "original" in foi_capture:
+                foi_capture["composited"] = foi_capture["original"]
 
         # Additive: expose results to programmatic callers (the UI bridge).
         # The CLI path ignores this return value, so it is non-breaking.
@@ -1523,7 +1600,28 @@ class MosaicPipeline:
         )
 
     def close(self) -> None:
-        """Release warm models/host. Idempotent."""
+        """Release warm models/host and reclaim their GPU memory. Idempotent.
+
+        Dropping the Python refs alone does NOT free VRAM: the detector and
+        restorer hold TensorRT engines + execution contexts whose GPU
+        allocations are released only when the objects are destroyed. TRT
+        wrappers commonly form reference cycles, so those destructors run on a
+        cyclic GC pass, not on a refcount drop. Without forcing it, each
+        config-change rebuild leaks ~2 GB (detection context + restoration
+        sub-engines), degrading restore speed run-over-run and eventually
+        OOM-hanging on an 8 GB card. So: drop refs, force a GC to run the
+        destructors, then return freed blocks to the driver (the same pattern
+        used between batch engine compiles).
+        """
         self._detector = None
         self._restorer = None
         self._host = None
+        try:
+            import gc
+            gc.collect()                 # run TRT/torch destructors (breaks cycles)
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception as e:
+            print(f"[mosaic] WARNING: GPU cleanup during pipeline close failed: {e}")
