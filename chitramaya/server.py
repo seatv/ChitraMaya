@@ -774,11 +774,27 @@ class SwapServer:
             orig_write_diag = pipeline.config.write_diagnostics
             pipeline.config.write_diagnostics = False
             foi = {"target_frame": int(local_target)}
+            # Progress: the client shows the same modal/bar as Restore and polls
+            # /api/progress while this synchronous request runs. Populate the
+            # same shape mosaic_full uses; the pipeline's progress_cb updates it.
+            self._cancel_flag.clear()
+            self._progress = {
+                "status": "processing",
+                "frame": 0,
+                "total": int(n_window),
+                "fps": 0,
+                "eta": "testing frame...",
+                "detections": 0,
+                "restorations": 0,
+                "buffered": 0,
+            }
             try:
                 pipeline.process_file(seg_input, seg_output,
-                                      use_tqdm=False, foi_capture=foi)
+                                      use_tqdm=False, foi_capture=foi,
+                                      progress_cb=self._mosaic_progress_cb)
             except Exception as e:
                 logger.exception("mosaic_foi_preview failed")
+                self._progress.update({"status": "error", "error": str(e)})
                 return {"error": str(e)}
             finally:
                 pipeline.config.write_diagnostics = orig_write_diag
@@ -790,6 +806,8 @@ class SwapServer:
                         pass
 
             if not foi.get("found") or foi.get("original") is None:
+                self._progress.update({"status": "error",
+                                       "error": f"frame {N} not captured"})
                 return {"error": f"Target frame {N} not captured "
                                  f"(window {start_f}-{end_f})"}
 
@@ -829,6 +847,8 @@ class SwapServer:
                     "restored": _encode(comp, et, el, eb, er),
                 })
 
+            self._progress["status"] = "complete"
+            self._progress["frame"] = int(n_window)
             return {
                 "ok": True,
                 "frame": int(N),
