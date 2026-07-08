@@ -796,11 +796,8 @@ document.getElementById('restorePreviewBtn').addEventListener('click', () => {
 });
 
 
-// Tooltip for the placeholder Detect button
-const restoreDetectBtn = document.getElementById('restoreDetectBtn');
-if (restoreDetectBtn) {
-  restoreDetectBtn.title = 'Coming soon — use the Show Mask Only checkbox + Restore for now';
-}
+// (restoreDetectBtn is repurposed as the "Test Frame N" trigger — wired in the
+// Frame-of-Interest section below.)
 
 
 // ── Manage Models button ──────────────────────────────────
@@ -816,12 +813,40 @@ if (manageModelsBtn) {
 }
 
 
-// ── Frame-of-Interest preview ─────────────────────────────
+// ── Frame-of-Interest "Test Frame" ────────────────────────
 // Restore a short window centered on the current playhead frame and show each
-// detected region as a [Mosaic | Restored] pair, so knobs can be judged
-// against a real frame before a full multi-hour run.
+// detected region as a [Mosaic | Restored] pair in the top strip. Click a pair
+// to enlarge it over the player (controls stay visible). Re-running after a
+// knob change refreshes the strip and the open enlarge in place — dial → test
+// → see, without the overlay closing.
+let _foiRegions = [];      // latest results
+let _foiOpenIdx = null;    // region index currently enlarged over the player, or null
+let _foiRunning = false;   // true while a test is in flight (protects the label)
+
+// Button reads "Test Frame N" for the current playhead, so it's unambiguous
+// which frame the click will process.
+function _updateTestFrameLabel() {
+  const btn = document.getElementById('restoreDetectBtn');
+  if (!btn) return;
+  if (_foiRunning) return;   // keep "⏳ Refreshing…" while a test is in flight
+  let n = null;
+  if (typeof frameAtTime === 'function' && typeof player !== 'undefined') {
+    n = frameAtTime(player.currentTime);
+  } else if (state.currentFrame != null) {
+    n = state.currentFrame;
+  }
+  btn.textContent = (n === null || n === undefined) ? 'Test Frame' : `Test Frame ${n}`;
+}
+
+function _foiCurrentFrame() {
+  if (typeof frameAtTime === 'function' && typeof player !== 'undefined') {
+    return frameAtTime(player.currentTime);
+  }
+  return state.currentFrame || 0;
+}
+
 async function runFoiPreview() {
-  const btn = document.getElementById('foiPreviewBtn');
+  const btn = document.getElementById('restoreDetectBtn');
   const status = document.getElementById('foiStatus');
   const container = document.getElementById('foiRegions');
   if (!container) return;
@@ -830,33 +855,44 @@ async function runFoiPreview() {
     status.textContent = 'Load a video first';
     return;
   }
-  const frame = (typeof frameAtTime === 'function' && typeof player !== 'undefined')
-    ? frameAtTime(player.currentTime)
-    : (state.currentFrame || 0);
+  const frame = _foiCurrentFrame();
   if (frame === null || frame === undefined) {
     status.textContent = 'Pause on a frame first';
     return;
   }
 
-  btn.disabled = true;
-  status.textContent = `Previewing frame ${frame}…`;
-  container.innerHTML = '';
+  // The button itself is the working indicator — no modal, no poll — so the
+  // images (strip + open enlarge) stay put and your eye keeps its reference for
+  // the before/after when the new result swaps in.
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Refreshing…'; }
+  _foiRunning = true;
+
   try {
     const res = await apiPost('/api/mosaic-foi', {
       frame: frame,
       params: gatherMosaicParams(),
     });
     if (!res || res.error) {
-      status.textContent = 'Error: ' + (res ? res.error : 'no response');
+      const msg = (res && res.error) ? res.error : 'no response';
+      if (/busy/i.test(msg)) {
+        // Another op is running — leave the current view untouched.
+        status.textContent = 'Still working — try again in a moment.';
+      } else {
+        status.textContent = 'Error: ' + msg;
+        _foiRegions = [];
+        _closeFoiEnlarge();
+      }
       return;
     }
-    const regions = res.regions || [];
+    _foiRegions = res.regions || [];
     const win = res.window || [];
     status.textContent =
-      `Frame ${res.frame} · ${regions.length} region${regions.length === 1 ? '' : 's'}`
-      + (win.length === 2 ? ` · window ${win[0]}–${win[1]}` : '');
-    if (regions.length === 0) {
+      `Frame ${res.frame} · ${_foiRegions.length} region${_foiRegions.length === 1 ? '' : 's'}`
+      + (win.length === 2 ? ` · window ${win[0]}–${win[1]}` : '')
+      + ' · click a pair to enlarge';
+    if (_foiRegions.length === 0) {
       container.innerHTML = '<div class="foi-empty">No mosaics detected on this frame.</div>';
+      _closeFoiEnlarge();
       return;
     }
     const cell = (label, b64) => {
@@ -865,48 +901,92 @@ async function runFoiPreview() {
         : '<div class="foi-img foi-na">—</div>';
       return `<div class="foi-cell"><div class="foi-clabel">${label}</div>${img}</div>`;
     };
-    regions.forEach((r) => {
+    // Rebuild the strip now that the new result is in hand (swap in place, so
+    // it never blanks while refreshing).
+    container.innerHTML = '';
+    _foiRegions.forEach((r, i) => {
       const row = document.createElement('div');
       row.className = 'foi-row';
-      row.title = 'Click to enlarge';
+      row.title = 'Click to enlarge over the player';
+      if (i === _foiOpenIdx) row.classList.add('foi-row-active');
       row.innerHTML = cell('Mosaic', r.mosaic) + cell('Restored', r.restored);
-      row.addEventListener('click', () => openFoiLightbox(r));
+      row.addEventListener('click', () => openFoiEnlarge(i));
       container.appendChild(row);
     });
+
+    // Refresh the open enlarge in place (same region index), or close it if the
+    // new result no longer has that region.
+    if (_foiOpenIdx !== null) {
+      if (_foiOpenIdx < _foiRegions.length) openFoiEnlarge(_foiOpenIdx);
+      else _closeFoiEnlarge();
+    }
   } catch (e) {
     status.textContent = 'Error: ' + (e && e.message ? e.message : e);
   } finally {
-    btn.disabled = false;
+    _foiRunning = false;
+    if (btn) { btn.disabled = false; _updateTestFrameLabel(); }
   }
 }
 
-const _foiBtn = document.getElementById('foiPreviewBtn');
-if (_foiBtn) _foiBtn.addEventListener('click', runFoiPreview);
+// Enlarge one region's Mosaic|Restored over the player, reusing the center-area
+// zoom overlay (absolute inset:0 in .center-area) so the side controls stay
+// visible. Panels scale to the crop's aspect (foi-mode overrides the fixed
+// 512 square). Does not close on re-run — it refreshes.
+function openFoiEnlarge(idx) {
+  const r = _foiRegions[idx];
+  if (!r) return;
+  _foiOpenIdx = idx;
+  const overlay = document.getElementById('zoomOverlay');
+  const orig = document.getElementById('zoomOriginal');
+  const rest = document.getElementById('zoomImage');
+  if (!overlay || !orig || !rest) return;
 
-// Full-size side-by-side view of one region's Mosaic vs Restored. Click
-// anywhere (or Esc) to dismiss. This keeps the stacked list compact while
-// giving a big view on demand — the place to judge the blend edge.
-function openFoiLightbox(r) {
-  const existing = document.getElementById('foiLightbox');
-  if (existing) existing.remove();
-  const lb = document.createElement('div');
-  lb.className = 'foi-lightbox';
-  lb.id = 'foiLightbox';
-  const cell = (label, b64) => b64
-    ? `<div class="foi-lb-cell"><div class="foi-lb-label">${label}</div>`
-      + `<img src="data:image/jpeg;base64,${b64}" alt="${label}"></div>`
-    : '';
-  lb.innerHTML = cell('Mosaic', r.mosaic) + cell('Restored', r.restored)
-    + '<div class="foi-lb-hint">click / Esc to close</div>';
-  const close = () => {
-    lb.remove();
-    document.removeEventListener('keydown', onKey);
-  };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  lb.addEventListener('click', close);
-  document.addEventListener('keydown', onKey);
-  document.body.appendChild(lb);
+  // Labels: first panel Mosaic, second Restored.
+  const labels = overlay.querySelectorAll('.zoom-label');
+  if (labels[0]) labels[0].textContent = 'Mosaic';
+  if (labels[1]) labels[1].textContent = 'Restored';
+
+  orig.src = r.mosaic ? ('data:image/jpeg;base64,' + r.mosaic) : '';
+  rest.src = r.restored ? ('data:image/jpeg;base64,' + r.restored) : '';
+  overlay.classList.add('foi-mode');
+  overlay.classList.remove('hidden');
+  if (typeof state !== 'undefined') state.zoomOpen = true;
+
+  // Mark the active strip row.
+  document.querySelectorAll('#foiRegions .foi-row').forEach((el, i) => {
+    el.classList.toggle('foi-row-active', i === idx);
+  });
 }
+
+function _closeFoiEnlarge() {
+  _foiOpenIdx = null;
+  const overlay = document.getElementById('zoomOverlay');
+  if (overlay) {
+    overlay.classList.add('hidden');
+    overlay.classList.remove('foi-mode');
+  }
+  const orig = document.getElementById('zoomOriginal');
+  const rest = document.getElementById('zoomImage');
+  if (orig) orig.src = '';
+  if (rest) rest.src = '';
+  if (typeof state !== 'undefined') state.zoomOpen = false;
+  document.querySelectorAll('#foiRegions .foi-row').forEach((el) => {
+    el.classList.remove('foi-row-active');
+  });
+}
+
+const _foiBtn = document.getElementById('restoreDetectBtn');
+if (_foiBtn) _foiBtn.addEventListener('click', runFoiPreview);
+const _foiZoomClose = document.getElementById('zoomClose');
+if (_foiZoomClose) _foiZoomClose.addEventListener('click', _closeFoiEnlarge);
+
+// Keep the button label in sync with the playhead.
+if (typeof player !== 'undefined' && player) {
+  player.addEventListener('timeupdate', _updateTestFrameLabel);
+  player.addEventListener('seeked', _updateTestFrameLabel);
+  player.addEventListener('loadedmetadata', _updateTestFrameLabel);
+}
+_updateTestFrameLabel();
 
 
 // ── Init: populate dropdowns + first state pass ───────────

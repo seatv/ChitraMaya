@@ -45,9 +45,10 @@
         .foi-bar { display:flex; align-items:center; gap:10px; }
         .foi-status { font:12px sans-serif; color:var(--text-dim,#8a8a8a); }
         .foi-regions { display:flex; flex-direction:column; gap:8px;
-                       max-height:260px; overflow-y:auto; }
+                       max-height:130px; overflow-y:auto; }
         .foi-row { display:flex; gap:8px; cursor:pointer; border-radius:4px; }
         .foi-row:hover { outline:1px solid var(--accent,#7a5cff); outline-offset:2px; }
+        .foi-row-active { outline:2px solid var(--accent,#7a5cff); outline-offset:2px; }
         .foi-cell { flex:1; display:flex; flex-direction:column; align-items:center; gap:3px; min-width:0; }
         .foi-clabel { font:11px sans-serif; color:var(--text-dim,#8a8a8a); }
         .foi-img { max-width:100%; max-height:220px; border:1px solid var(--border,#2a2a2a);
@@ -55,18 +56,22 @@
         .foi-na { display:flex; align-items:center; justify-content:center;
                   width:90px; height:64px; color:#555; font:12px sans-serif; }
         .foi-empty { font:12px sans-serif; color:var(--text-dim,#8a8a8a); padding:8px; }
-        .foi-lightbox { position:fixed; inset:0; z-index:99999; background:rgba(0,0,0,0.92);
-                        display:flex; align-items:center; justify-content:center; gap:16px; padding:24px; cursor:zoom-out; }
-        .foi-lb-cell { display:flex; flex-direction:column; align-items:center; gap:6px; max-width:48%; }
-        .foi-lb-cell img { max-width:100%; max-height:86vh; border:1px solid #333; border-radius:6px; background:#000; }
-        .foi-lb-label { font:13px sans-serif; color:#ccc; }
-        .foi-lb-hint { position:fixed; top:12px; right:16px; font:12px sans-serif; color:#888; }
+        /* FOI enlarge over the player: fill the actual center-area (player
+           box), not the viewport — so panels track the real player size live
+           in windowed + fullscreen. Two panels split the width; the image
+           flex-fills the space under its label and object-fit:contain scales
+           it to fit with aspect preserved. */
+        #zoomOverlay.foi-mode .zoom-dual { width:100%; height:100%; gap:10px;
+                   align-items:stretch; justify-content:center; padding:10px; box-sizing:border-box; }
+        #zoomOverlay.foi-mode .zoom-panel { flex:1 1 0; min-width:0; height:100%;
+                   display:flex; flex-direction:column; gap:6px; }
+        #zoomOverlay.foi-mode .zoom-label { flex:0 0 auto; }
+        #zoomOverlay.foi-mode .zoom-panel img { flex:1 1 0; min-height:0;
+                   width:100%; height:100%; max-width:100%; max-height:100%; object-fit:contain; }
       </style>
       <div class="foi-panel" id="faceStrip">
         <div class="foi-bar">
-          <button class="header-btn" id="foiPreviewBtn"
-                  title="Restore a short window around the current frame and preview each detected region (Mosaic vs Restored) before committing to a full run">🔍 Preview Frame</button>
-          <span class="foi-status" id="foiStatus">Pause on a frame, then Preview</span>
+          <span class="foi-status" id="foiStatus">Pause on a frame, then press Test Frame (below)</span>
         </div>
         <div class="foi-regions" id="foiRegions"></div>
         <!-- hidden stubs: keep dormant detect/zoom refs in state.js/init.js alive -->
@@ -377,7 +382,8 @@
     <button class="action-btn primary" id="swapSaveBtn" data-mode="face-swap" disabled>Swap &amp; Save</button>
 
     <!-- Restoration mode buttons (toggled visible by tab JS in B2) -->
-    <button class="action-btn secondary" id="restoreDetectBtn" data-mode="restoration" hidden disabled>Detect</button>
+    <button class="action-btn primary" id="restoreDetectBtn" data-mode="restoration" hidden
+            title="Process the current playhead frame with the current settings — restores a short window around it and shows each detected region (Mosaic vs Restored) so you can judge before a full run">Test Frame</button>
     <button class="action-btn primary"   id="restoreBtn"       data-mode="restoration" hidden disabled>Restore</button>
     <button class="action-btn secondary" id="restorePreviewBtn" data-mode="restoration" hidden disabled>Preview</button>
     <button class="action-btn primary"   id="restoreSaveBtn"   data-mode="restoration" hidden disabled>Restore &amp; Save</button>

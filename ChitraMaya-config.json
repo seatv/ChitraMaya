@@ -12,6 +12,7 @@
   "ctrlMosaicDetBatch": "4",
   "ctrlMosaicDetFp16": true,
   "ctrlMosaicDetTrt": true,
+  "ctrlMosaicSbsSplit": false,
   "ctrlMosaicRestModel": "models/lada_mosaic_restoration_model_generic_v1.2.pth",
   "ctrlMosaicMaxClip": "60",
   "ctrlMosaicRestFp16": true,
