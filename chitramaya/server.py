@@ -692,6 +692,153 @@ class SwapServer:
                     result.frames, result.detections, result.restorations, self.preview_path)
         return self.preview_path
 
+    def mosaic_foi_preview(self, frame_num: int, params: dict) -> dict:
+        """Frame-of-interest preview.
+
+        Restore a short window centered on `frame_num` (reusing the segment
+        trim + warm pipeline), capture that frame's boxes + pre/post-composite
+        via the run() foi_capture hook, and return per-region [Mosaic|Restored]
+        crops (each box expanded to 2h x 2w, clamped to the frame and, when
+        Split SBS is on, the eye seam). No encode/mux is kept — the temp files
+        are deleted. Frame math only (no time rounding) for the target index.
+        """
+        import subprocess
+        import tempfile
+        import base64
+        import cv2
+
+        if not self.video_path or not self.video_info:
+            return {"error": "No video loaded"}
+
+        from chitramaya.models import MosaicConfig
+        mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
+        encoder_dict = params.get("encoder", {})
+        if not mosaic_cfg.detection_model:
+            return {"error": "No detection model selected"}
+        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
+            return {"error": "No restoration model selected"}
+
+        info = self.video_info
+        fps = float(info.get("fps", 30.0)) or 30.0
+        total = int(info.get("num_frames", 0))
+        N = int(frame_num)
+        if total > 0:
+            N = max(0, min(N, total - 1))
+
+        # Window: +/- X frames, X = max clip size (a full clip's context each
+        # side so the target sits interior to whatever clip the pipeline forms).
+        X = max(1, int(mosaic_cfg.mosaic_max_clip_size))
+        start_f = max(0, N - X)
+        end_f = (min(total - 1, N + X) if total > 0 else N + X)
+        local_target = N - start_f
+        n_window = end_f - start_f + 1
+
+        # Bias the seek half a frame early so CFR rounding can't skip past the
+        # intended start frame — the first decoded frame is then exactly start_f.
+        start_time = max(0.0, (start_f - 0.5) / fps)
+
+        # Serialize with other GPU ops; bail fast if a job is running.
+        if not _op_lock.acquire(blocking=False):
+            return {"error": "busy — another operation is running"}
+        try:
+            temp_dir = self.temp_dir if self.temp_dir else tempfile.gettempdir()
+            os.makedirs(temp_dir, exist_ok=True)
+            seg_input = os.path.join(temp_dir, "chitramaya_foi_input.mp4")
+            seg_output = os.path.join(temp_dir, "chitramaya_foi_out.mp4")
+
+            # Fast seek (keyframe, so deep frames stay quick) + re-encode, which
+            # is accurate to the exact start on modern ffmpeg. Cut by exact
+            # FRAME COUNT (not -t): a time cut lands mid-GOP and leaves broken
+            # references at the tail. Use crf 10 (NOT 0): lossless H.264 uses
+            # transform-bypass macroblocks that NVDEC decodes unreliably
+            # ("Decode Error occurred for picture N"); crf 10 is normal-transform,
+            # NVDEC-clean, and visually lossless for mosaic regions. yuv420p +
+            # no B-frames keep the throwaway snippet trivially decodable, and we
+            # stay on NVDEC (same decode path as a real run — true to WYSIWYG).
+            extract_cmd = [
+                "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
+                "-ss", f"{start_time:.4f}",
+                "-i", self.video_path,
+                "-frames:v", str(int(n_window)),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
+                "-pix_fmt", "yuv420p", "-bf", "0",
+                "-an",
+                seg_input,
+            ]
+            proc = subprocess.run(extract_cmd, capture_output=True, text=True,
+                                  timeout=180, encoding="utf-8", errors="replace")
+            if proc.returncode != 0:
+                return {"error": f"FOI extract failed: {proc.stderr[-200:]}"}
+
+            pipeline = self._ensure_mosaic_pipeline(mosaic_cfg, encoder_dict=encoder_dict)
+            orig_write_diag = pipeline.config.write_diagnostics
+            pipeline.config.write_diagnostics = False
+            foi = {"target_frame": int(local_target)}
+            try:
+                pipeline.process_file(seg_input, seg_output,
+                                      use_tqdm=False, foi_capture=foi)
+            except Exception as e:
+                logger.exception("mosaic_foi_preview failed")
+                return {"error": str(e)}
+            finally:
+                pipeline.config.write_diagnostics = orig_write_diag
+                for p in (seg_input, seg_output):
+                    try:
+                        if os.path.isfile(p):
+                            os.unlink(p)
+                    except Exception:
+                        pass
+
+            if not foi.get("found") or foi.get("original") is None:
+                return {"error": f"Target frame {N} not captured "
+                                 f"(window {start_f}-{end_f})"}
+
+            orig = foi["original"].detach().to("cpu").contiguous().numpy()
+            comp = foi["composited"].detach().to("cpu").contiguous().numpy()
+            H = int(foi.get("frame_h", orig.shape[0]))
+            W = int(foi.get("frame_w", orig.shape[1]))
+            boxes = foi.get("boxes") or []
+            sbs = bool(mosaic_cfg.mosaic_sbs_split)
+            seam = W // 2
+
+            def _encode(img, t, l, b, r):
+                crop = img[t:b + 1, l:r + 1]
+                ok, buf = cv2.imencode(".jpg", crop,
+                                       [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                return base64.b64encode(buf.tobytes()).decode("ascii") if ok else None
+
+            regions = []
+            for (t, l, b, r) in boxes:
+                t, l, b, r = int(t), int(l), int(b), int(r)
+                hb, wb = (b - t + 1), (r - l + 1)
+                # Expand to 2h x 2w (0.5x margin each side).
+                et, eb = t - hb // 2, b + hb // 2
+                el, er = l - wb // 2, r + wb // 2
+                # Clamp to frame.
+                et, el = max(0, et), max(0, el)
+                eb, er = min(H - 1, eb), min(W - 1, er)
+                # Clamp expansion to the eye seam (box already lies in one eye).
+                if sbs:
+                    if r < seam:
+                        er = min(er, seam - 1)
+                    elif l >= seam:
+                        el = max(el, seam)
+                regions.append({
+                    "box": [t, l, b, r],
+                    "mosaic": _encode(orig, et, el, eb, er),
+                    "restored": _encode(comp, et, el, eb, er),
+                })
+
+            return {
+                "ok": True,
+                "frame": int(N),
+                "window": [int(start_f), int(end_f)],
+                "region_count": len(regions),
+                "regions": regions,
+            }
+        finally:
+            _op_lock.release()
+
 
 # ── Global server instance ────────────────────────────────────────────────
 
@@ -808,6 +955,20 @@ def api_mosaic_full():
         server.mosaic_full(params)
 
     return _run_mosaic_threaded("mosaic-full", data, _do)
+
+
+@app.route("/api/mosaic-foi", methods=["POST"])
+def api_mosaic_foi():
+    """Frame-of-interest preview: synchronous (returns crops directly, not
+    progress-polled). Body: { frame: int, params: {...} }."""
+    data = request.get_json(force=True)
+    server = _get_server()
+    try:
+        frame_num = int(data.get("frame", 0))
+    except (TypeError, ValueError):
+        frame_num = 0
+    params = data.get("params", {})
+    return jsonify(server.mosaic_foi_preview(frame_num, params))
 
 
 @app.route("/api/session-status", methods=["GET"])

@@ -816,6 +816,99 @@ if (manageModelsBtn) {
 }
 
 
+// ── Frame-of-Interest preview ─────────────────────────────
+// Restore a short window centered on the current playhead frame and show each
+// detected region as a [Mosaic | Restored] pair, so knobs can be judged
+// against a real frame before a full multi-hour run.
+async function runFoiPreview() {
+  const btn = document.getElementById('foiPreviewBtn');
+  const status = document.getElementById('foiStatus');
+  const container = document.getElementById('foiRegions');
+  if (!container) return;
+
+  if (!state.videoPath && !state.videoInfo) {
+    status.textContent = 'Load a video first';
+    return;
+  }
+  const frame = (typeof frameAtTime === 'function' && typeof player !== 'undefined')
+    ? frameAtTime(player.currentTime)
+    : (state.currentFrame || 0);
+  if (frame === null || frame === undefined) {
+    status.textContent = 'Pause on a frame first';
+    return;
+  }
+
+  btn.disabled = true;
+  status.textContent = `Previewing frame ${frame}…`;
+  container.innerHTML = '';
+  try {
+    const res = await apiPost('/api/mosaic-foi', {
+      frame: frame,
+      params: gatherMosaicParams(),
+    });
+    if (!res || res.error) {
+      status.textContent = 'Error: ' + (res ? res.error : 'no response');
+      return;
+    }
+    const regions = res.regions || [];
+    const win = res.window || [];
+    status.textContent =
+      `Frame ${res.frame} · ${regions.length} region${regions.length === 1 ? '' : 's'}`
+      + (win.length === 2 ? ` · window ${win[0]}–${win[1]}` : '');
+    if (regions.length === 0) {
+      container.innerHTML = '<div class="foi-empty">No mosaics detected on this frame.</div>';
+      return;
+    }
+    const cell = (label, b64) => {
+      const img = b64
+        ? `<img class="foi-img" src="data:image/jpeg;base64,${b64}" alt="${label}">`
+        : '<div class="foi-img foi-na">—</div>';
+      return `<div class="foi-cell"><div class="foi-clabel">${label}</div>${img}</div>`;
+    };
+    regions.forEach((r) => {
+      const row = document.createElement('div');
+      row.className = 'foi-row';
+      row.title = 'Click to enlarge';
+      row.innerHTML = cell('Mosaic', r.mosaic) + cell('Restored', r.restored);
+      row.addEventListener('click', () => openFoiLightbox(r));
+      container.appendChild(row);
+    });
+  } catch (e) {
+    status.textContent = 'Error: ' + (e && e.message ? e.message : e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+const _foiBtn = document.getElementById('foiPreviewBtn');
+if (_foiBtn) _foiBtn.addEventListener('click', runFoiPreview);
+
+// Full-size side-by-side view of one region's Mosaic vs Restored. Click
+// anywhere (or Esc) to dismiss. This keeps the stacked list compact while
+// giving a big view on demand — the place to judge the blend edge.
+function openFoiLightbox(r) {
+  const existing = document.getElementById('foiLightbox');
+  if (existing) existing.remove();
+  const lb = document.createElement('div');
+  lb.className = 'foi-lightbox';
+  lb.id = 'foiLightbox';
+  const cell = (label, b64) => b64
+    ? `<div class="foi-lb-cell"><div class="foi-lb-label">${label}</div>`
+      + `<img src="data:image/jpeg;base64,${b64}" alt="${label}"></div>`
+    : '';
+  lb.innerHTML = cell('Mosaic', r.mosaic) + cell('Restored', r.restored)
+    + '<div class="foi-lb-hint">click / Esc to close</div>';
+  const close = () => {
+    lb.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  lb.addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(lb);
+}
+
+
 // ── Init: populate dropdowns + first state pass ───────────
 populateMosaicModelDropdowns();
 _updateRestorationButtonStates();

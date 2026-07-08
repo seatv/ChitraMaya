@@ -92,6 +92,26 @@ class DetStats:
 
 
 
+class _DiscardEncoder:
+    """No-op encoder used by the FOI preview.
+
+    The FOI run only needs the captured target frame, not an output video, so
+    the compositor's frames are consumed and thrown away — no NVENC encode, no
+    .hevc elementary stream, no two-step remux. Satisfies the drain/finalize
+    interface (encode_frame + close); it is deliberately NOT an AsyncEncoder,
+    so run()'s async flush/join path is skipped.
+    """
+
+    def encode_frame(self, *args, **kwargs) -> None:
+        pass
+
+    def flush(self, *args, **kwargs) -> None:
+        pass
+
+    def close(self, *args, **kwargs) -> None:
+        pass
+
+
 @dataclass
 class PipelineMetrics:
     processed_frames: int = 0
@@ -580,25 +600,29 @@ class Pipeline:
         # ChitraMaya's Encoder has a slimmer signature than gRestorer's.
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
         _mux_audio_bool = str(self.mux_audio).lower() != "none"
-        encoder = Encoder(
-            output_path=str(out),
-            width=w,
-            height=h,
-            fps=fps,
-            codec=self.enc_codec,
-            preset=self.enc_preset,
-            qp=self.enc_qp,
-            gpu_id=self.enc_gpu_id,
-            input_path=str(inp),
-            mux_audio=_mux_audio_bool,
-        )
+        if foi_capture is not None:
+            # FOI preview: capture-only. Never encode or mux (see _DiscardEncoder).
+            encoder = _DiscardEncoder()
+        else:
+            encoder = Encoder(
+                output_path=str(out),
+                width=w,
+                height=h,
+                fps=fps,
+                codec=self.enc_codec,
+                preset=self.enc_preset,
+                qp=self.enc_qp,
+                gpu_id=self.enc_gpu_id,
+                input_path=str(inp),
+                mux_audio=_mux_audio_bool,
+            )
 
-        # Wrap in AsyncEncoder if enabled — runs encode_frame() on a
-        # background thread, overlapping NVENC work with the main thread's
-        # decode/detect/restore/composite pass.
-        if self.async_encoder:
-            print(f"[Encoder] Async encoder thread enabled (queue_size={self.async_encoder_queue})")
-            encoder = AsyncEncoder(encoder, device=self.device, queue_size=self.async_encoder_queue)
+            # Wrap in AsyncEncoder if enabled — runs encode_frame() on a
+            # background thread, overlapping NVENC work with the main thread's
+            # decode/detect/restore/composite pass.
+            if self.async_encoder:
+                print(f"[Encoder] Async encoder thread enabled (queue_size={self.async_encoder_queue})")
+                encoder = AsyncEncoder(encoder, device=self.device, queue_size=self.async_encoder_queue)
 
         # Warm-model injection (additive): the UI bridge passes pre-built
         # models so repeated previews don't reload. When not provided, build
@@ -1131,6 +1155,12 @@ class Pipeline:
                     )
                     metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                     metrics.clip_lengths.append(int(len(clip.frame_nums)))
+                    if (_foi_target is not None
+                            and int(_foi_target) in clip.frame_nums
+                            and int(_foi_target) in store.frames_bgr_u8):
+                        foi_capture["composited"] = (
+                            store.frames_bgr_u8[int(_foi_target)].detach().clone()
+                        )
 
             drain_store_to_encoder(
                 store=store,
@@ -1147,7 +1177,7 @@ class Pipeline:
             tc_path: Optional[str] = None
             pts_fps: float = fps
             is_vfr: bool = False
-            if pts_log:
+            if pts_log and foi_capture is None:
                 pts_fps, is_vfr = compute_pts_fps(pts_log, fallback_fps=fps)
                 tc_path = write_timecodes_v2(pts_log, self.output_path, fps=fps)
 
@@ -1565,8 +1595,13 @@ class MosaicPipeline:
         progress_cb=None,
         use_tqdm: bool = False,
         cancel_flag=None,
+        foi_capture=None,
     ) -> MosaicResult:
-        """Process one file using the warm models. Returns a MosaicResult."""
+        """Process one file using the warm models. Returns a MosaicResult.
+
+        foi_capture: optional dict with 'target_frame'; when given, run() fills
+        it with that frame's boxes + pre/post-composite tensors (FOI preview).
+        """
         # Rebuild the host's config for this input/output, re-running
         # __post_init__ so paths/knobs are picked up, then drive run() with the
         # warm models injected. Reusing the same Pipeline instance keeps the
@@ -1582,6 +1617,7 @@ class MosaicPipeline:
             restorer_override=self._restorer,
             progress_cb=progress_cb,
             cancel_flag=cancel_flag,
+            foi_capture=foi_capture,
         )
 
         diag_path = None

@@ -38,24 +38,42 @@
     <!-- ── CENTER: Video / Preview ──────────────────────── -->
     <div class="center-panel">
 
-      <!-- Detected / Restored thumbnails -->
-      <div class="face-strip" id="faceStrip">
-
-        <!-- Detected mosaic region -->
-        <div class="face-slot">
-          <div class="face-slot-img empty" id="targetImg">?</div>
-          <span class="face-slot-label">Mosaic</span>
+      <!-- Frame-of-interest preview: per-region [Mosaic | Restored] -->
+      <style>
+        .foi-panel { display:flex; flex-direction:column; gap:6px; padding:6px 8px;
+                     background:var(--panel-bg,#161616); border-bottom:1px solid var(--border,#2a2a2a); }
+        .foi-bar { display:flex; align-items:center; gap:10px; }
+        .foi-status { font:12px sans-serif; color:var(--text-dim,#8a8a8a); }
+        .foi-regions { display:flex; flex-direction:column; gap:8px;
+                       max-height:260px; overflow-y:auto; }
+        .foi-row { display:flex; gap:8px; cursor:pointer; border-radius:4px; }
+        .foi-row:hover { outline:1px solid var(--accent,#7a5cff); outline-offset:2px; }
+        .foi-cell { flex:1; display:flex; flex-direction:column; align-items:center; gap:3px; min-width:0; }
+        .foi-clabel { font:11px sans-serif; color:var(--text-dim,#8a8a8a); }
+        .foi-img { max-width:100%; max-height:220px; border:1px solid var(--border,#2a2a2a);
+                   border-radius:4px; background:#000; object-fit:contain; }
+        .foi-na { display:flex; align-items:center; justify-content:center;
+                  width:90px; height:64px; color:#555; font:12px sans-serif; }
+        .foi-empty { font:12px sans-serif; color:var(--text-dim,#8a8a8a); padding:8px; }
+        .foi-lightbox { position:fixed; inset:0; z-index:99999; background:rgba(0,0,0,0.92);
+                        display:flex; align-items:center; justify-content:center; gap:16px; padding:24px; cursor:zoom-out; }
+        .foi-lb-cell { display:flex; flex-direction:column; align-items:center; gap:6px; max-width:48%; }
+        .foi-lb-cell img { max-width:100%; max-height:86vh; border:1px solid #333; border-radius:6px; background:#000; }
+        .foi-lb-label { font:13px sans-serif; color:#ccc; }
+        .foi-lb-hint { position:fixed; top:12px; right:16px; font:12px sans-serif; color:#888; }
+      </style>
+      <div class="foi-panel" id="faceStrip">
+        <div class="foi-bar">
+          <button class="header-btn" id="foiPreviewBtn"
+                  title="Restore a short window around the current frame and preview each detected region (Mosaic vs Restored) before committing to a full run">🔍 Preview Frame</button>
+          <span class="foi-status" id="foiStatus">Pause on a frame, then Preview</span>
         </div>
-
-        <!-- Restored region + zoom -->
-        <div class="face-slot">
-          <div class="face-slot-img empty" id="swappedImg">?</div>
-          <div class="face-slot-label">
-            <span>Restored</span>
-            <button class="zoom-btn" id="zoomBtn" title="Open 512×512 preview">🔍</button>
-          </div>
+        <div class="foi-regions" id="foiRegions"></div>
+        <!-- hidden stubs: keep dormant detect/zoom refs in state.js/init.js alive -->
+        <div style="display:none">
+          <span id="targetImg"></span><span id="swappedImg"></span>
+          <button id="zoomBtn"></button>
         </div>
-
       </div>
 
       <!-- Center area: drop zone / video / preview -->
