@@ -364,8 +364,12 @@ async function populateMosaicModelDropdowns() {
     _mosaicDetEngines[item.path] = !!item.has_engine;
   }
 
-  fill(detSel, data.detection);
-  fill(restSel, data.restoration);
+  // Restore the config's saved model selections (see applyConfig): stashed so
+  // this survives the startup race with the config load, whichever resolves
+  // first. Falls back to the current value if there's no stash.
+  const _saved = (typeof window !== 'undefined' && window._pendingMosaicModels) || {};
+  fill(detSel, data.detection, _saved.det);
+  fill(restSel, data.restoration, _saved.rest);
   updateMaxClipConstraints();
   _updateRestorationButtonStates();
 }

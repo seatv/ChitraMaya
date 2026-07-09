@@ -40,4 +40,4 @@ gswapper-config.json
 
 #Custom
 *.exe
-*.spec
+*.7z.*
