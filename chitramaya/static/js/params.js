@@ -151,6 +151,18 @@ function applyConfig(cfg) {
     else el.value = String(cfg[id]);
   }
 
+  // The mosaic model dropdowns are filled asynchronously (populateMosaic-
+  // ModelDropdowns fetches the list). At startup this can race the config
+  // load: if the config applies first, the setValue above no-ops because the
+  // <option>s don't exist yet. Stash the desired values so populate can
+  // restore them once the options are in. Robust to either resolve order.
+  if (typeof window !== 'undefined') {
+    window._pendingMosaicModels = {
+      det: cfg.ctrlMosaicDetModel,
+      rest: cfg.ctrlMosaicRestModel,
+    };
+  }
+
   // Update all dial value displays
   document.querySelectorAll('.ctrl-dial').forEach(dial => {
     dial.dispatchEvent(new Event('input'));
