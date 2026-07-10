@@ -88,7 +88,7 @@
 #>
 
 param(
-    [string]$ModelsDir = ".\models",
+    [string]$ModelsDir = "$PSScriptRoot\models",
     [int]$DetImgsz = 640,
     [int]$DetMaxBatch = 8,
     [int]$DetWorkspace = 2,
@@ -101,6 +101,17 @@ param(
 )
 
 $ErrorActionPreference = "Continue"  # We want to keep going on failures
+
+# Resolve the chitramaya compiler: prefer the frozen ChitraMaya.exe sitting
+# next to this script (clean install), else the 'chitramaya' console script on
+# PATH (dev venv). The frozen exe bundles the compile code (tools/*), so a
+# machine with only the installer -- no Python, no ./tools -- can still compile.
+$ChitraMaya = if (Test-Path (Join-Path $PSScriptRoot 'ChitraMaya.exe')) {
+    Join-Path $PSScriptRoot 'ChitraMaya.exe'
+} else {
+    'chitramaya'
+}
+Write-Host "[i] Compiler: $ChitraMaya" -ForegroundColor DarkGray
 
 # Resolve and validate the models directory
 $ModelsDir = (Resolve-Path -Path $ModelsDir -ErrorAction SilentlyContinue).Path
@@ -203,7 +214,7 @@ if ($SkipDetection) {
                 $Fp16Flag
             )
             if ($Force) { $stepArgs += "--force" }
-            chitramaya @stepArgs
+            & $ChitraMaya @stepArgs
         }
     }
 }
@@ -254,7 +265,7 @@ if ($SkipRestoration) {
                 $Fp16Flag
             )
             if ($Force) { $stepArgs += "--force" }
-            chitramaya @stepArgs
+            & $ChitraMaya @stepArgs
         }
     }
 }

@@ -74,6 +74,25 @@ New-Item -ItemType Directory -Force -Path $eng | Out-Null
 "Place compiled .engine files here (use Manage Models / Compile-All-Engines.ps1)." |
   Set-Content -Encoding ASCII (Join-Path $eng "PUT-ENGINES-HERE.txt")
 
+# ── Ship the compile script + a models drop folder ───────────────────────
+# CRITICAL for fresh installs: the frozen exe bundles the compile code
+# (tools/* via collect_submodules), so this PS1 drives ChitraMaya.exe
+# -compile-* to build engines on the TARGET machine's GPU. No Python or
+# ./tools folder needed on the clean machine. Ship the PS1 next to the exe;
+# it resolves .\ChitraMaya.exe via $PSScriptRoot.
+$compileSrc = Join-Path (Resolve-Path ".").Path "Compile-All-Engines.ps1"
+if (Test-Path $compileSrc) {
+  Copy-Item -Force $compileSrc (Join-Path $distDir "Compile-All-Engines.ps1")
+  Write-Host "Copied Compile-All-Engines.ps1" -ForegroundColor Green
+} else {
+  Write-Warning "Compile-All-Engines.ps1 not found at repo root - fresh installs will have NO way to compile engines. Fix before releasing."
+}
+("Place source model files here:" + [Environment]::NewLine +
+ "  *.pt   - YOLO mosaic detection" + [Environment]::NewLine +
+ "  *.pth  - BasicVSR++ mosaic restoration" + [Environment]::NewLine +
+ "Then run Compile-All-Engines.ps1 to build engines for THIS machine's GPU.") |
+  Set-Content -Encoding ASCII (Join-Path $distDir "models\PUT-MODELS-HERE.txt")
+
 # ── Optional self-extracting installer ──────────────────────────────────
 Write-Host "Creating self-extracting installer..." -ForegroundColor Yellow
 if (Get-Command 7z -ErrorAction SilentlyContinue) {

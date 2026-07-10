@@ -561,6 +561,9 @@ async function resetProject() {
   state.segmentStartFrame = 0;
   state.segmentEndFrame = 0;
 
+  // Clear Test Frame (FOI) state: regions cache, strip, and any open enlarge.
+  if (typeof _foiReset === 'function') _foiReset();
+
   // Clear player
   try { player.pause(); } catch {}
   try { player.removeAttribute('src'); player.load(); } catch {}

@@ -804,17 +804,293 @@ document.getElementById('restorePreviewBtn').addEventListener('click', () => {
 // Frame-of-Interest section below.)
 
 
-// ── Manage Models button ──────────────────────────────────
-// No-op placeholder. A later increment replaces this with a modal for
-// downloading source checkpoints (.pt / .pth) and compiling TRT engines.
-// The "Use Tensor" checkboxes (increment 2) will route here when a
-// requested engine is missing and no source checkpoint is present.
-const manageModelsBtn = document.getElementById('manageModelsBtn');
-if (manageModelsBtn) {
-  manageModelsBtn.addEventListener('click', () => {
-    console.info('[ChitraMaya] Manage Models: model download/compile modal is not implemented yet.');
+// ── Manage Models window (list + select + compile) ────────
+// Lists local models with a compiled? badge, lets you multi-select rows, set
+// Image Size (detection) + Max Clip Length (restoration), and compile the
+// selected models for THIS machine's GPU (server shells out to the exe's
+// -compile-* subcommands, streaming the log). Reached from the header button
+// and the "engine not found" modal's Manage Models button.
+let _mmPoll = null;
+let _mmModels = [];             // [{path,label,kind:'det'|'rest',compiled,detail}]
+const _mmSelected = new Set();  // selected model paths
+
+async function mmPopulateList() {
+  const el = document.getElementById('mmModelList');
+  if (!el) return;
+  el.textContent = 'Loading…';
+  const data = await apiGet('/api/list-mosaic-models');
+  if (!data || data.error) { el.textContent = 'Failed to list models.'; return; }
+  _mmModels = [];
+  (data.detection || []).forEach(m =>
+    _mmModels.push({ path: m.path, label: m.label, kind: 'det',
+                     compiled: !!m.has_engine, detail: '' }));
+  (data.restoration || []).forEach(m => {
+    const sizes = [...new Set([...((m.engines && m.engines.fp16) || []),
+                               ...((m.engines && m.engines.fp32) || [])])].sort((a, b) => a - b);
+    _mmModels.push({ path: m.path, label: m.label, kind: 'rest',
+                     compiled: sizes.length > 0,
+                     detail: sizes.length ? ('clips ' + sizes.join(',')) : '' });
   });
+  for (const p of [..._mmSelected]) if (!_mmModels.some(m => m.path === p)) _mmSelected.delete(p);
+  mmRenderList();
 }
+
+function mmRenderList() {
+  const el = document.getElementById('mmModelList');
+  if (!el) return;
+  if (!_mmModels.length) {
+    el.innerHTML = '<div class="mm-empty">No .pt / .pth models in models/. Add some (Download lands next), then Refresh.</div>';
+    mmUpdateControls();
+    return;
+  }
+  const badge = (ok, detail) =>
+    `<span class="mm-badge ${ok ? 'mm-ok' : 'mm-no'}">`
+    + (ok ? ('Compiled' + (detail ? ' · ' + detail : '')) : 'Not compiled') + '</span>';
+  el.innerHTML = _mmModels.map(m => {
+    const sel = _mmSelected.has(m.path) ? ' mm-selected' : '';
+    const ext = m.kind === 'det' ? '.pt detection' : '.pth restoration';
+    return `<div class="mm-row${sel}" data-path="${encodeURIComponent(m.path)}">`
+      + `<span class="mm-name">${m.label} <span class="mm-ext">${ext}</span></span>`
+      + badge(m.compiled, m.detail) + '</div>';
+  }).join('');
+  el.querySelectorAll('.mm-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const p = decodeURIComponent(row.dataset.path);
+      if (_mmSelected.has(p)) _mmSelected.delete(p); else _mmSelected.add(p);
+      row.classList.toggle('mm-selected', _mmSelected.has(p));
+      mmUpdateControls();
+    });
+  });
+  mmUpdateControls();
+}
+
+function mmUpdateControls() {
+  const btn = document.getElementById('mmCompile');
+  const n = _mmSelected.size;
+  if (btn && !btn.classList.contains('mm-compiling')) {
+    btn.disabled = n === 0;
+    btn.textContent = `Compile (${n} selected)`;
+  }
+  // Image Size applies to detection, Max Clip to restoration. Dim the slider
+  // that no selected model uses (only once a selection excludes that kind).
+  const kinds = new Set(_mmModels.filter(m => _mmSelected.has(m.path)).map(m => m.kind));
+  const imgRow = document.getElementById('mmImgszRow');
+  const clipRow = document.getElementById('mmMaxClipRow');
+  if (imgRow)  imgRow.classList.toggle('mm-inert',  n > 0 && !kinds.has('det'));
+  if (clipRow) clipRow.classList.toggle('mm-inert', n > 0 && !kinds.has('rest'));
+}
+
+function mmSelectMissing() {
+  _mmSelected.clear();
+  _mmModels.forEach(m => { if (!m.compiled) _mmSelected.add(m.path); });
+  mmRenderList();
+}
+
+function _mmSetCompiling(on) {
+  const btn = document.getElementById('mmCompile');
+  if (!btn) return;
+  btn.classList.toggle('mm-compiling', on);
+  btn.disabled = on || _mmSelected.size === 0;
+  btn.textContent = on ? '⏳ Compiling…' : `Compile (${_mmSelected.size} selected)`;
+}
+
+function _mmStartPolling() {
+  const log = document.getElementById('mmLog');
+  if (_mmPoll) clearInterval(_mmPoll);
+  _mmSetCompiling(true);
+  _mmPoll = setInterval(async () => {
+    const s = await apiGet('/api/compile-log');
+    if (!s) return;
+    if (log) { log.textContent = s.log || ''; log.scrollTop = log.scrollHeight; }
+    if (!s.running) {
+      clearInterval(_mmPoll); _mmPoll = null;
+      _mmSetCompiling(false);
+      mmPopulateList();                        // Manage Models badges refresh
+      if (typeof populateMosaicModelDropdowns === 'function') populateMosaicModelDropdowns();  // Control Panel dropdowns + engine caches
+    }
+  }, 1000);
+}
+
+async function mmCompile() {
+  if (_mmSelected.size === 0) return;
+  const log = document.getElementById('mmLog');
+  const imgsz = parseInt(document.getElementById('mmImgsz').value, 10) || 640;
+  const maxClip = parseInt(document.getElementById('mmMaxClip').value, 10) || 60;
+  const force = document.getElementById('mmForce').checked;
+  _mmSetCompiling(true);
+  if (log) log.textContent = 'Starting…';
+  const res = await apiPost('/api/compile-engines',
+    { models: [..._mmSelected], imgsz, max_clip: maxClip, force });
+  if (!res || res.error) {
+    if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
+    _mmSetCompiling(false);
+    return;
+  }
+  _mmStartPolling();
+}
+
+async function openManageModels() {
+  const modal = document.getElementById('manageModelsModal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  await mmLoadSources();
+  await mmPopulateList();
+  const s = await apiGet('/api/compile-log');   // resume if a compile is running
+  if (s && s.running) {
+    const log = document.getElementById('mmLog');
+    if (log) log.textContent = s.log || '';
+    _mmStartPolling();
+  }
+}
+
+function closeManageModels() {
+  const modal = document.getElementById('manageModelsModal');
+  if (modal) modal.classList.add('hidden');
+  if (_mmPoll) { clearInterval(_mmPoll); _mmPoll = null; }  // leave compile running server-side
+}
+
+// ── Download (Hugging Face) ───────────────────────────────
+let _mmDlPoll = null;
+let _mmFetchFiles = [];            // [{path, size}]
+let _mmCurrentRepoUrl = '';
+const _mmDlSelected = new Set();   // selected repo file paths
+
+async function mmLoadSources() {
+  const sel = document.getElementById('mmSource');
+  if (!sel) return;
+  const data = await apiGet('/api/model-sources');
+  const sources = (data && data.sources) || [];
+  sel.innerHTML = sources.map(s =>
+    `<option value="${encodeURIComponent(s.url)}">${s.name || s.url}</option>`).join('');
+}
+
+async function mmAddSource() {
+  const url = (window.prompt('Hugging Face repo URL (e.g. https://huggingface.co/owner/repo):') || '').trim();
+  if (!url) return;
+  const name = (window.prompt('A short name for this source (optional):') || '').trim();
+  const res = await apiPost('/api/model-sources', { url, name });
+  if (!res || res.error) { alert('Could not add source: ' + (res ? res.error : 'no response')); return; }
+  await mmLoadSources();
+  const sel = document.getElementById('mmSource');
+  if (sel) sel.value = encodeURIComponent(url);   // select the newly added
+}
+
+function _mmFmtSize(b) {
+  if (!b) return '';
+  return b >= 1048576 ? (b / 1048576).toFixed(0) + ' MB' : (b / 1024).toFixed(0) + ' KB';
+}
+
+async function mmFetch() {
+  const sel = document.getElementById('mmSource');
+  const list = document.getElementById('mmFetchList');
+  const btns = document.getElementById('mmDlBtns');
+  const fetchBtn = document.getElementById('mmFetch');
+  if (!sel || !sel.value) return;
+  _mmCurrentRepoUrl = decodeURIComponent(sel.value);
+  if (fetchBtn) { fetchBtn.disabled = true; fetchBtn.textContent = '⏳ Fetching…'; }
+  if (list) { list.classList.remove('mm-hidden'); list.innerHTML = 'Fetching…'; }
+  if (btns) btns.classList.add('mm-hidden');
+  try {
+    const res = await apiPost('/api/fetch-model-list', { url: _mmCurrentRepoUrl });
+    if (!res || res.error) { if (list) list.innerHTML = '<div class="mm-empty">' + ((res && res.error) || 'Fetch failed') + '</div>'; return; }
+    _mmFetchFiles = res.files || [];
+    _mmDlSelected.clear();
+    mmFetchRender();
+    if (btns) btns.classList.toggle('mm-hidden', _mmFetchFiles.length === 0);
+  } finally {
+    if (fetchBtn) { fetchBtn.disabled = false; fetchBtn.textContent = 'Fetch'; }
+  }
+}
+
+function mmFetchRender() {
+  const list = document.getElementById('mmFetchList');
+  if (!list) return;
+  if (!_mmFetchFiles.length) {
+    list.innerHTML = '<div class="mm-empty">No .pt / .pth files in this repo.</div>';
+    mmDlUpdateControls();
+    return;
+  }
+  list.innerHTML = _mmFetchFiles.map(f => {
+    const sel = _mmDlSelected.has(f.path) ? ' mm-selected' : '';
+    return `<div class="mm-row${sel}" data-path="${encodeURIComponent(f.path)}">`
+      + `<span class="mm-name">${f.path}</span>`
+      + `<span class="mm-size">${_mmFmtSize(f.size)}</span></div>`;
+  }).join('');
+  list.querySelectorAll('.mm-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const p = decodeURIComponent(row.dataset.path);
+      if (_mmDlSelected.has(p)) _mmDlSelected.delete(p); else _mmDlSelected.add(p);
+      row.classList.toggle('mm-selected', _mmDlSelected.has(p));
+      mmDlUpdateControls();
+    });
+  });
+  mmDlUpdateControls();
+}
+
+function mmDlUpdateControls() {
+  const btn = document.getElementById('mmDownload');
+  const n = _mmDlSelected.size;
+  if (btn && !btn.classList.contains('mm-downloading')) {
+    btn.disabled = n === 0;
+    btn.textContent = `Download (${n} selected)`;
+  }
+}
+
+function mmDlSelectAll() {
+  _mmFetchFiles.forEach(f => _mmDlSelected.add(f.path));
+  mmFetchRender();
+}
+
+function _mmSetDownloading(on) {
+  const btn = document.getElementById('mmDownload');
+  if (!btn) return;
+  btn.classList.toggle('mm-downloading', on);
+  btn.disabled = on || _mmDlSelected.size === 0;
+  btn.textContent = on ? '⏳ Downloading…' : `Download (${_mmDlSelected.size} selected)`;
+}
+
+async function mmDownload() {
+  if (_mmDlSelected.size === 0) return;
+  const log = document.getElementById('mmLog');
+  _mmSetDownloading(true);
+  if (log) log.textContent = 'Starting download…';
+  const res = await apiPost('/api/download-models',
+    { url: _mmCurrentRepoUrl, files: [..._mmDlSelected] });
+  if (!res || res.error) {
+    if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
+    _mmSetDownloading(false);
+    return;
+  }
+  if (_mmDlPoll) clearInterval(_mmDlPoll);
+  _mmDlPoll = setInterval(async () => {
+    const s = await apiGet('/api/download-log');
+    if (!s) return;
+    if (log) { log.textContent = s.log || ''; log.scrollTop = log.scrollHeight; }
+    if (!s.running) {
+      clearInterval(_mmDlPoll); _mmDlPoll = null;
+      _mmSetDownloading(false);
+      mmPopulateList();                        // downloaded models appear in the list below
+      if (typeof populateMosaicModelDropdowns === 'function') populateMosaicModelDropdowns();  // AND in the Control Panel dropdowns (so they're selectable)
+    }
+  }, 800);
+}
+
+// Slider readouts — self-contained (kept out of the config system).
+['mmImgsz', 'mmMaxClip'].forEach(id => {
+  const dial = document.getElementById(id);
+  const val = document.getElementById(id + 'Val');
+  if (dial && val) { const upd = () => { val.textContent = dial.value; }; dial.addEventListener('input', upd); upd(); }
+});
+
+const manageModelsBtn = document.getElementById('manageModelsBtn');
+if (manageModelsBtn) manageModelsBtn.addEventListener('click', openManageModels);
+[['mmRefresh', mmPopulateList], ['mmSelectMissing', mmSelectMissing],
+ ['mmCompile', mmCompile], ['mmClose', closeManageModels],
+ ['mmAddSource', mmAddSource], ['mmFetch', mmFetch],
+ ['mmDlSelectAll', mmDlSelectAll], ['mmDownload', mmDownload]].forEach(([id, fn]) => {
+  const b = document.getElementById(id);
+  if (b) b.addEventListener('click', fn);
+});
 
 
 // ── Frame-of-Interest "Test Frame" ────────────────────────
@@ -865,6 +1141,17 @@ async function runFoiPreview() {
     return;
   }
 
+  // Honor the same TRT-engine gate as Restore / Restore & Save: if Use Tensor
+  // is on but the engine is missing, prompt (Manage vs Continue-on-PyTorch)
+  // instead of silently falling back to PyTorch.
+  const gate = await checkTensorBeforeRun();
+  if (!gate.proceed) return;             // user chose Manage Models — abort
+  const params = gatherMosaicParams();
+  if (gate.override) {
+    if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
+    if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
+  }
+
   // The button itself is the working indicator — no modal, no poll — so the
   // images (strip + open enlarge) stay put and your eye keeps its reference for
   // the before/after when the new result swaps in.
@@ -874,7 +1161,7 @@ async function runFoiPreview() {
   try {
     const res = await apiPost('/api/mosaic-foi', {
       frame: frame,
-      params: gatherMosaicParams(),
+      params: params,
     });
     if (!res || res.error) {
       const msg = (res && res.error) ? res.error : 'no response';
@@ -981,6 +1268,19 @@ function _closeFoiEnlarge() {
 
 const _foiBtn = document.getElementById('restoreDetectBtn');
 if (_foiBtn) _foiBtn.addEventListener('click', runFoiPreview);
+
+// Full reset of the Test Frame state — regions cache, strip, and any open
+// enlarge. Called from resetProject (New) so a new video starts clean.
+function _foiReset() {
+  _foiRegions = [];
+  _foiOpenIdx = null;
+  if (_foiRunning) _foiRunning = false;
+  const c = document.getElementById('foiRegions');
+  if (c) c.innerHTML = '';
+  const st = document.getElementById('foiStatus');
+  if (st) st.textContent = 'Pause on a frame, then press Test Frame (below)';
+  _closeFoiEnlarge();
+}
 const _foiZoomClose = document.getElementById('zoomClose');
 if (_foiZoomClose) _foiZoomClose.addEventListener('click', _closeFoiEnlarge);
 
