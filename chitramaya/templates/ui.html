@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ChitraMaya</title>
-<link rel="stylesheet" href="/static/tokens.css">
-<link rel="stylesheet" href="/static/swap.css">
+<link rel="stylesheet" href="/static/tokens.css?v={{ cachebust }}">
+<link rel="stylesheet" href="/static/swap.css?v={{ cachebust }}">
 </head>
 <body>
 
@@ -172,7 +172,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Detection confidence threshold. Lower = more (looser) detections, higher = fewer (stricter)">Score</span>
+                      title="How confident the detector must be to accept a mosaic (0.05-1.00). Lower catches more, including faint or partial mosaics, but risks false positives on mosaic-like texture; higher is stricter. Start around 0.25 and lower it if mosaics are being missed.">Score</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetScore"
                          min="5" max="100" value="25">
@@ -181,7 +181,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Detection NMS IoU threshold. Lower = more aggressive overlap suppression">IoU</span>
+                      title="When two detections overlap, how much overlap is allowed before they are merged into one (NMS). Lower merges more aggressively into fewer, larger boxes; higher keeps more separate boxes. Rarely needs changing from ~0.70.">IoU</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetIou"
                          min="5" max="100" value="70">
@@ -190,7 +190,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Frames detected per GPU batch. Higher = faster but more VRAM">Batch</span>
+                      title="How many frames the detector processes per GPU call (1-16). Higher is faster but uses more VRAM - lower it if detection runs out of memory. Affects only speed and memory, not quality.">Batch</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicDetBatch"
                          min="1" max="16" value="4">
@@ -228,7 +228,7 @@
                       title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="Frames per clip before splitting. Lower = less VRAM, more boundaries">Max Clip</span>
+                <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip. Must match a compiled engine size (see Manage Models). Longer clips give smoother motion but use more VRAM; anything longer is split. Independent of detection.">Max Clip</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
                          min="30" max="180" step="10" value="90">
@@ -237,7 +237,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Grow each detected region by N pixels before restoring (0 = off)">ROI Dilate</span>
+                      title="Grow every detected region outward by N pixels before restoring (0-64). Helps when the detector box is slightly tight and leaves a mosaic rim - a few pixels covers the edge. Too much wastes work and can touch clean areas. 0 = off.">ROI Dilate</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicRoiDilate"
                          min="0" max="64" value="0">
@@ -246,7 +246,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Soften the restored-region mask edge by N pixels (0 = hard edge)">Feather</span>
+                      title="Soften the edge where the restored patch meets the original frame by N pixels (0-64). Higher hides the seam for a smoother blend; 0 = hard edge. Raise it if paste-backs look like sharp rectangles.">Feather</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicFeather"
                          min="0" max="64" value="0">
@@ -254,7 +254,7 @@
                 </div>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="Compositor blend-mask mode">Blend Mask</span>
+                <span class="ctrl-label" title="How the restored patch is blended back into the frame. None = a rectangular blended region (can leave a hard ice-block edge around the mosaic). FaceFusion = the blend follows the mosaic actual shape with a soft inward edge, reducing that rectangle - usually cleaner, especially on SBS/VR content.">Blend Mask</span>
                 <select class="ctrl-select" id="ctrlMosaicBlendMask">
                   <option value="none" selected>None</option>
                   <option value="facefusion">FaceFusion</option>
@@ -263,7 +263,7 @@
               <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicSegMasks" checked>
                 <span class="ctrl-label" style="min-width:auto;"
-                      title="Use per-pixel segmentation masks (vs bounding boxes) for restoration">Use Seg Masks</span>
+                      title="Blend the restored patch using the detector exact pixel outline of the mosaic (segmentation mask) instead of its rectangular box. On = cleaner edges that follow the mosaic real shape; off = the whole box is blended. Leave on unless the mask looks wrong.">Use Seg Masks</span>
               </div>
             </div>
           </div>
@@ -277,7 +277,7 @@
               <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicMaskPreview">
                 <span class="ctrl-label" style="min-width:auto;"
-                      title="Skip restoration; fill detected regions with a flat colour (fast). Any leftover mosaic = a detection miss.">Preview Mask Only</span>
+                      title="Fast coverage check: instead of restoring, fills each detected region with a flat colour (set below) so you can see exactly what will be detected and restored - without waiting for restoration. Any mosaic still visible in the preview is a detection miss; adjust Score or Image Size. Uncheck to restore for real.">Preview Mask Only</span>
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label" title="Flat fill colour for detected regions">Mask Colour</span>
@@ -433,13 +433,109 @@
   </div>
 </div>
 
+<!-- ── Manage Models Modal ─────────────────────────────────── -->
+<style>
+  #manageModelsModal .modal { width: min(760px, 92vw); max-width: 92vw; text-align: left; }
+  .mm-body { display: flex; flex-direction: column; gap: 14px; margin: 8px 0 12px; }
+  .mm-section-title { font: 600 12px sans-serif; color: var(--text-dim,#9a9a9a); text-transform: uppercase;
+                      letter-spacing: .04em; margin-bottom: 6px; }
+  .mm-list { max-height: 180px; overflow-y: auto; border: 1px solid var(--border,#2a2a2a);
+             border-radius: 6px; padding: 4px; background: var(--bg,#111); }
+  .mm-row { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+            padding: 5px 8px; border-radius: 4px; cursor: pointer; }
+  .mm-row:nth-child(odd) { background: rgba(255,255,255,0.02); }
+  .mm-row:hover { background: rgba(255,255,255,0.06); }
+  .mm-row.mm-selected { background: rgba(122,92,255,0.20) !important;
+                        outline: 1px solid var(--accent,#7a5cff); }
+  .mm-name { font: 13px sans-serif; color: var(--text,#ddd); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mm-ext { color: var(--text-dim,#888); font-size: 11px; }
+  .mm-badge { font: 11px sans-serif; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
+  .mm-ok { background: rgba(60,180,90,0.18); color: #6ee7a0; border: 1px solid rgba(60,180,90,0.4); }
+  .mm-no { background: rgba(200,80,80,0.15); color: #f0a0a0; border: 1px solid rgba(200,80,80,0.4); }
+  .mm-empty { padding: 10px; font: 12px sans-serif; color: var(--text-dim,#888); }
+  .mm-params { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 8px; }
+  .mm-params label { font: 12px sans-serif; color: var(--text,#ccc); display: flex; align-items: center; gap: 6px; }
+  .mm-params input[type=number] { width: 72px; background: var(--bg,#111); color: var(--text,#ddd);
+                      border: 1px solid var(--border,#2a2a2a); border-radius: 4px; padding: 3px 6px; }
+  .mm-check { gap: 5px !important; }
+  .mm-hint { display: block; font: 11px sans-serif; color: var(--text-dim,#888); margin-top: 6px; }
+  .mm-log { max-height: 220px; overflow: auto; background: #0b0b0d; color: #cfcfcf;
+            border: 1px solid var(--border,#2a2a2a); border-radius: 6px; padding: 8px;
+            font: 11px/1.4 ui-monospace, Consolas, monospace; white-space: pre-wrap; margin: 0; }
+  .mm-row-btns { display: flex; gap: 8px; align-items: center; }
+  .mm-slider-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .mm-slabel { flex: 0 0 120px; font: 12px sans-serif; color: var(--text,#ccc); }
+  .mm-slider-row .ctrl-dial { flex: 1; }
+  .mm-slider-row .ctrl-value { flex: 0 0 40px; text-align: right;
+                      font: 12px ui-monospace, Consolas, monospace; color: var(--text,#ddd); }
+  .mm-slider-row.mm-inert { opacity: 0.38; }
+  .mm-dl-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .mm-select { flex: 1; background: var(--bg,#111); color: var(--text,#ddd);
+               border: 1px solid var(--border,#2a2a2a); border-radius: 4px;
+               padding: 4px 6px; font: 12px sans-serif; }
+  .mm-hidden { display: none; }
+  .mm-size { color: var(--text-dim,#888); font-size: 11px; white-space: nowrap; }
+</style>
+<div class="modal-overlay hidden" id="manageModelsModal">
+  <div class="modal">
+    <div class="modal-title">Manage Models</div>
+    <div class="mm-body">
+      <div class="mm-section">
+        <div class="mm-section-title">Download models (Hugging Face)</div>
+        <div class="mm-dl-row">
+          <select id="mmSource" class="mm-select"></select>
+          <button class="modal-btn" id="mmAddSource" title="Add a Hugging Face repo URL">+ Add</button>
+          <button class="modal-btn modal-btn-confirm" id="mmFetch">Fetch</button>
+        </div>
+        <div class="mm-list mm-hidden" id="mmFetchList"></div>
+        <div class="mm-row-btns mm-hidden" id="mmDlBtns">
+          <button class="modal-btn" id="mmDlSelectAll">Select all</button>
+          <button class="modal-btn modal-btn-confirm" id="mmDownload" disabled>Download (0 selected)</button>
+        </div>
+      </div>
+      <div class="mm-section">
+        <div class="mm-section-title">Models in models/</div>
+        <div class="mm-list" id="mmModelList">Loading…</div>
+        <div class="mm-row-btns"><button class="modal-btn" id="mmRefresh">Refresh list</button></div>
+      </div>
+      <div class="mm-section">
+        <div class="mm-section-title">Compile engines for this GPU</div>
+        <div class="mm-slider-row" id="mmImgszRow">
+          <span class="mm-slabel" title="Detection resolution the engine is built for - a multiple of 32 (YOLO stride). Higher (e.g. 960) downscales the frame less, so small or faint mosaics detect better, at the cost of slower compile and detection and more VRAM. 640 is the tested default; 960 suits dense VR content.">Image Size</span>
+          <input type="range" class="ctrl-dial" id="mmImgsz" min="640" max="960" step="32" value="640">
+          <span class="ctrl-value" id="mmImgszVal">640</span>
+        </div>
+        <div class="mm-slider-row" id="mmMaxClipRow">
+          <span class="mm-slabel" title="How many consecutive frames the restoration engine is built to process as one clip. Pick the value you will run with - the engine is compiled for this exact length. Longer = smoother motion but more VRAM.">Max Clip Length</span>
+          <input type="range" class="ctrl-dial" id="mmMaxClip" min="30" max="180" step="30" value="60">
+          <span class="ctrl-value" id="mmMaxClipVal">60</span>
+        </div>
+        <label class="mm-check" title="Recompile even if an engine already exists.">
+          <input type="checkbox" id="mmForce"> Force rebuild (recompile existing)</label>
+        <div class="mm-row-btns">
+          <button class="modal-btn" id="mmSelectMissing">Select all not-compiled</button>
+          <button class="modal-btn modal-btn-confirm" id="mmCompile" disabled>Compile (0 selected)</button>
+        </div>
+        <span class="mm-hint">Select model rows above, set the sliders, then Compile. Builds on THIS machine's GPU (minutes each). Native TensorRT builders shipped for sm_120 / sm_89 / sm_86; other GPUs fall back to PTX (slower first compile).</span>
+      </div>
+      <div class="mm-section">
+        <div class="mm-section-title">Compile log</div>
+        <pre class="mm-log" id="mmLog"></pre>
+      </div>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-btn" id="mmClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── JS Modules ───────────────────────────────────────── -->
-<script src="/static/js/state.js"></script>
-<script src="/static/js/api.js"></script>
-<script src="/static/js/player.js"></script>
-<script src="/static/js/params.js"></script>
-<script src="/static/js/init.js"></script>
-<script src="/static/js/mosaic.js"></script>
+<script src="/static/js/state.js?v={{ cachebust }}"></script>
+<script src="/static/js/api.js?v={{ cachebust }}"></script>
+<script src="/static/js/player.js?v={{ cachebust }}"></script>
+<script src="/static/js/params.js?v={{ cachebust }}"></script>
+<script src="/static/js/init.js?v={{ cachebust }}"></script>
+<script src="/static/js/mosaic.js?v={{ cachebust }}"></script>
 
 </body>
 </html>

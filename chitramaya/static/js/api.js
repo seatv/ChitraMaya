@@ -20,7 +20,7 @@ async function apiPost(endpoint, data = {}) {
 
 async function apiGet(endpoint) {
   try {
-    const resp = await fetch(endpoint);
+    const resp = await fetch(endpoint, { cache: 'no-store' });
     return await resp.json();
   } catch (err) {
     console.error(`API fetch failed (${endpoint}):`, err);

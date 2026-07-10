@@ -36,6 +36,25 @@ app = Flask(__name__,
             template_folder=str(Path(__file__).parent / "templates"),
             static_folder=str(Path(__file__).parent / "static"))
 
+# Local single-user app: never let the WebView/browser cache our JS/CSS or API
+# responses. Stale cached JS silently runs old code after an update (edits
+# appear not to take effect), and a cached /api/list-mosaic-models hides newly
+# downloaded/compiled models. no-store on static + api keeps everything fresh.
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+
+@app.after_request
+def _no_store_static_api(resp):
+    try:
+        p = request.path or ""
+        if p.startswith("/static/") or p.startswith("/api/"):
+            resp.headers["Cache-Control"] = "no-store, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return resp
+
 # Suppress Flask request logging in production
 WSGIRequestHandler.log_request = lambda *args, **kwargs: None
 
@@ -875,9 +894,15 @@ def _get_server() -> SwapServer:
 
 # ── Flask Routes ──────────────────────────────────────────────────────────
 
+# Per-process token appended to static asset URLs (below) so that restarting
+# ChitraMaya forces the WebView to re-fetch JS/CSS — its HTTP cache persists
+# across restarts, which otherwise serves stale code after an update.
+_CACHEBUST = str(int(time.time()))
+
+
 @app.route("/")
 def index():
-    return render_template("ui.html")
+    return render_template("ui.html", cachebust=_CACHEBUST)
 
 
 # ── Video ──
@@ -1070,6 +1095,306 @@ def api_list_mosaic_models():
                 })
 
     return jsonify({"detection": detection, "restoration": restoration})
+
+
+# ── Engine compilation (Manage Models) ─────────────────────────────────────
+# Shells out to Compile-All-Engines.ps1 (which drives ChitraMaya.exe
+# -compile-det/-rest) in a background thread, streaming stdout into a buffer
+# the client polls. One compile at a time.
+_compile_job = {"running": False, "log": "", "returncode": None}
+_compile_lock = threading.Lock()
+
+
+def _compiler_prefix():
+    """Command prefix that runs ChitraMaya's compile subcommands: the frozen
+    exe itself, or `python -m chitramaya` in dev."""
+    import sys
+    if getattr(sys, "frozen", False):
+        return [sys.executable]                       # ChitraMaya.exe -compile-*
+    return [sys.executable, "-m", "chitramaya"]        # dev
+
+
+def _run_compile(models, imgsz, max_clip, force):
+    """Compile the SELECTED models one at a time via the exe's -compile-det /
+    -compile-rest subcommands (.pt -> detection, .pth -> restoration),
+    streaming each model's output into the shared log with a header."""
+    import subprocess
+    prefix = _compiler_prefix()
+    overall_rc = 0
+    for mp in models:
+        name = os.path.basename(mp)
+        ext = os.path.splitext(mp)[1].lower()
+        if ext == ".pt":
+            cmd = prefix + ["-compile-det", "--det-model", mp,
+                            "--det-imgsz", str(int(imgsz)),
+                            "--max-batch", "8", "--workspace", "2"]
+        elif ext == ".pth":
+            cmd = prefix + ["-compile-rest", "--rest-model", mp,
+                            "--rest-max-clip-length", str(int(max_clip)),
+                            "--workspace", "2"]
+        else:
+            with _compile_lock:
+                _compile_job["log"] += f"\n[skip] {name} (not .pt/.pth)\n"
+            continue
+        if force:
+            cmd.append("--force")
+
+        with _compile_lock:
+            _compile_job["log"] += f"\n=== Compiling {name} ===\n"
+        rc = -1
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            for line in proc.stdout:
+                with _compile_lock:
+                    _compile_job["log"] += line
+            proc.wait()
+            rc = proc.returncode
+        except Exception as e:
+            logger.exception("compile failed for %s", mp)
+            with _compile_lock:
+                _compile_job["log"] += f"\n[compile error] {e}\n"
+        if rc != 0:
+            overall_rc = rc
+        with _compile_lock:
+            _compile_job["log"] += (f"--- {name}: OK ---\n" if rc == 0
+                                    else f"--- {name}: FAILED (exit {rc}) ---\n")
+
+    with _compile_lock:
+        _compile_job["returncode"] = overall_rc
+        _compile_job["running"] = False
+        _compile_job["log"] += (f"\n=== All done ===\n" if overall_rc == 0
+                                else f"\n=== Finished with errors (exit {overall_rc}) ===\n")
+
+
+@app.route("/api/compile-engines", methods=["POST"])
+def api_compile_engines():
+    data = request.get_json(force=True) or {}
+    try:
+        imgsz = int(data.get("imgsz", 640))
+        max_clip = int(data.get("max_clip", 60))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Image Size and Max Clip Length must be integers."})
+    force = bool(data.get("force", False))
+
+    # Only accept real .pt/.pth files (guards against odd paths from the client).
+    safe = []
+    for mp in (data.get("models") or []):
+        mp = str(mp)
+        try:
+            if os.path.isfile(mp) and os.path.splitext(mp)[1].lower() in (".pt", ".pth"):
+                safe.append(mp)
+        except Exception:
+            pass
+    if not safe:
+        return jsonify({"error": "No valid models selected."})
+
+    with _compile_lock:
+        if _compile_job["running"]:
+            return jsonify({"error": "A compile is already running."})
+        _compile_job["running"] = True
+        _compile_job["returncode"] = None
+        _compile_job["log"] = (
+            f"Compiling {len(safe)} model(s) for THIS machine's GPU "
+            f"(Image Size={imgsz}, Max Clip Length={max_clip}"
+            f"{', force rebuild' if force else ''})...\n"
+        )
+
+    threading.Thread(target=_run_compile, args=(safe, imgsz, max_clip, force),
+                     daemon=True).start()
+    return jsonify({"ok": True, "started": True, "count": len(safe)})
+
+
+@app.route("/api/compile-log", methods=["GET"])
+def api_compile_log():
+    with _compile_lock:
+        return jsonify({
+            "running": _compile_job["running"],
+            "log": _compile_job["log"],
+            "returncode": _compile_job["returncode"],
+        })
+
+
+# ── Model download (Manage Models / Download) ──────────────────────────────
+# Lists + downloads .pt/.pth from Hugging Face repos via the plain REST API
+# (no huggingface_hub dependency). Sources persist in model-sources.json,
+# seeded with the two known repos. Downloads stream into models/.
+_MODEL_SOURCES_SEED = [
+    {"name": "lada (primary)", "url": "https://huggingface.co/ladaapp/lada/tree/main"},
+    {"name": "zelefans (VR)", "url": "https://huggingface.co/zelefans/vrmr/tree/main"},
+]
+_download_job = {"running": False, "log": "", "done": None}
+_download_lock = threading.Lock()
+
+
+def _model_sources_path():
+    return Path("model-sources.json")
+
+
+def _load_model_sources():
+    p = _model_sources_path()
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            logger.exception("failed to read model-sources.json")
+    _save_model_sources(_MODEL_SOURCES_SEED)
+    return list(_MODEL_SOURCES_SEED)
+
+
+def _save_model_sources(sources):
+    try:
+        _model_sources_path().write_text(json.dumps(sources, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("failed to write model-sources.json")
+
+
+def _parse_hf_repo(url):
+    """https://huggingface.co/{owner}/{repo}[/tree/...] -> (owner, repo) or None."""
+    import re
+    m = re.match(r"https?://huggingface\.co/([^/\s]+)/([^/\s]+)", str(url).strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+@app.route("/api/model-sources", methods=["GET", "POST"])
+def api_model_sources():
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        url = str(data.get("url", "")).strip()
+        name = str(data.get("name", "")).strip()
+        if not _parse_hf_repo(url):
+            return jsonify({"error": "Not a valid Hugging Face repo URL "
+                                     "(expected https://huggingface.co/owner/repo)."})
+        sources = _load_model_sources()
+        if not any(s.get("url") == url for s in sources):
+            sources.append({"name": name or url, "url": url})
+            _save_model_sources(sources)
+        return jsonify({"ok": True, "sources": sources})
+    return jsonify({"sources": _load_model_sources()})
+
+
+@app.route("/api/fetch-model-list", methods=["POST"])
+def api_fetch_model_list():
+    import urllib.request
+    import urllib.error
+    data = request.get_json(force=True) or {}
+    repo = _parse_hf_repo(data.get("url", ""))
+    if not repo:
+        return jsonify({"error": "Not a Hugging Face repo URL."})
+    owner, name = repo
+    api = f"https://huggingface.co/api/models/{owner}/{name}/tree/main?recursive=true"
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "ChitraMaya"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            tree = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return jsonify({"error": "This repo needs authentication (not supported)."})
+        if e.code == 404:
+            return jsonify({"error": "Repo not found (check the URL)."})
+        return jsonify({"error": f"Fetch failed: HTTP {e.code}"})
+    except Exception as e:
+        return jsonify({"error": f"Fetch failed: {e}"})
+
+    files = []
+    for item in (tree or []):
+        if item.get("type") == "file":
+            path = str(item.get("path", ""))
+            if path.lower().endswith((".pt", ".pth")):
+                files.append({"path": path, "size": int(item.get("size", 0) or 0)})
+    files.sort(key=lambda f: f["path"])
+    return jsonify({"ok": True, "repo": f"{owner}/{name}", "files": files})
+
+
+def _run_download(owner, name, files):
+    import urllib.request
+    models_dir = Path("./models")
+    try:
+        models_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    ok_all = True
+    for path in files:
+        fname = os.path.basename(path)          # flatten nested repo paths
+        dest = models_dir / fname
+        with _download_lock:
+            _download_job["log"] += f"\n=== {fname} ===\n"
+        if dest.exists():
+            with _download_lock:
+                _download_job["log"] += f"[skip] already in models/ (delete it to re-download)\n"
+            continue
+        url = f"https://huggingface.co/{owner}/{name}/resolve/main/{path}"
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ChitraMaya"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                total = int(r.headers.get("Content-Length", 0) or 0)
+                got, last = 0, -1
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            pct = int(got * 100 / total)
+                            if pct != last and pct % 5 == 0:
+                                last = pct
+                                with _download_lock:
+                                    _download_job["log"] += (
+                                        f"  {pct}%  ({got // 1048576}/{total // 1048576} MB)\n")
+            tmp.replace(dest)
+            with _download_lock:
+                _download_job["log"] += f"[done] {fname}\n"
+        except Exception as e:
+            ok_all = False
+            logger.exception("download failed for %s", path)
+            with _download_lock:
+                _download_job["log"] += f"[error] {fname}: {e}\n"
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+    with _download_lock:
+        _download_job["done"] = ok_all
+        _download_job["running"] = False
+        _download_job["log"] += "\n=== Download complete ===\n"
+
+
+@app.route("/api/download-models", methods=["POST"])
+def api_download_models():
+    data = request.get_json(force=True) or {}
+    repo = _parse_hf_repo(data.get("url", ""))
+    files = [str(f) for f in (data.get("files") or []) if str(f).lower().endswith((".pt", ".pth"))]
+    if not repo:
+        return jsonify({"error": "Invalid repo URL."})
+    if not files:
+        return jsonify({"error": "No files selected."})
+    owner, name = repo
+    with _download_lock:
+        if _download_job["running"]:
+            return jsonify({"error": "A download is already running."})
+        _download_job["running"] = True
+        _download_job["done"] = None
+        _download_job["log"] = f"Downloading {len(files)} file(s) from {owner}/{name} into models/...\n"
+    threading.Thread(target=_run_download, args=(owner, name, files), daemon=True).start()
+    return jsonify({"ok": True, "started": True, "count": len(files)})
+
+
+@app.route("/api/download-log", methods=["GET"])
+def api_download_log():
+    with _download_lock:
+        return jsonify({
+            "running": _download_job["running"],
+            "log": _download_job["log"],
+            "done": _download_job["done"],
+        })
 
 
 @app.route("/api/progress", methods=["GET"])
