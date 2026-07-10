@@ -1,0 +1,137 @@
+name: Bug report
+description: Something isn't working in ChitraMaya.  File a report so we can investigate.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to file a bug report.  The more detail you
+        can give in the fields below, the faster we can diagnose what's going on.
+
+        **Content policy — please read:**
+        Do **not** attach, embed, paste, or link any NSFW or sexually explicit
+        images, video, or frames — including "before/after" mosaic or restored
+        frames.  Issues or threads containing explicit content **will be removed**.
+        You can report almost any problem with **console log text** plus your
+        settings and GPU; if a visual is truly needed, crop to a non-explicit
+        UI element only.
+
+        **Before filing:** search
+        [existing issues](https://github.com/seatv/ChitraMaya/issues?q=is%3Aissue)
+        and check the [Known Issues](https://github.com/seatv/ChitraMaya#known-issues--not-yet-implemented)
+        section in the README.
+
+  - type: checkboxes
+    id: content-ack
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: This issue contains **no NSFW / explicit content**, and any image I attach shows only non-explicit UI (dialogs, controls, logs).
+          required: true
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of what went wrong.
+      placeholder: |
+        e.g. "After clicking Restore & Save, the app closed without producing an output file."
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: |
+        e.g. "Expected a restored .mp4 to be written to my output folder."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps that let us reliably trigger the bug.
+      placeholder: |
+        1. Load a video
+        2. Select detection model X and restoration model Y
+        3. Enable Use Tensor
+        4. Click Restore & Save
+        5. Observe: ...
+      value: |
+        1. 
+        2. 
+        3. 
+    validations:
+      required: true
+
+  - type: textarea
+    id: console-log
+    attributes:
+      label: Console log output
+      description: |
+        Run ChitraMaya from a PowerShell terminal (`ChitraMaya.exe`, or
+        `chitramaya --console`) and paste the relevant log text below.
+        Paste **text** — do not screenshot frames.  Remove anything personal
+        (file paths with your name, etc.) first.
+      render: shell
+      placeholder: Paste the log lines from the failing run here.
+
+  - type: input
+    id: version
+    attributes:
+      label: ChitraMaya version
+      description: Check the installer file name or the release you downloaded (or a commit hash if built from source).
+      placeholder: e.g. v1.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How did you install ChitraMaya?
+      options:
+        - "Downloaded the installer from a GitHub release"
+        - "Built from source with pip install -e ."
+        - "Other (describe above)"
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Windows version
+      description: Settings then System then About then Windows specifications.
+      placeholder: e.g. Windows 11 24H2
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Device Manager then Display adapters.  Include card name and VRAM.
+      placeholder: e.g. NVIDIA RTX 3060 12GB / RTX 5060 Ti 8GB
+    validations:
+      required: true
+
+  - type: textarea
+    id: models
+    attributes:
+      label: Models involved
+      description: Which detection (.pt) and restoration (.pth) models, and were the engines compiled?
+      placeholder: |
+        e.g. det: lada_mosaic_detection_model_v4_accurate (compiled),
+             rest: lada_mosaic_restoration_model_generic_v1.2 (compiled)
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Anything else?
+      description: Settings used, workarounds tried, related issues.  (No explicit media — describe instead.)
