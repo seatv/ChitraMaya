@@ -183,11 +183,6 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--trk-match-pad-px", type=int, default=None,
                    help="Pad previous ROI when matching new detections to scenes (default 8)")
 
-    # --- Scene tracking (kept for config parity) ---
-    p.add_argument("--trk-min-iou", type=float, default=None)
-    p.add_argument("--trk-max-clip-frames", type=int, default=None)
-    p.add_argument("--trk-min-clip-frames", type=int, default=None)
-
     # --- Visualization (pseudo / debug overlays) ---
     p.add_argument("--vis-box-color", type=_parse_rgb_triplet, default=None)
     p.add_argument("--vis-box-thickness", type=int, default=None)
@@ -323,9 +318,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("store_max_frames",), args.store_max_frames)
 
     # Scene tracking
-    _set_if_not_none(cfg, ("scene_tracking", "min_iou"), args.trk_min_iou)
-    _set_if_not_none(cfg, ("scene_tracking", "max_clip_frames"), args.trk_max_clip_frames)
-    _set_if_not_none(cfg, ("scene_tracking", "min_clip_frames"), args.trk_min_clip_frames)
     _set_if_not_none(cfg, ("scene_tracking", "ttl_after_end"), args.trk_ttl_after_end)
     _set_if_not_none(cfg, ("scene_tracking", "crop_quant_px"), args.trk_crop_quant_px)
     _set_if_not_none(cfg, ("scene_tracking", "crop_sticky"), args.trk_crop_sticky)
