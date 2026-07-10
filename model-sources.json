@@ -1,0 +1,10 @@
+[
+  {
+    "name": "lada (primary)",
+    "url": "https://huggingface.co/ladaapp/lada/tree/main"
+  },
+  {
+    "name": "zelefans (VR)",
+    "url": "https://huggingface.co/zelefans/vrmr/tree/main"
+  }
+]
