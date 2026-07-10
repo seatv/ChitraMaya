@@ -501,10 +501,14 @@ class SwapServer:
             bf = 0
         self._mosaic_pipeline._discard_margin = d
         self._mosaic_pipeline._blend_frames = bf
-        # Detector score is read at detect-time from self.score_threshold,
-        # so live-mutation is safe.
-        if self._mosaic_pipeline._detector is not None:
-            self._mosaic_pipeline._detector.score_threshold = pipeline_cfg.detection_score
+        # Detector score is read at detect-time from the live model
+        # (_detector.model.conf). Writing _detector.score_threshold is a no-op
+        # the detector never reads, so use the pipeline's own updater — otherwise
+        # a Score-only change (Score isn't in the rebuild key) is silently ignored.
+        try:
+            self._mosaic_pipeline._set_detection_score(float(pipeline_cfg.detection_score))
+        except Exception:
+            logger.exception("Failed to apply live detection score")
         return self._mosaic_pipeline
 
     def _mosaic_progress_cb(self, *, frame_num, total_frames, detections,
@@ -1714,6 +1718,15 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
         class Api:
             def __init__(self):
                 self._window = None
+
+            @staticmethod
+            def open_url(url):
+                """Open an external URL in the system default browser."""
+                try:
+                    webbrowser.open(str(url))
+                    return {"ok": True}
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
 
             def toggle_fullscreen(self):
                 win = getattr(self, "_window", None)

@@ -1,0 +1,87 @@
+name: Bug report
+description: Report a problem with ChitraMaya (crash, wrong output, install/compile issue).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Content policy — read before posting
+
+        **Do not attach, embed, paste, or link any NSFW or sexually explicit
+        images, video, frames, thumbnails, or samples** — including "before/after"
+        mosaic or restored frames — anywhere in this issue.
+
+        Posts or threads containing explicit content **will be removed**, and
+        repeat offenders may be blocked.
+
+        You can report almost any problem without explicit media: describe what
+        happened, paste the **console log text**, and include your settings and
+        GPU. If a visual is truly necessary, crop to a **non-explicit** UI
+        element only (a dialog, a control, an error message).
+  - type: checkboxes
+    id: content-ack
+    attributes:
+      label: Content acknowledgement
+      options:
+        - label: This issue contains **no NSFW / explicit content**, and any image I attach shows only non-explicit UI (dialogs, controls, logs).
+          required: true
+        - label: I have searched existing issues and this isn't a duplicate.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what actually happened?
+      placeholder: "When I clicked Restore & Save, the app ..."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Load a video
+        2. Select detection model X, restoration model Y
+        3. Set Score to ...
+        4. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console log
+      description: Copy the text from the console window (run `ChitraMaya.exe` from a terminal, or use `chitramaya --console`). Paste text — do not screenshot frames.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: "e.g. RTX 3060 12GB / RTX 5060 Ti 8GB"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: How are you running ChitraMaya?
+      options:
+        - Installer (release build)
+        - From source (developer install)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / release
+      placeholder: "e.g. v1.0.0, or a commit hash if from source"
+    validations:
+      required: false
+  - type: textarea
+    id: models
+    attributes:
+      label: Models involved
+      description: Which detection (.pt) and restoration (.pth) models, and were the engines compiled?
+      placeholder: "det: lada_mosaic_detection_model_v4_accurate (compiled) / rest: lada_mosaic_restoration_model_generic_v1.2 (compiled)"
+    validations:
+      required: false

@@ -716,3 +716,20 @@ async function resetDefaults() {
     console.error('[ChitraMaya] Failed to fetch defaults');
   }
 }
+
+// ── Save The Children ─────────────────────────────────────
+// Opens the official donation page in the system browser (via the pywebview
+// bridge; window.open fallback for dev/browser). Not affiliated.
+const stcBtn = document.getElementById('stcBtn');
+if (stcBtn) {
+  stcBtn.addEventListener('click', () => {
+    const url = 'https://www.savethechildren.org/us/ways-to-help/ways-to-give';
+    if (typeof window.pywebview !== 'undefined'
+        && window.pywebview && window.pywebview.api
+        && typeof window.pywebview.api.open_url === 'function') {
+      window.pywebview.api.open_url(url);
+    } else {
+      window.open(url, '_blank');
+    }
+  });
+}
