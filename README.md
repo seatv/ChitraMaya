@@ -178,6 +178,22 @@ A YOLO detector locates mosaic regions per frame, a scene tracker groups them in
 
 Full restores stream the whole file through NVDEC for throughput; *Test Frame* and segment previews read just the frames they need.
 
+## Known Issues / Not Yet Implemented
+
+A few things are intentionally incomplete or have known limitations in this release:
+
+**Not yet implemented (flags parse but have no effect):**
+
+- **Batch / folder processing** — `--batch-video-extensions` and `--batch-skip-existing` are placeholders; ChitraMaya currently processes one input at a time. Batch-over-a-folder isn't wired yet.
+- **Detection debug dumps** — `--debug-save-detection-frames` and `--debug-save-detection-json` don't write anything yet.
+
+**Known limitations:**
+
+- **FP16 toggles apply only to the PyTorch fallback.** For pre-compiled TensorRT engines, precision is fixed at compile time, so toggling **Use FP16** at runtime has no effect on a selected `.engine`. (It does affect `.pt` / `.pth` PyTorch runs.)
+- **Test Frame preview rows can accumulate.** Running **Test Frame** repeatedly on the same frame may stack preview rows in the strip until you press **New** or the next result replaces them. Cosmetic; a fix is planned.
+
+Found something else? Please open an issue — **without** attaching any explicit content (see the issue template).
+
 ## License
 
 See [LICENSE](LICENSE) for details.

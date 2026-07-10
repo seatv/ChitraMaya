@@ -1,0 +1,7 @@
+# Force use of the templates below (which carry the content policy) — a blank
+# issue would bypass the NSFW notice and the required acknowledgement.
+blank_issues_enabled: false
+contact_links:
+  - name: Content policy
+    url: https://github.com/seatv/ChitraMaya/blob/main/.github/ISSUE_TEMPLATE/bug_report.yml
+    about: "Do NOT post NSFW/explicit content in issues. Posts/threads with explicit content will be removed."

@@ -1128,3 +1128,24 @@ body.isAppFullscreen.pinned .app-footer { transform: translateY(0%); }
   font-size: 18px; line-height: 1; cursor: pointer; padding: 0 4px;
 }
 .session-banner-close:hover { color: var(--text); }
+
+/* -- Save The Children button -- */
+.stc-btn {
+  background: rgba(220, 38, 38, 0.12);
+  border: 1px solid rgba(220, 38, 38, 0.35);
+  color: var(--text, #e6e6e6);
+  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  margin-right: 8px;
+  white-space: nowrap;
+  transition: background 0.2s, border-color 0.2s;
+}
+.stc-btn:hover {
+  background: rgba(220, 38, 38, 0.22);
+  border-color: rgba(220, 38, 38, 0.6);
+}
+.stc-btn:active { transform: translateY(1px); }
