@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Content policy
+    url: https://github.com/seatv/ChitraMaya#known-issues--not-yet-implemented
+    about: "Do NOT post NSFW/explicit content in issues — posts and threads with explicit content will be removed."
+  - name: Known Issues / Not Yet Implemented
+    url: https://github.com/seatv/ChitraMaya#known-issues--not-yet-implemented
+    about: Documented behaviors and unimplemented flags that may look like bugs.
+  - name: Releases
+    url: https://github.com/seatv/ChitraMaya/releases
+    about: Download the latest installer and see what changed in each version.
