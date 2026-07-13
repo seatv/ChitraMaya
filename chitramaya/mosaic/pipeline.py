@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import queue as _queue
+import sys as _sys
 import threading as _threading
 import time
 from dataclasses import dataclass, field
@@ -476,39 +477,109 @@ class Pipeline:
         if str(self.rest_backend).lower() != "pytorch":
             try:
                 from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
+                    _basicvsrpp_sub_engine_dir,
                     all_basicvsrpp_sub_engines_exist,
+                    list_basicvsrpp_compiled_clip_sizes,
+                    pick_engine_clip_size,
                 )
+
+                # Engine filenames bind (precision, max_clip_size) at compile
+                # time, but the compiled sets are DYNAMIC-batch (valid for
+                # clips 1..N), so the compiled size only decides which FILES
+                # to load — the user's request stays the RUNTIME clip
+                # ceiling whenever a compiled set covers it. See
+                # pick_engine_clip_size(). Without this resolution, a model
+                # compiled at e.g. b90 hard-failed — or, worse, silently
+                # fell back to PyTorch under backend=auto — just because
+                # --rest-max-clip-length was omitted or different.
+                req_mcl = int(self.rest_max_clip_length)
+                engine_mcl = req_mcl
+                if not all_basicvsrpp_sub_engines_exist(
+                    self.rest_model, fp16=self.rest_fp16, max_clip_size=req_mcl,
+                ):
+                    avail = list_basicvsrpp_compiled_clip_sizes(
+                        self.rest_model, self.rest_fp16,
+                    )
+                    pick = pick_engine_clip_size(avail, req_mcl)
+                    if pick is not None:
+                        engine_mcl, runtime_mcl = pick
+                        if runtime_mcl == req_mcl:
+                            print(
+                                f"[Restorer] max_clip_length={req_mcl} has no "
+                                f"exact engine set; loading the b{engine_mcl} "
+                                f"set (dynamic, covers 1..{engine_mcl}) and "
+                                f"running with max_clip_length={req_mcl} "
+                                f"(compiled sizes: {avail})"
+                            )
+                        else:
+                            # Only smaller sets are compiled — clips longer
+                            # than the engine's ceiling cannot run, so the
+                            # runtime ceiling caps. This happens BEFORE run()
+                            # builds the tracker/store, so clip formation and
+                            # the engines stay consistent.
+                            print(
+                                f"[Restorer] No TRT sub-engines compiled for "
+                                f"max_clip_length>={req_mcl} "
+                                f"(fp16={self.rest_fp16}); capping "
+                                f"max_clip_length to {runtime_mcl} "
+                                f"(compiled sizes: {avail})"
+                            )
+                            self.rest_max_clip_length = int(runtime_mcl)
+
                 if all_basicvsrpp_sub_engines_exist(
                     self.rest_model,
                     fp16=self.rest_fp16,
-                    max_clip_size=int(self.rest_max_clip_length),
+                    max_clip_size=int(engine_mcl),
                 ):
                     from chitramaya.mosaic.restorer.basicvsrpp_trt_clip_restorer import (
                         BasicVSRPPTRTClipRestorer,
                     )
                     print(
                         f"[Restorer] Using TensorRT sub-engines "
-                        f"(max_clip_size={self.rest_max_clip_length}, "
+                        f"(engine_set=b{engine_mcl}, "
+                        f"max_clip_length={self.rest_max_clip_length}, "
                         f"fp16={self.rest_fp16})"
                     )
                     return BasicVSRPPTRTClipRestorer(
                         model_path=self.rest_model,
                         device=self.device,
                         fp16=self.rest_fp16,
-                        max_clip_size=int(self.rest_max_clip_length),
+                        max_clip_size=int(engine_mcl),
                     )
                 elif str(self.rest_backend).lower() == "trt":
-                    # User explicitly asked for TRT but engines are missing
+                    # User explicitly asked for TRT but no engine set exists
+                    # for this precision at ANY clip size. Say exactly what
+                    # was looked for, where, and what IS on disk.
+                    eng_dir = _basicvsrpp_sub_engine_dir(self.rest_model)
+                    other = list_basicvsrpp_compiled_clip_sizes(
+                        self.rest_model, not self.rest_fp16,
+                    )
+                    if other:
+                        hint = (
+                            f" Engines for fp16={not self.rest_fp16} DO exist "
+                            f"(clip sizes {other}) — match the compiled "
+                            f"precision with "
+                            f"{'--rest-fp16' if not self.rest_fp16 else '--no-rest-fp16'}, "
+                            f"or recompile."
+                        )
+                    else:
+                        hint = f" No compiled sub-engines found in {eng_dir}."
                     raise FileNotFoundError(
-                        f"--rest-backend trt requested but sub-engines not found "
-                        f"for max_clip_size={self.rest_max_clip_length}, "
-                        f"fp16={self.rest_fp16} alongside {self.rest_model}. "
-                        f"Compile with `ChitraMaya -compile-rest --rest-model "
+                        f"--rest-backend trt requested but no sub-engines found "
+                        f"for fp16={self.rest_fp16} alongside {self.rest_model} "
+                        f"(looked in {eng_dir})." + hint +
+                        f" Compile with `ChitraMaya -compile-rest --rest-model "
                         f"{self.rest_model} --rest-max-clip-length "
-                        f"{self.rest_max_clip_length}` or pass "
+                        f"{req_mcl}` or pass "
                         f"--rest-backend pytorch to use the PyTorch path."
                     )
-                # else: backend=auto, engines absent → silent PyTorch fallback
+                # else: backend=auto, nothing compiled → PyTorch fallback,
+                # but say so loudly enough that "it's slow" is diagnosable.
+                print(
+                    f"[Restorer] No compiled TRT sub-engines for "
+                    f"{self.rest_model} (fp16={self.rest_fp16}); "
+                    f"falling back to PyTorch."
+                )
             except (ImportError, ModuleNotFoundError) as e:
                 if str(self.rest_backend).lower() == "trt":
                     raise
@@ -1140,9 +1211,13 @@ class Pipeline:
             except Exception:
                 pass
 
-            # If producer failed, surface it now.
-            if "e" in prod_exc:
-                raise prod_exc["e"]
+            # NOTE: a producer failure is re-raised at the END of this
+            # finally block, not here. Raising here aborted the rest of the
+            # cleanup — flush_eof, the final drain, and critically
+            # encoder.close() — stranding an open NVENC session, the raw
+            # bitstream file handle, and the AsyncEncoder worker thread on
+            # every failed ffmpeg-CPU-lane run (they accumulate in the
+            # long-lived UI server; NVENC sessions are a scarce resource).
 
             if tracker is not None and restorer is not None:
                 for clip in tracker.flush_eof():
@@ -1201,15 +1276,20 @@ class Pipeline:
 
             # If async, flush + join the encoder worker before close()
             # triggers the remux. close() does this internally too, but
-            # making it explicit lets us report worker stats.
-            if isinstance(encoder, AsyncEncoder):
-                encoder.flush_and_join()
-                print(
-                    f"[Encoder] Async worker: encoded={encoder.frames_encoded} frames "
-                    f"in {encoder.worker_wall:.2f}s wall (overlapping with main thread)"
-                )
-
-            encoder.close()
+            # making it explicit lets us report worker stats. The inner
+            # try/finally guarantees encoder.close() runs even when
+            # flush_and_join() surfaces a worker exception — close() calls
+            # flush_and_join() again, which is a no-op once _stopped is set,
+            # so the underlying encoder/remux is never stranded.
+            try:
+                if isinstance(encoder, AsyncEncoder):
+                    encoder.flush_and_join()
+                    print(
+                        f"[Encoder] Async worker: encoded={encoder.frames_encoded} frames "
+                        f"in {encoder.worker_wall:.2f}s wall (overlapping with main thread)"
+                    )
+            finally:
+                encoder.close()
 
             metrics.t_mux += (time.perf_counter() - t0)
 
@@ -1383,6 +1463,14 @@ class Pipeline:
                 pbar.close()
             except Exception:
                 pass
+
+            # If the producer failed, surface it now — AFTER all cleanup, so
+            # the encoder/NVENC session, async worker, and remux were never
+            # stranded by a decode error. Guard on sys.exc_info(): if the
+            # try-body is already propagating its own exception through this
+            # finally, do not mask it with the producer's.
+            if "e" in prod_exc and _sys.exc_info()[0] is None:
+                raise prod_exc["e"]
 
         # FOI: if the target frame was a passthrough (no clip touched it), its
         # composited form equals the original. Also flag whether we saw it.

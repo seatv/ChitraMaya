@@ -230,7 +230,7 @@
                       title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip. Must match a compiled engine size (see Manage Models). Longer clips give smoother motion but use more VRAM; anything longer is split. Independent of detection.">Max Clip</span>
+                <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip. With Use Tensor on, any value up to the largest compiled engine size works (a set compiled at N covers clips 1..N); the ceiling is the largest compiled size (see Manage Models). Longer clips give smoother motion but use more VRAM; anything longer is split. Independent of detection.">Max Clip</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
                          min="30" max="180" step="10" value="90">

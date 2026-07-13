@@ -194,27 +194,18 @@ function updateMaxClipConstraints() {
     return;
   }
 
-  if (avail.length === 1) {
-    // Single compiled size — lock the slider to it.
-    const only = avail[0];
-    slider.min = only; slider.max = only; slider.step = 1;
-    slider.value = only;
-    slider.disabled = true;
-    if (valSpan) valSpan.textContent = String(only);
-  } else {
-    // Multiple compiled sizes — allow the compiled range; snap the current
-    // value to the nearest available <= current. The server snaps anything
-    // in between as a backstop.
-    const lo = avail[0];
-    const hi = avail[avail.length - 1];
-    slider.min = lo; slider.max = hi; slider.step = 1;
-    slider.disabled = false;
-    const cur = parseInt(slider.value);
-    const le = avail.filter(n => n <= cur);
-    const pick = le.length ? le[le.length - 1] : lo;
-    slider.value = pick;
-    if (valSpan) valSpan.textContent = String(pick);
-  }
+  // The compiled sets are DYNAMIC-batch: a set compiled at N covers clips of
+  // any length 1..N, and the pipeline loads the smallest compiled set that
+  // covers the requested value. So every Max Clip up to the LARGEST compiled
+  // size is runnable — only values above it are impossible. Cap the slider
+  // there; no locking to exact compiled sizes.
+  const hi = avail[avail.length - 1];
+  slider.min = Math.min(MAX_CLIP_FREE.min, hi);
+  slider.max = hi;
+  slider.step = MAX_CLIP_FREE.step;
+  slider.disabled = false;
+  if (parseInt(slider.value) > hi) slider.value = hi;
+  if (valSpan) valSpan.textContent = slider.value;
 
   _updateRestorationButtonStates();
 }
@@ -367,7 +358,14 @@ async function populateMosaicModelDropdowns() {
   // Restore the config's saved model selections (see applyConfig): stashed so
   // this survives the startup race with the config load, whichever resolves
   // first. Falls back to the current value if there's no stash.
+  //
+  // CONSUME-ONCE: the stash must be deleted after use. This function re-runs
+  // whenever a compile or download finishes (to pick up new engines/models);
+  // if the stash survived, every re-run would snap the dropdowns back to the
+  // STARTUP config's models, silently reverting the user's live selection —
+  // the next Restore would run the wrong model.
   const _saved = (typeof window !== 'undefined' && window._pendingMosaicModels) || {};
+  if (typeof window !== 'undefined') delete window._pendingMosaicModels;
   fill(detSel, data.detection, _saved.det);
   fill(restSel, data.restoration, _saved.rest);
   updateMaxClipConstraints();
