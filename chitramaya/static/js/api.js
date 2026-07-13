@@ -64,6 +64,27 @@ async function loadVideo(path) {
   state.currentFaceIdx = 0;
   state.assignments = {};
 
+  // A new video invalidates any segment marks and preview state from the
+  // previous one. Without this reset, a segment marked on video A survives
+  // into video B: Restore silently submits A's time range against B, the
+  // seekbar paints A's segment on B's timeline, and Preview stays enabled
+  // pointing at A's preview file. This lives here (not in onVideoLoad) so
+  // every entry path — drag-drop, file picker, browser prompt — is covered.
+  state.previewMode = false;
+  if (typeof clearSegment === 'function') {
+    // clearSegment() also resets the armed start marker, repaints the
+    // seekbar, deletes the server-side temp preview, and refreshes button
+    // states (with previewMode already false, the Preview button leaves
+    // "◀ Back" mode correctly).
+    try { clearSegment(); } catch (e) { console.warn('[ChitraMaya] segment reset on load failed:', e); }
+  } else {
+    state.segmentStartTime = 0;
+    state.segmentEndTime = 0;
+    state.segmentStartFrame = 0;
+    state.segmentEndFrame = 0;
+    state.previewReady = false;
+  }
+
   return result;
 }
 

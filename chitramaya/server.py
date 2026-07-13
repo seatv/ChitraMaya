@@ -411,33 +411,46 @@ class SwapServer:
         from chitramaya.mosaic.pipeline import MosaicPipeline
 
         # If TRT restoration is requested but the requested clip size has no
-        # compiled sub-engine set, snap to the nearest AVAILABLE compiled size
-        # (prefer the largest that is <= requested; else the smallest available).
-        # This prevents a stale UI/config clip size from hard-failing with a
-        # FileNotFoundError. When nothing is compiled the request is left
-        # unchanged so the build raises the clean "compile first" error.
+        # exact compiled sub-engine set: the compiled sets are DYNAMIC-batch
+        # (a set compiled at N covers clips 1..N), so when a LARGER set
+        # covers the request, keep the user's clip size — the pipeline's
+        # _build_restorer loads the covering set and runs at the requested
+        # ceiling. Only when every compiled set is SMALLER must the runtime
+        # ceiling shrink (clips longer than the engine's N cannot run).
+        # When nothing is compiled the request is left unchanged so the
+        # build raises the clean "compile first" error.
         if (mosaic_cfg.mosaic_restoration_trt and mosaic_cfg.restoration_model
                 and not mosaic_cfg.mosaic_mask_preview):
             import dataclasses
             from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
                 list_basicvsrpp_compiled_clip_sizes,
+                pick_engine_clip_size,
             )
             avail = list_basicvsrpp_compiled_clip_sizes(
                 mosaic_cfg.restoration_model, bool(mosaic_cfg.mosaic_restoration_fp16),
             )
             req = int(mosaic_cfg.mosaic_max_clip_size)
             if avail and req not in avail:
-                le = [n for n in avail if n <= req]
-                snapped = max(le) if le else min(avail)
-                logger.warning(
-                    "[mosaic] Max clip %d has no compiled TRT engines for %s "
-                    "(fp16=%s); snapping to %d (available: %s)",
-                    req, mosaic_cfg.restoration_model,
-                    mosaic_cfg.mosaic_restoration_fp16, snapped, avail,
-                )
-                mosaic_cfg = dataclasses.replace(
-                    mosaic_cfg, mosaic_max_clip_size=snapped,
-                )
+                engine_mcl, runtime_mcl = pick_engine_clip_size(avail, req)
+                if runtime_mcl != req:
+                    logger.warning(
+                        "[mosaic] Max clip %d exceeds every compiled TRT engine "
+                        "set for %s (fp16=%s); capping to %d (available: %s)",
+                        req, mosaic_cfg.restoration_model,
+                        mosaic_cfg.mosaic_restoration_fp16, runtime_mcl, avail,
+                    )
+                    mosaic_cfg = dataclasses.replace(
+                        mosaic_cfg, mosaic_max_clip_size=runtime_mcl,
+                    )
+                else:
+                    logger.info(
+                        "[mosaic] Max clip %d has no exact engine set for %s "
+                        "(fp16=%s); pipeline will load the b%d set (dynamic "
+                        "1..%d) and run at %d",
+                        req, mosaic_cfg.restoration_model,
+                        mosaic_cfg.mosaic_restoration_fp16,
+                        engine_mcl, engine_mcl, req,
+                    )
 
         # Tensor Detection: if requested and a compiled .engine exists for the
         # selected detection .pt, run detection on the engine (TRT). If the
@@ -658,12 +671,22 @@ class SwapServer:
         # ── Phase 1: ffmpeg extract ─────────────────────────────────────
         logger.info("Extracting mosaic segment %.2f → %.2f (%.1fs)",
                     start_time, end_time, seg_duration)
+        # Same extraction recipe as the FOI path (see mosaic_foi_preview):
+        # crf 10, NOT 0 — lossless H.264 uses transform-bypass macroblocks
+        # that NVDEC decodes unreliably on Ampere ("Decode Error occurred
+        # for picture N"); crf 10 is normal-transform, NVDEC-clean, and
+        # visually lossless. yuv420p + no B-frames keep the temp clip
+        # trivially decodable, and cutting by exact FRAME COUNT (not -t)
+        # avoids a time cut landing mid-GOP and leaving broken references
+        # at the tail.
+        n_seg_frames = max(1, int(round(seg_duration * vid_fps)))
         extract_cmd = [
             "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
             "-ss", f"{start_time:.3f}",
             "-i", self.video_path,
-            "-t", f"{seg_duration:.3f}",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
+            "-frames:v", str(n_seg_frames),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
+            "-pix_fmt", "yuv420p", "-bf", "0",
             "-an",
             seg_input,
         ]

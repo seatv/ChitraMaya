@@ -468,10 +468,16 @@ class SceneTracker:
         """Cache current frame for potential gap-fill; trim entries older
         than the TTL window."""
         # We clone so the buffer entry survives even if the pipeline
-        # mutates frame_bgr_u8 elsewhere. The frame is uint8 HWC, so
-        # for 4K this is ~25 MB per frame. We hold at most ttl+2 of
-        # them.
-        self._frame_buffer[int(frame_num)] = frame_bgr_u8
+        # mutates frame_bgr_u8 elsewhere. This is NOT theoretical: the same
+        # tensor object lives in the pipeline's FrameStore, and
+        # composite_clip_into_store() blends restored pixels into it IN
+        # PLACE when a clip completes. Without the clone, a scene that
+        # reactivates within its TTL window can gap-fill from frames
+        # another clip already composited — feeding restored pixels back
+        # through BasicVSR++ (double restoration, subtle smearing).
+        # Cost: one device memcpy per frame (~25 MB at 4K), at most ttl+2
+        # frames held.
+        self._frame_buffer[int(frame_num)] = frame_bgr_u8.clone()
         ttl = int(getattr(self.cfg, "ttl_after_end", 0) or 0)
         keep_from = frame_num - (ttl + 2)
         if keep_from > 0:
