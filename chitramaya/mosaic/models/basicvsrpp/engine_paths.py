@@ -80,6 +80,41 @@ def all_basicvsrpp_sub_engines_exist(
     )
 
 
+def pick_engine_clip_size(
+    compiled_sizes: list[int], requested: int,
+) -> tuple[int, int] | None:
+    """Resolve which compiled engine set serves a requested max clip length.
+
+    The preprocess/upsample sub-engines are compiled with DYNAMIC batch: a
+    set compiled at N is valid for clips of any length 1..N at inference
+    (see tools/compile_basicvsrpp.py). So the compiled size determines which
+    FILES to load, while the user's request determines the RUNTIME clip
+    ceiling — they only have to match when nothing big enough is compiled.
+
+    Returns ``(engine_size, runtime_max_clip_length)``:
+      - exact match compiled            -> (requested, requested)
+      - a larger set covers the request -> (smallest such set, requested)
+      - only smaller sets compiled      -> (largest set, largest set)
+                                           (clips longer than the engine's N
+                                           cannot run, so the ceiling caps)
+    Returns None when ``compiled_sizes`` is empty.
+
+    NOTE: a larger set may reserve somewhat more VRAM at runtime than a set
+    compiled exactly at the requested size; on VRAM-tight cards, compiling
+    an exact set is still worthwhile.
+    """
+    if not compiled_sizes:
+        return None
+    req = int(requested)
+    sizes = sorted(int(n) for n in compiled_sizes)
+    if req in sizes:
+        return (req, req)
+    ge = [n for n in sizes if n >= req]
+    if ge:
+        return (min(ge), req)
+    return (sizes[-1], sizes[-1])
+
+
 def list_basicvsrpp_compiled_clip_sizes(
     model_weights_path: str, fp16: bool,
 ) -> list[int]:

@@ -156,11 +156,29 @@ function applyConfig(cfg) {
   // load: if the config applies first, the setValue above no-ops because the
   // <option>s don't exist yet. Stash the desired values so populate can
   // restore them once the options are in. Robust to either resolve order.
+  //
+  // Only stash values that FAILED to apply (option not present yet) — and
+  // clear any stale stash when everything applied. populateMosaicModel-
+  // Dropdowns() consumes the stash exactly once. An unconditional stash
+  // lingered forever and snapped the dropdowns back to the startup config's
+  // models every time a compile/download finished repopulating the lists.
   if (typeof window !== 'undefined') {
-    window._pendingMosaicModels = {
-      det: cfg.ctrlMosaicDetModel,
-      rest: cfg.ctrlMosaicRestModel,
-    };
+    const detSel = document.getElementById('ctrlMosaicDetModel');
+    const restSel = document.getElementById('ctrlMosaicRestModel');
+    const detWanted = cfg.ctrlMosaicDetModel;
+    const restWanted = cfg.ctrlMosaicRestModel;
+    const detMissed = detWanted !== undefined && detWanted !== '' &&
+                      detSel && detSel.value !== String(detWanted);
+    const restMissed = restWanted !== undefined && restWanted !== '' &&
+                       restSel && restSel.value !== String(restWanted);
+    if (detMissed || restMissed) {
+      window._pendingMosaicModels = {
+        det: detMissed ? detWanted : undefined,
+        rest: restMissed ? restWanted : undefined,
+      };
+    } else {
+      delete window._pendingMosaicModels;
+    }
   }
 
   // Update all dial value displays
