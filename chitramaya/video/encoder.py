@@ -164,6 +164,8 @@ class Encoder:
         gpu_id: int = 0,
         input_path: str | Path | None = None,
         mux_audio: bool = True,
+        mp4_faststart: bool = True,
+        mux_extra_args: str = "",
         ffmpeg_path: str = "ffmpeg",
         # NVENC advanced options. Defaults below are "do not include" sentinels:
         # we pass NOTHING beyond codec/preset/QP and let the card pick the rest.
@@ -194,6 +196,8 @@ class Encoder:
         self.qp = int(qp)
         self.gpu_id = int(gpu_id)
         self.mux_audio = bool(mux_audio)
+        self.mp4_faststart = bool(mp4_faststart)
+        self.mux_extra_args = str(mux_extra_args or "")
         self.ffmpeg_path = str(ffmpeg_path)
         self.tune = str(tune)
         self.spatial_aq = bool(spatial_aq)
@@ -408,9 +412,20 @@ class Encoder:
         timescale_args = (
             ["-video_track_timescale", "90000"] if self._container == "mp4" else []
         )
+        # faststart is mp4-only AND now honors the mp4_faststart flag (was
+        # previously forced on with no way to disable it).
         faststart_args = (
-            ["-movflags", "+faststart"] if self._container == "mp4" else []
+            ["-movflags", "+faststart"]
+            if (self._container == "mp4" and self.mp4_faststart) else []
         )
+        # User-supplied extra remux args (must not include -i), appended just
+        # before the output path in whichever final remux command runs.
+        extra_args: List[str] = []
+        if self.mux_extra_args.strip():
+            extra_args = shlex.split(self.mux_extra_args)
+            for _t in extra_args:
+                if _t == "-i" or _t.startswith("-i"):
+                    raise ValueError("mux_extra_args must not include -i")
 
         # Cap output near the (possibly delayed) video length so trailing audio
         # doesn't extend the file, without clipping the delayed video's tail.
@@ -458,7 +473,7 @@ class Encoder:
                     step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
                              "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
                              "-map", "0:v:0", "-c:v", "copy"] + tag_args
-                step2 += faststart_args + timescale_args + dur_args + [str(out_path)]
+                step2 += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
                 return self._run_ffmpeg(step2, "remux")
 
             # No video delay: single pass raw -> final. audio_delay (rare: source
@@ -476,7 +491,7 @@ class Encoder:
             cmd += ["-map", "0:v:0", "-c:v", "copy"] + tag_args
             if has_audio_source:
                 cmd += ["-map", "1:a?", "-c:a", "copy"]
-            cmd += faststart_args + timescale_args + dur_args + [str(out_path)]
+            cmd += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
             return self._run_ffmpeg(cmd, "remux")
         finally:
             if temp_video is not None:

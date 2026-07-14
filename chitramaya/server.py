@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -29,6 +30,52 @@ from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.serving import WSGIRequestHandler
 
 logger = logging.getLogger(__name__)
+
+
+def _describe_gpu_error(e: BaseException) -> str:
+    """User-facing error text, with a restart hint for fatal CUDA states.
+
+    A CUDA 'illegal memory access' (or similar sticky device error) poisons
+    the process's CUDA context: every later CUDA call — including the next
+    Restore from this still-running server — fails with confusing errors.
+    Only a process restart recovers, so say that explicitly instead of
+    letting the user retry into a wall.
+    """
+    msg = str(e)
+    low = msg.lower()
+    if ("illegal memory access" in low or "cudaerrorillegaladdress" in low
+            or "device-side assert" in low or "unspecified launch failure" in low):
+        msg += (" — the GPU context is now unrecoverable in this process; "
+                "close and restart ChitraMaya before the next run. (This "
+                "usually follows severe VRAM oversubscription — see the "
+                "console warning and lower Max Clip / use a larger-VRAM GPU.)")
+    return msg
+
+
+def _app_base_dir() -> Path:
+    """Directory the app treats as home for ``models/`` and the config file.
+
+    Frozen (PyInstaller onedir): the exe's OWN directory. This makes
+    ``models/`` and ``ChitraMaya-config.json`` resolve no matter what
+    working directory the app was launched from — double-click, a Start-menu
+    or desktop shortcut pointing straight at the .exe, or any folder on the
+    PATH. Previously these were read relative to the process cwd, so only the
+    ``.cmd`` launcher's ``cd /d %~dp0`` (or launching from the install dir)
+    made them resolve; a direct .exe launch silently found an empty models
+    dir and no config. The .cmd's chdir is now belt-and-braces, not the only
+    thing holding it together.
+
+    From source (not frozen): cwd, preserving the documented
+    ``pip install -e .`` dev flow where you run from the repo root.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path.cwd()
+
+
+def _config_file_path() -> Path:
+    """Absolute path to ChitraMaya-config.json, anchored at the app base dir."""
+    return _app_base_dir() / "ChitraMaya-config.json"
 
 # ── Flask App ─────────────────────────────────────────────────────────────
 
@@ -87,8 +134,17 @@ class SwapServer:
         import torch
         torch.set_grad_enabled(False)
 
-        self.models_dir = Path(models_dir)
+        # Anchor a relative models dir (the default "./models", or a relative
+        # --models-dir) to the app base dir, so the models folder resolves
+        # regardless of launch cwd. An absolute CHITRAMAYA_MODELS_DIR /
+        # --models-dir is honored as-is.
+        _md = Path(models_dir)
+        self.models_dir = _md if _md.is_absolute() else (_app_base_dir() / _md)
         self.gpu_id = gpu_id
+
+        # Default so /api/ui-config and _save_ui_config never AttributeError
+        # when no config file exists yet (fresh install / first launch).
+        self.faces_dir: str = ""
 
         # Mosaic restoration pipeline (lazy; rebuilt only when load-affecting
         # config changes). Cached across requests so TRT engines don't reload.
@@ -125,7 +181,7 @@ class SwapServer:
     def _load_ui_config(self):
         """Load saved folder paths from unified config file."""
         try:
-            config_path = Path.cwd() / "ChitraMaya-config.json"
+            config_path = _config_file_path()
             if config_path.exists():
                 data = json.loads(config_path.read_text(encoding="utf-8"))
                 self.faces_dir = data.get("facesDir", data.get("faces_dir", ""))
@@ -139,7 +195,7 @@ class SwapServer:
     def _save_ui_config(self):
         """Save folder paths to unified config file (merges with existing)."""
         try:
-            config_path = Path.cwd() / "ChitraMaya-config.json"
+            config_path = _config_file_path()
             data = {}
             if config_path.exists():
                 data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -595,7 +651,7 @@ class SwapServer:
         except Exception as e:
             logger.exception("mosaic_full failed")
             self._progress["status"] = "error"
-            self._progress["error"] = str(e)
+            self._progress["error"] = _describe_gpu_error(e)
             return ""
 
         if self._cancel_flag.is_set():
@@ -716,7 +772,7 @@ class SwapServer:
         except Exception as e:
             logger.exception("mosaic_segment failed")
             self._progress["status"] = "error"
-            self._progress["error"] = str(e)
+            self._progress["error"] = _describe_gpu_error(e)
             return ""
         finally:
             pipeline.config.write_diagnostics = original_write_diag
@@ -840,8 +896,9 @@ class SwapServer:
                                       progress_cb=self._mosaic_progress_cb)
             except Exception as e:
                 logger.exception("mosaic_foi_preview failed")
-                self._progress.update({"status": "error", "error": str(e)})
-                return {"error": str(e)}
+                _emsg = _describe_gpu_error(e)
+                self._progress.update({"status": "error", "error": _emsg})
+                return {"error": _emsg}
             finally:
                 pipeline.config.write_diagnostics = orig_write_diag
                 for p in (seg_input, seg_output):
@@ -1088,7 +1145,11 @@ def api_list_mosaic_models():
     and will include those too. UI can filter further by filename if
     that ever becomes an issue.
     """
-    models_dir = Path("./models")
+    # Use the server's resolved (absolute) models dir, not a cwd-relative
+    # "./models" — the latter returned an empty list whenever the app was
+    # launched from anywhere other than the install dir (e.g. a double-click
+    # or a shortcut pointing at the .exe).
+    models_dir = _get_server().models_dir
     detection: list[dict] = []
     restoration: list[dict] = []
 
@@ -1315,12 +1376,12 @@ def api_fetch_model_list():
     owner, name = repo
     api = f"https://huggingface.co/api/models/{owner}/{name}/tree/main?recursive=true"
     try:
-        req = urllib.request.Request(api, headers={"User-Agent": "ChitraMaya"})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _hf_open(api, timeout=30) as r:
             tree = json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return jsonify({"error": "This repo needs authentication (not supported)."})
+        if e.code in (401, 403, 429):
+            return jsonify({"error": f"Hugging Face refused the request "
+                                     f"(HTTP {e.code}).{_hf_error_hint(e)}"})
         if e.code == 404:
             return jsonify({"error": "Repo not found (check the URL)."})
         return jsonify({"error": f"Fetch failed: HTTP {e.code}"})
@@ -1337,9 +1398,105 @@ def api_fetch_model_list():
     return jsonify({"ok": True, "repo": f"{owner}/{name}", "files": files})
 
 
+def _hf_token() -> str:
+    """Optional Hugging Face access token for the in-app downloader.
+
+    HF throttles ANONYMOUS downloads (~1,000 requests/hour per IP) and returns
+    403 Forbidden when the limit is hit; a free user token raises the limit
+    ~50x. Sources, in order:
+      1. HF_TOKEN environment variable (the standard HF name)
+      2. CHITRAMAYA_HF_TOKEN environment variable
+      3. hf-token.txt next to the exe / repo root (single line) — the easy
+         path for packaged users: create the file, paste the token from
+         https://huggingface.co/settings/tokens (a 'read' token suffices).
+    Kept OUT of ChitraMaya-config.json because api_save_config rewrites that
+    file with UI keys only and would silently drop a hand-added token.
+    """
+    for env in ("HF_TOKEN", "CHITRAMAYA_HF_TOKEN"):
+        tok = os.environ.get(env, "").strip()
+        if tok:
+            return tok
+    try:
+        p = _app_base_dir() / "hf-token.txt"
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
+
+_HF_UA = "ChitraMaya/1.1 (+https://github.com/seatv/ChitraMaya)"
+
+
+def _hf_open(url: str, timeout: int = 60, *, max_redirects: int = 5):
+    """Open an HF URL with optional auth, following redirects SAFELY.
+
+    urllib's default redirect handler forwards ALL request headers — including
+    Authorization — to the redirect target. HF ``resolve`` URLs 302 to a CDN
+    with a signed URL, and the CDN rejects requests that carry a conflicting
+    Authorization header. So: send the Bearer token to huggingface.co only,
+    then follow the redirect WITHOUT it (the signed URL itself is the
+    credential). This mirrors what huggingface_hub does internally.
+    """
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # surface redirects as HTTPError so we control them
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    token = _hf_token()
+    headers = {"User-Agent": _HF_UA, "Accept": "*/*"}
+    if token and url.startswith("https://huggingface.co/"):
+        headers["Authorization"] = f"Bearer {token}"
+
+    import urllib.error
+    current = url
+    for _hop in range(max_redirects):
+        req = urllib.request.Request(current, headers=headers)
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                loc = e.headers.get("Location")
+                if not loc:
+                    raise
+                current = loc
+                # Cross to the CDN: signed URL is the credential — drop auth.
+                headers = {"User-Agent": _HF_UA, "Accept": "*/*"}
+                continue
+            raise
+    raise RuntimeError(f"Too many redirects fetching {url}")
+
+
+def _hf_error_hint(e: BaseException) -> str:
+    """Actionable text for HF download failures (esp. anonymous throttling)."""
+    code = getattr(e, "code", None)
+    if code in (401, 403, 429):
+        tok = _hf_token()
+        if tok:
+            return (
+                " Hugging Face refused the request despite a token — the token "
+                "may be invalid/expired, or the repo may be gated (open it in a "
+                "browser and accept its terms). Check hf-token.txt / HF_TOKEN."
+            )
+        return (
+            " Hugging Face throttles anonymous downloads (~1,000 requests/hour "
+            "per IP) and returns 403 when exceeded — likely after several "
+            "installs/tests from this network today. Fix: create hf-token.txt "
+            "next to ChitraMaya-config.json containing a free token from "
+            "huggingface.co/settings/tokens (or set HF_TOKEN) and retry — or "
+            "wait an hour, or download the file in a browser into models/."
+        )
+    return ""
+
+
 def _run_download(owner, name, files):
     import urllib.request
-    models_dir = Path("./models")
+    # Download into the server's resolved (absolute) models dir so in-app
+    # downloads land next to the exe's models/ regardless of launch cwd —
+    # matching where /api/list-mosaic-models now scans.
+    models_dir = _get_server().models_dir
     try:
         models_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -1357,8 +1514,7 @@ def _run_download(owner, name, files):
         url = f"https://huggingface.co/{owner}/{name}/resolve/main/{path}"
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ChitraMaya"})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with _hf_open(url, timeout=60) as r:
                 total = int(r.headers.get("Content-Length", 0) or 0)
                 got, last = 0, -1
                 with open(tmp, "wb") as f:
@@ -1382,7 +1538,7 @@ def _run_download(owner, name, files):
             ok_all = False
             logger.exception("download failed for %s", path)
             with _download_lock:
-                _download_job["log"] += f"[error] {fname}: {e}\n"
+                _download_job["log"] += f"[error] {fname}: {e}{_hf_error_hint(e)}\n"
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -1522,7 +1678,7 @@ def api_save_config():
     """Save UI config. Writes ONLY known UI keys — no legacy data."""
     data = request.get_json(force=True)
     try:
-        config_path = Path.cwd() / "ChitraMaya-config.json"
+        config_path = _config_file_path()
         config_path.write_text(
             json.dumps(data, indent=2, default=str) + "\n",
             encoding="utf-8",
@@ -1544,7 +1700,7 @@ def api_save_config():
 def api_load_config():
     """Load UI config. Filters to known UI keys only."""
     try:
-        config_path = Path.cwd() / "ChitraMaya-config.json"
+        config_path = _config_file_path()
         if not config_path.exists():
             return jsonify({})
         data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1601,6 +1757,7 @@ def api_default_config():
         "ctrlCodec": "hevc",
         "ctrlPreset": "P5",
         "ctrlQP": "18",
+        "ctrlAsyncEncoder": False,
 
         # Transport
         "skipBackward": "5",

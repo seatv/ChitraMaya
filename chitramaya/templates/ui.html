@@ -248,7 +248,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Soften the edge where the restored patch meets the original frame by N pixels (0-64). Higher hides the seam for a smoother blend; 0 = hard edge. Raise it if paste-backs look like sharp rectangles.">Feather</span>
+                      title="Soften the edge where the restored patch meets the original frame by N pixels (0-64). Higher hides the seam for a smoother blend; 0 = auto. Applies when Blend Mask = FaceFusion (the shape-aware edge). With Blend Mask = None it has no effect.">Feather</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicFeather"
                          min="0" max="64" value="0">
@@ -331,6 +331,11 @@
               <input type="range" class="ctrl-dial" id="ctrlQP" min="0" max="51" value="18">
               <span class="ctrl-value" id="valQP">18</span>
             </div>
+          </div>
+          <div class="ctrl-row">
+            <input type="checkbox" class="ctrl-checkbox" id="ctrlAsyncEncoder">
+            <span class="ctrl-label" style="min-width:auto;"
+                  title="Encode on a background thread, overlapping NVENC with detection/restoration — up to ~20-25% faster on encode-heavy runs. Needs VRAM headroom (adds a ~500-600 MB frame queue at 4K) and can hit NVENC errors on saturated or low-VRAM cards. Leave OFF unless your card has room to spare.">Async Encode</span>
           </div>
         </div>
       </div>

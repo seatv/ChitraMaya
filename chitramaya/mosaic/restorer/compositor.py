@@ -43,6 +43,8 @@ def _blend_into_frame_lada(
     orig_clip_box: Box,
     model_dtype: torch.dtype,
     border_ratio: float = 0.05,
+    blendmask: str = "none",
+    feather_radius: int = 0,
 ) -> None:
     """
     Direct port of LADA frame_restorer.py blend:
@@ -51,12 +53,27 @@ def _blend_into_frame_lada(
       temp += roi
       round+clamp (GPU path)
       CPU path uses numpy and uint8 cast (trunc)
+
+    blendmask selects how the per-pixel alpha is built:
+      - "none"       : legacy LADA rectangular blend mask (create_blend_mask).
+                       feather_radius does not apply here.
+      - "facefusion" : alpha follows the mosaic's actual mask support
+                       (create_support_blend_mask) for a softer, shape-aware
+                       edge. feather_radius (px) sets the inward feather;
+                       0 = auto (derived from crop size).
     """
     t, l, b, r = map(int, orig_clip_box)
     frame_roi = frame_bgr_u8[t : b + 1, l : r + 1]
 
-    # Create blend mask like LADA: create_blend_mask(mask.float())
-    blend_mask = mask_utils.create_blend_mask(clip_mask_u8.float())
+    # Build the blend alpha per the selected mode.
+    if str(blendmask).lower() == "facefusion":
+        _feather = int(feather_radius) if int(feather_radius) > 0 else None
+        blend_mask = mask_utils.create_support_blend_mask(
+            clip_mask_u8.float(), feather_px=_feather,
+        )
+    else:
+        # Legacy LADA rectangular blend mask.
+        blend_mask = mask_utils.create_blend_mask(clip_mask_u8.float())
 
     if frame_bgr_u8.device.type != "cuda":
         # CPU/numpy path (matches LADA CPU semantics: astype(uint8) truncation)
@@ -99,9 +116,14 @@ def composite_clip_into_store(
     store_bgr_u8: Dict[int, torch.Tensor],
     model_dtype: torch.dtype,
     border_ratio: float = 0.05,
+    blendmask: str = "none",
+    feather_radius: int = 0,
 ) -> None:
     """
     Port of LADA FrameRestorer._restore_frame applied over an entire clip.
+
+    blendmask / feather_radius select the paste-back alpha (see
+    _blend_into_frame_lada). Defaults ("none", 0) preserve the legacy behavior.
     """
     n = min(len(restored_frames_u8), len(clip.frame_nums))
     for i in range(n):
@@ -131,6 +153,8 @@ def composite_clip_into_store(
             orig_clip_box=orig_box,
             model_dtype=model_dtype,
             border_ratio=border_ratio,
+            blendmask=blendmask,
+            feather_radius=feather_radius,
         )
 
 __all__ = ["composite_clip_into_store"]
