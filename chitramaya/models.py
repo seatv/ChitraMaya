@@ -180,6 +180,7 @@ class MosaicConfig:
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),
+            async_encoder=bool(enc.get("async_encoder", False)),
             write_diagnostics=True,
         )
 

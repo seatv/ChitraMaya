@@ -48,6 +48,8 @@ No models ship with the app — you add them once. Two ways, both from **Manage 
 
 **In-app download (easiest):** launch ChitraMaya, click **Manage Models**, pick a source from the dropdown (the primary **lada** and VR-focused **zelefans** repositories are pre-loaded), click **Fetch**, select the detection (`.pt`) and restoration (`.pth`) files you want, and **Download**. They land in `models\` automatically. You can add your own Hugging Face repo URLs with **+ Add**.
 
+> Hugging Face throttles anonymous downloads (~1,000 requests/hour per IP) and answers with a 403 once you cross it — easy to hit on a heavy day of testing across machines behind one home IP. If downloads start failing, drop a free "read" token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) into a one-line `hf-token.txt` next to the app (or set the `HF_TOKEN` environment variable) and retry. Failed downloads now name the cause and the fix in the log rather than showing a bare error.
+
 ![Manage Models — download checkpoints, then compile TensorRT engines for your GPU](docs/ModelManagement.png)
 
 **Manual:** drop any detection `.pt` and restoration `.pth` files straight into the `models\` folder.
@@ -73,6 +75,12 @@ When it finishes, the badges flip to **Compiled** and the models are ready to us
 4. Use **Restore** / **Restore & Save** to process a segment or the whole video.
 
 For side-by-side (SBS) VR video, enable **Split SBS** in Detection so each eye is detected at full resolution.
+
+A few things worth knowing before a full run:
+
+- **Max Clip Length is flexible.** A restoration engine set compiled at N handles any clip length up to N, so you can set Max Clip to any value up to your largest compiled size — the app loads the smallest set that covers your request and runs at the ceiling you asked for. Longer clips give better temporal stability but cost more VRAM.
+- **VRAM pre-flight warning.** Before processing starts, ChitraMaya checks free GPU memory against what the run needs and warns you up front — from "headroom is thin" through "VRAM tight, may page" up to "this configuration does not fit this GPU" — and names the levers that would help (lower Max Clip, a smaller compiled engine set, PyTorch detection). Heed it, especially on 8 GB and smaller cards.
+- **Async Encode is off by default.** Synchronous encoding is the dependable default and saves ~500–600 MB of VRAM at 4K. If your card has headroom, tick **Async Encode** in the Encoder panel to overlap encode with restoration for a faster run.
 
 ![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
 
@@ -147,15 +155,17 @@ Useful CLI flags:
 
 | Flag | Description |
 |---|---|
-| `--rest-backend` | `trt` (TensorRT sub-engines) or `pytorch` (fallback, no precompiled engines needed) |
-| `--rest-max-clip-length` | Frames per restoration clip (must match the compiled engine) |
+| `--rest-backend` | `auto` (default — loads a covering engine set, or falls back to PyTorch), `trt` (force TensorRT sub-engines), or `pytorch` (force fallback, no precompiled engines needed) |
+| `--rest-max-clip-length` | Frames per restoration clip. Any value up to your largest compiled set — the app loads the smallest set that covers it and runs at this ceiling. Defaults to 30 if omitted. |
 | `--det-conf` | Detection confidence threshold |
-| `--det-imgsz` | Detector input size (multiple of 32) |
+| `--det-imgsz` | Detector input size (multiple of 32). This is the only way to run detection at a size other than 640 — see Known Issues. |
+| `--async-encoder` | Overlap encode with restoration (opt-in; synchronous is the default). Faster on cards with VRAM headroom. |
 | `--enc-codec` | Output codec: `hevc` or `h264` |
 | `--enc-qp` | Encoder quantization parameter (lower = higher quality) |
+| `--mp4-fast-start` / `--no-mp4-fast-start` | Move the MP4 index to the front for streaming (on by default) |
 | `--max-frames` | Process at most N frames (debug) |
 
-Run `chitramaya -restore --help` for the full list.
+Run `chitramaya -restore --help` for the full list. A handful of no-op flags from earlier versions (`--enc-format`, the `--vis-*` overlay flags, `--profile-sync`, and two `--rest-compositor-*` flags) were removed in v1.1; every flag that remains has a real effect.
 
 ### Build the installer
 
@@ -189,7 +199,8 @@ A few things are intentionally incomplete or have known limitations in this rele
 
 **Known limitations:**
 
-- **FP16 toggles apply only to the PyTorch fallback.** For pre-compiled TensorRT engines, precision is fixed at compile time, so toggling **Use FP16** at runtime has no effect on a selected `.engine`. (It does affect `.pt` / `.pth` PyTorch runs.)
+- **Detection Image Size is UI-selectable only at compile time.** You can compile a detection engine at 960 (or any multiple of 32) from **Manage Models**, but the UI restore path always detects at 640. To *run* at a non-640 size, drive it from the CLI with `--det-imgsz` until the runtime UI control lands.
+- **Detection FP16 applies only to the PyTorch path.** For a compiled TensorRT detection engine, precision is baked in at compile time, so the runtime **Detection FP16** toggle has no effect — the app now grays it out when a compiled engine is selected. It still applies to `.pt` PyTorch detection runs.
 - **Test Frame preview rows can accumulate.** Running **Test Frame** repeatedly on the same frame may stack preview rows in the strip until you press **New** or the next result replaces them. Cosmetic; a fix is planned.
 
 Found something else? Please open an issue — **without** attaching any explicit content (see the issue template).
