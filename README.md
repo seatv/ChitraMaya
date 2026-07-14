@@ -4,6 +4,12 @@ A TensorRT-accelerated mosaic restoration studio with a real-time visual editor.
 
 ![ChitraMaya — the mosaic input and the restored result, side by side](docs/InAction.png)
 
+## Terms & Conditions
+
+By downloading or using any part of this software you agree that you will use it for only actions legally permitted in your geographic jurisdiction.
+We are NOT, cannot, and will not be held responsible for any actions performed by users of this software. Users must understand and comply with all relevant local, regional, and international laws pertaining to this technology. This includes laws related to privacy, defamation, intellectual property rights, and other relevant legislation. Users should consult legal professionals if they have any doubts regarding the legal implications of their creations.
+
+
 ## Why ChitraMaya?
 
 Some restoration tools are batch processors: set parameters, run a full pass, look at the result, repeat. ChitraMaya is built the other way around — as an **interactive editor**.
