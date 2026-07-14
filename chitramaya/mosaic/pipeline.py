@@ -304,6 +304,116 @@ def _compute_emergency_store_max(
     return max(base, min(target, ceiling))
 
 
+# ---------------------------------------------------------------------------
+# VRAM oversubscription check (warn up-front instead of paging silently)
+# ---------------------------------------------------------------------------
+# Base headroom (MB) the run needs BEYOND the FrameStore and the async-encoder
+# queue, for restore activations, NVDEC surfaces, and torch scratch allocated
+# during the loop (not yet allocated when we measure). The caller ADDS the
+# async NVENC queue's real footprint (queue_size x W x H x 4 BGRA — ~600 MB at
+# 4K/queue=16) on top. Raise this if it under-warns on your hardware, lower it
+# if it over-warns.
+_VRAM_BASE_RESERVE_MB = 512
+
+
+def _vram_free_total(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
+    """Best-effort (free_bytes, total_bytes) for the device, or (None, None).
+
+    Uses the driver-level free (torch.cuda.mem_get_info), which accounts for
+    TensorRT-managed allocations too (they live outside torch's caching
+    allocator), so it reflects what NVDEC/NVENC/the FrameStore can actually
+    draw from.
+    """
+    try:
+        if device.type == "cuda":
+            free, total = torch.cuda.mem_get_info(device)
+            return int(free), int(total)
+    except Exception:
+        pass
+    return None, None
+
+
+def _vram_plan(
+    *,
+    width: int,
+    height: int,
+    max_clip_length: int,
+    requested_frames: int,
+    free_bytes: int,
+    total_bytes: int,
+    reserve_bytes: int = _VRAM_BASE_RESERVE_MB * 1024 * 1024,
+) -> Tuple[int, bool, Optional[str]]:
+    """Decide the FrameStore cap and whether the run will likely oversubscribe.
+
+    Measured AFTER the models are built (so free_bytes already excludes the
+    detector/restorer contexts) and BEFORE the loop (FrameStore still empty).
+
+    Returns ``(final_frames, reduced, warning)``:
+      - final_frames : store cap to use. For an oversubscribing AUTO store, it
+        is lowered toward what fits (never below a one-clip floor); callers
+        should apply this only when the cap was auto-computed.
+      - reduced      : True if final_frames < requested_frames.
+      - warning      : a message if the *requested* config won't fit free VRAM
+        (i.e. paging to system RAM is likely), else None.
+    """
+    mb = 1024 * 1024
+    thin_bytes = 512 * mb  # "headroom is thin" band above a hard shortfall
+    frame_bytes = max(1, int(width) * int(height) * 3)
+    req = int(requested_frames)
+    floor = max(int(max_clip_length) + 8, 32)  # hold ~one clip + small buffer
+
+    req_bytes = req * frame_bytes
+    headroom = int(free_bytes) - req_bytes - int(reserve_bytes)
+
+    # Only reduce an oversubscribing AUTO store — down to what fits, never
+    # below the one-clip floor. A store that merely leaves thin headroom is
+    # left alone (it fits); we just note it.
+    final = req
+    reduced = False
+    if headroom < 0:
+        fit_frames = max(0, (int(free_bytes) - int(reserve_bytes))) // frame_bytes
+        final = max(floor, int(fit_frames))
+        reduced = final < req
+
+    _lev = "Levers: lower --rest-max-clip-length or --store-max-frames, use " \
+           "PyTorch or smaller --det-imgsz detection, or a larger-VRAM GPU."
+    # SEVERE means "does not fit" — reserve it for when the minimum one-clip
+    # store ALONE cannot fit free VRAM (the store frames physically don't have
+    # room). The old test (floor + full surface reserve > free) over-fired: on
+    # a 6 GB card the store floor fit with ~150 MB to spare and the run was
+    # healthy, yet it printed "does not fit this GPU" — crying wolf on exactly
+    # the modest hardware the warning most needs to be trusted on. The surface
+    # reserve is a padded estimate (transient scratch/surfaces), so it drives
+    # the softer OVERSUBSCRIBED tier, not the hard verdict.
+    store_floor_bytes = floor * frame_bytes
+    warning: Optional[str] = None
+    if store_floor_bytes > int(free_bytes):
+        warning = (
+            f"VRAM SEVERELY oversubscribed at {width}x{height}: even the minimum "
+            f"one-clip FrameStore (~{store_floor_bytes // mb} MB for "
+            f"max_clip_length={int(max_clip_length)}) exceeds the "
+            f"{int(free_bytes) // mb} MB free after models "
+            f"({int(total_bytes) // mb} MB total) — before any surfaces or "
+            f"activations. This configuration does not fit this GPU; expect "
+            f"extreme paging and possible CUDA errors. " + _lev
+        )
+    elif headroom < 0:
+        warning = (
+            f"VRAM tight at {width}x{height}: FrameStore ~{(final * frame_bytes) // mb} MB "
+            f"+ ~{int(reserve_bytes) // mb} MB surfaces vs {int(free_bytes) // mb} MB "
+            f"free ({int(total_bytes) // mb} MB total after models). May page to "
+            f"system RAM if scratch exceeds the ~{max(0, (int(free_bytes) - final * frame_bytes)) // mb} MB "
+            f"headroom — watch throughput. " + _lev
+        )
+    elif headroom < thin_bytes:
+        warning = (
+            f"VRAM headroom is thin (~{headroom // mb} MB free after a "
+            f"~{req_bytes // mb} MB FrameStore + ~{int(reserve_bytes) // mb} MB surfaces "
+            f"at {width}x{height}); watch for paging. " + _lev
+        )
+    return final, reduced, warning
+
+
 @dataclass
 class Pipeline:
     cfg: Config
@@ -314,9 +424,16 @@ class Pipeline:
         self.max_frames: Optional[int] = self.cfg.get("max_frames", default=None)
 
         self.debug: bool = bool(self.cfg.get("debug_enabled", default=False))
-        self.profile_sync: bool = bool(self.cfg.get("profile_sync", default=False))
 
-        self.batch_size: int = int(self.cfg.get("batch_size", default=8))
+        # Batch size drives decode + detection batching. Read the top-level
+        # `batch_size` first (CLI --batch-size), falling back to
+        # `detection.batch_size` — the key the UI ("Detection Batch") and CLI
+        # --det-batch-size actually write. Without the fallback, both of those
+        # controls were silently ignored and every UI run used 8.
+        _bs = self.cfg.get("batch_size", default=None)
+        if _bs is None:
+            _bs = self.cfg.get("detection", "batch_size", default=8)
+        self.batch_size: int = int(_bs)
 
         self.dec_gpu_id: int = int(cfg_first(self.cfg, [("decoder", "gpu_id")], default=0))
         self.enc_gpu_id: int = int(cfg_first(self.cfg, [("encoder", "gpu_id")], default=self.dec_gpu_id))
@@ -373,14 +490,6 @@ class Pipeline:
         if self.rest_blendmask not in ("none", "facefusion"):
             raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
 
-        # Generic compositor tuning knobs
-        self.rest_compositor_quantize_before_resize: bool = bool(
-            self.cfg.get("restoration", "compositor_quantize_before_resize", default=False)
-        )
-        self.rest_compositor_resize_backend: str = str(
-            self.cfg.get("restoration", "compositor_resize_backend", default="torch") or "torch"
-        ).lower()
-
         # Fixed-box analysis mode (use synth_mosaic.rois instead of detector boxes)
         self.analysis_use_synth_rois: bool = bool(
             self.cfg.get("restoration", "analysis_use_synth_rois", default=False)
@@ -416,9 +525,16 @@ class Pipeline:
         self.mux_extra_args: str = str(self.cfg.get("encoder", "mux_extra_args", default="") or "")
         self.mp4_faststart: bool = bool(self.cfg.get("encoder", "mp4_faststart", default=True))
 
-        # Async encoder thread (Step 1 threading): overlap NVENC encode with
-        # the main thread's decode/detect/restore/composite pass.
-        self.async_encoder: bool = bool(self.cfg.get("encoder", "async_encoder", default=True))
+        # Async encoder thread: overlap NVENC encode with the main thread's
+        # decode/detect/restore/composite pass. DEFAULT OFF (opt-in): the
+        # async path has produced two distinct field failure modes on
+        # VRAM/NVENC-pressured cards — worker deadlock-hangs (fixed) and
+        # NVENC error 8 (nvEncLockBitstream) under 4K load — while the sync
+        # path has been reliable. Sync also skips the ~queue_size x W x H x 4
+        # BGRA queue (~600 MB at 4K/queue16), which matters on 8 GB cards.
+        # Opt in on healthy/large-VRAM machines for up to ~20-25% wall-time
+        # savings on encode-heavy runs (--async-encoder, or the UI checkbox).
+        self.async_encoder: bool = bool(self.cfg.get("encoder", "async_encoder", default=False))
         self.async_encoder_queue: int = int(self.cfg.get("encoder", "async_encoder_queue", default=16))
 
     def _build_detector(self):
@@ -451,6 +567,10 @@ class Pipeline:
             raise ValueError(f"Unknown detector_type: {det_type}")
 
     def _build_restorer(self):
+        # Reset the engine-set VRAM hint; set only when a TRT set is chosen
+        # and smaller compiled sets exist (see below).
+        self._rest_engine_note = ""
+
         if self.mode == "none":
             return None
 
@@ -525,6 +645,27 @@ class Pipeline:
                                 f"(compiled sizes: {avail})"
                             )
                             self.rest_max_clip_length = int(runtime_mcl)
+
+                # VRAM-hint note, surfaced alongside run()'s VRAM warning: a
+                # larger engine set reserves dramatically more activation
+                # memory (observed: b180 + detection context left ~335 MB free
+                # on an 8 GB card at 4K). If smaller compiled sets exist,
+                # tell the user exactly which Max Clip selects them.
+                self._rest_engine_note = ""
+                try:
+                    _avail_all = list_basicvsrpp_compiled_clip_sizes(
+                        self.rest_model, self.rest_fp16,
+                    )
+                    _smaller = [n for n in _avail_all if n < int(engine_mcl)]
+                    if _smaller:
+                        self._rest_engine_note = (
+                            f" Note: restoration engine set b{int(engine_mcl)} is in "
+                            f"use; smaller compiled set(s) {_smaller} exist — a max "
+                            f"clip length <= {max(_smaller)} selects b{max(_smaller)}, "
+                            f"which reserves substantially less VRAM."
+                        )
+                except Exception:
+                    pass
 
                 if all_basicvsrpp_sub_engines_exist(
                     self.rest_model,
@@ -686,6 +827,8 @@ class Pipeline:
                 gpu_id=self.enc_gpu_id,
                 input_path=str(inp),
                 mux_audio=_mux_audio_bool,
+                mp4_faststart=self.mp4_faststart,
+                mux_extra_args=self.mux_extra_args,
             )
 
             # Wrap in AsyncEncoder if enabled — runs encode_frame() on a
@@ -722,20 +865,63 @@ class Pipeline:
             )
             tracker = SceneTracker(cfg=tracker_cfg, seg_mask_only=True)
 
-        # [CHANGE 2] FrameStore with backpressure
+        # [CHANGE 2] FrameStore with backpressure.
+        # Determine the requested cap first (auto / explicit / unlimited).
         if self.store_max_frames == 0:
-            computed_max = _compute_default_store_max(w, h, self.rest_max_clip_length)
-            store = FrameStore(max_frames=computed_max)
+            requested_cap = _compute_default_store_max(w, h, self.rest_max_clip_length)
+            store_is_auto = True
         elif self.store_max_frames < 0:
-            store = FrameStore(max_frames=0)
+            requested_cap = 0            # unlimited
+            store_is_auto = False
         else:
-            store = FrameStore(max_frames=self.store_max_frames)
+            requested_cap = int(self.store_max_frames)
+            store_is_auto = False
+
+        # VRAM oversubscription check (best-effort; models are already built so
+        # free VRAM reflects their contexts, and the store is still empty). For
+        # an AUTO store we lower the cap toward what fits; either way we warn
+        # up-front if the config is likely to page instead of failing silently.
+        final_cap = requested_cap
+        if requested_cap > 0:
+            _free_b, _total_b = _vram_free_total(self.device)
+            if _free_b is not None:
+                # Reserve = base + the async NVENC queue's real BGRA footprint
+                # (the queue can hold up to async_encoder_queue full frames on
+                # the GPU). Scales with resolution and the queue setting.
+                _queue_frames = int(self.async_encoder_queue) if self.async_encoder else 2
+                _reserve_b = (_VRAM_BASE_RESERVE_MB * 1024 * 1024) + _queue_frames * (w * h * 4)
+                _plan_frames, _reduced, _warn = _vram_plan(
+                    width=w, height=h, max_clip_length=self.rest_max_clip_length,
+                    requested_frames=requested_cap,
+                    free_bytes=_free_b, total_bytes=_total_b,
+                    reserve_bytes=_reserve_b,
+                )
+                if store_is_auto and _reduced:
+                    final_cap = _plan_frames
+                    # Honest wording: the reduction may have bottomed out at the
+                    # one-clip floor, which does NOT necessarily fit free VRAM —
+                    # the warning below states the real situation.
+                    print(
+                        f"[FrameStore] VRAM-aware: reduced auto max_frames "
+                        f"{requested_cap}->{final_cap} (free VRAM after models: "
+                        f"~{_free_b // (1024*1024)} MB; backpressure can still bump "
+                        f"if a scene needs it)"
+                    )
+                if _warn is not None:
+                    print(f"[Pipeline] WARNING: {_warn}"
+                          f"{getattr(self, '_rest_engine_note', '')}")
+        store = FrameStore(max_frames=final_cap)
 
         if store.max_frames > 0:
             est_mb = (store.max_frames * w * h * 3) / (1024.0 * 1024.0)
             print(f"[FrameStore] max_frames={store.max_frames} (~{est_mb:.0f} MB VRAM budget)")
         else:
             print("[FrameStore] max_frames=unlimited")
+
+        # Echo the effective batch size (decode + detection). Surfaced so the
+        # "Detection Batch" control / --batch-size / --det-batch-size is
+        # visible in the log — previously there was no way to confirm it took.
+        print(f"[Pipeline] batch_size={self.batch_size}")
 
         # [CHANGE 4] PTS log: collects (frame_num, pts_ns) for all encoded frames
         pts_log: List[Tuple[int, Optional[int]]] = []
@@ -971,6 +1157,8 @@ class Pipeline:
                             restored_frames_u8=restored,
                             store_bgr_u8=store.frames_bgr_u8,
                             model_dtype=restorer.model_dtype,
+                            blendmask=self.rest_blendmask,
+                            feather_radius=self.feather_radius,
                         )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
@@ -1198,6 +1386,15 @@ class Pipeline:
                     consume_batch(list(batch0), batch_pts=batch_pts_raw)
 
         finally:
+            # True when this finally was entered by an exception propagating
+            # out of the try-body (e.g. a CUDA illegal-memory-access mid-run).
+            # In that state the GPU context is typically poisoned, so cleanup
+            # steps that touch CUDA will ALSO fail — those failures must be
+            # logged-and-skipped rather than allowed to MASK the original
+            # exception and abort the rest of cleanup (remux of the partial
+            # output, reports). On a clean exit, cleanup errors still raise.
+            _inflight_exc = _sys.exc_info()[0] is not None
+
             # Stop producer safely and avoid deadlock if it is blocked on a full queue.
             stop.set()
             if prod is not None:
@@ -1219,32 +1416,47 @@ class Pipeline:
             # every failed ffmpeg-CPU-lane run (they accumulate in the
             # long-lived UI server; NVENC sessions are a scarce resource).
 
-            if tracker is not None and restorer is not None:
-                for clip in tracker.flush_eof():
-                    restored = restorer.restore_clip(clip)
-                    composite_clip_into_store(
-                        clip=clip,
-                        restored_frames_u8=restored,
-                        store_bgr_u8=store.frames_bgr_u8,
-                        model_dtype=restorer.model_dtype,
-                    )
-                    metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
-                    metrics.clip_lengths.append(int(len(clip.frame_nums)))
-                    if (_foi_target is not None
-                            and int(_foi_target) in clip.frame_nums
-                            and int(_foi_target) in store.frames_bgr_u8):
-                        foi_capture["composited"] = (
-                            store.frames_bgr_u8[int(_foi_target)].detach().clone()
+            try:
+                if tracker is not None and restorer is not None:
+                    for clip in tracker.flush_eof():
+                        restored = restorer.restore_clip(clip)
+                        composite_clip_into_store(
+                            clip=clip,
+                            restored_frames_u8=restored,
+                            store_bgr_u8=store.frames_bgr_u8,
+                            model_dtype=restorer.model_dtype,
+                            blendmask=self.rest_blendmask,
+                            feather_radius=self.feather_radius,
                         )
+                        metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
+                        metrics.clip_lengths.append(int(len(clip.frame_nums)))
+                        if (_foi_target is not None
+                                and int(_foi_target) in clip.frame_nums
+                                and int(_foi_target) in store.frames_bgr_u8):
+                            foi_capture["composited"] = (
+                                store.frames_bgr_u8[int(_foi_target)].detach().clone()
+                            )
 
-            drain_store_to_encoder(
-                store=store,
-                safe_before=10**18,
-                encoder=encoder,
-                device=self.device,
-                sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,
-            )
+                drain_store_to_encoder(
+                    store=store,
+                    safe_before=10**18,
+                    encoder=encoder,
+                    device=self.device,
+                    sync_before_encode=self.enc_sync_before_encode,
+                    pts_log=pts_log,
+                )
+            except Exception as _flush_e:
+                if not _inflight_exc:
+                    raise
+                # Original exception is propagating through this finally; the
+                # GPU context is likely dead and these CUDA ops fail too. Log
+                # and continue so the encoder still closes/remuxes the frames
+                # encoded so far, and the ORIGINAL error reaches the caller.
+                print(
+                    f"[Pipeline] WARNING: final flush/drain failed after run "
+                    f"error ({type(_flush_e).__name__}: {_flush_e}); continuing "
+                    f"cleanup with frames encoded so far"
+                )
 
             t_total_no_mux = time.perf_counter() - t0_all
 
@@ -1282,14 +1494,28 @@ class Pipeline:
             # flush_and_join() again, which is a no-op once _stopped is set,
             # so the underlying encoder/remux is never stranded.
             try:
-                if isinstance(encoder, AsyncEncoder):
-                    encoder.flush_and_join()
-                    print(
-                        f"[Encoder] Async worker: encoded={encoder.frames_encoded} frames "
-                        f"in {encoder.worker_wall:.2f}s wall (overlapping with main thread)"
-                    )
-            finally:
-                encoder.close()
+                try:
+                    if isinstance(encoder, AsyncEncoder):
+                        encoder.flush_and_join()
+                        print(
+                            f"[Encoder] Async worker: encoded={encoder.frames_encoded} frames "
+                            f"in {encoder.worker_wall:.2f}s wall (overlapping with main thread)"
+                        )
+                finally:
+                    encoder.close()
+            except Exception as _enc_e:
+                if not _inflight_exc:
+                    raise
+                # Same rationale as the flush guard: with the original error
+                # in flight (dead GPU context), the async worker likely died
+                # with the same CUDA error — surface it as a log line, keep
+                # the original exception, and let the remaining cleanup run.
+                # Encoder.close()'s remux of the partial bitstream is CPU-side
+                # and has already been attempted by the inner finally.
+                print(
+                    f"[Pipeline] WARNING: encoder finalize failed after run "
+                    f"error ({type(_enc_e).__name__}: {_enc_e})"
+                )
 
             metrics.t_mux += (time.perf_counter() - t0)
 
@@ -1546,6 +1772,7 @@ class MosaicPipelineConfig:
     codec: str = "hevc"
     preset: str = "P5"
     qp: int = 18
+    async_encoder: bool = False      # opt-in: overlap NVENC on a worker thread
     write_diagnostics: bool = True
     # Optional pass-throughs the UI may set later; safe defaults preserve
     # current behavior. SBS is exposed because the CLI supports it and the
@@ -1560,6 +1787,58 @@ class MosaicPipelineConfig:
     use_seg_masks: bool = True
     feather_radius: int = 0
     blendmask: str = "none"
+
+
+# ---------------------------------------------------------------------------
+# Wiring guardrail (see ChitraMaya-WiringAudit)
+# ---------------------------------------------------------------------------
+# Every MosaicPipelineConfig field must be classified as CONSUMED (it flows to
+# the pipeline/server and has an effect) or INERT (accepted for
+# signature/UX compatibility but deliberately not implemented). Adding a field
+# without classifying it — or renaming one and leaving a stale entry — raises
+# at import. This is the check that would have caught the Detection-Batch /
+# Feather / Blend-Mask "wired every layer except the last hop" bugs before they
+# shipped. Pair it with tools/verify_wiring.py, which asserts the values
+# actually survive the to_pipeline_config -> _build_base_config -> Pipeline
+# round trip.
+_MPC_CONSUMED_FIELDS = frozenset({
+    "detection_model", "restoration_model", "detection_score",
+    "detection_batch_size", "max_clip_size", "mask_preview", "mask_color",
+    "mask_opacity", "detection_fp16", "restoration_fp16", "use_trt",
+    "codec", "preset", "qp", "async_encoder", "write_diagnostics",
+    "sbs_enabled", "sbs_layout",
+    "sbs_det_split", "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
+    "use_seg_masks", "feather_radius", "blendmask",
+})
+_MPC_INERT_FIELDS = frozenset({
+    "temporal_overlap",   # no temporal-overlap implementation
+    "crossfade",          # no crossfade implementation
+    "blend_frames",       # no crossfade implementation
+    "color_match",        # no color-match implementation
+})
+
+
+def _audit_mosaic_pipeline_config_fields() -> None:
+    import dataclasses
+    allf = {f.name for f in dataclasses.fields(MosaicPipelineConfig)}
+    classified = _MPC_CONSUMED_FIELDS | _MPC_INERT_FIELDS
+    unclassified = allf - classified
+    stale = classified - allf
+    if unclassified:
+        raise RuntimeError(
+            "MosaicPipelineConfig field(s) not classified as consumed/inert: "
+            f"{sorted(unclassified)} — wire them (and add to "
+            "_MPC_CONSUMED_FIELDS) or add to _MPC_INERT_FIELDS. See "
+            "ChitraMaya-WiringAudit."
+        )
+    if stale:
+        raise RuntimeError(
+            "consumed/inert sets reference nonexistent MosaicPipelineConfig "
+            f"field(s): {sorted(stale)} (rename left a stale entry)."
+        )
+
+
+_audit_mosaic_pipeline_config_fields()
 
 
 class MosaicPipeline:
@@ -1631,6 +1910,7 @@ class MosaicPipeline:
                 "codec": str(c.codec),
                 "preset": str(c.preset),
                 "qp": int(c.qp),
+                "async_encoder": bool(getattr(c, "async_encoder", False)),
                 "gpu_id": self.gpu_id,
             },
             "decoder": {"gpu_id": self.gpu_id},

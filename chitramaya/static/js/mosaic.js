@@ -70,6 +70,7 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
   'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
+  'ctrlAsyncEncoder',
 ];
 
 if (typeof CONFIG_CONTROLS !== 'undefined') {
@@ -370,6 +371,9 @@ async function populateMosaicModelDropdowns() {
   fill(restSel, data.restoration, _saved.rest);
   updateMaxClipConstraints();
   _updateRestorationButtonStates();
+  // Engine availability just refreshed → recompute which controls are inert
+  // (e.g. Det FP16 when a compiled engine exists for the selected model).
+  _updateControlEnableStates();
 }
 
 
@@ -414,6 +418,7 @@ function gatherMosaicParams() {
       codec: document.getElementById('ctrlCodec').value,
       preset: document.getElementById('ctrlPreset').value,
       qp: parseInt(document.getElementById('ctrlQP').value),
+      async_encoder: !!document.getElementById('ctrlAsyncEncoder')?.checked,
     },
   };
 }
@@ -434,8 +439,13 @@ function buildMosaicParamsSummary() {
     parts.push(m.mosaic_restoration_fp16 ? 'FP16' : 'FP32');
     parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
     if (m.mosaic_roi_dilate > 0) parts.push(`Dilate:${m.mosaic_roi_dilate}`);
-    if (m.mosaic_feather_radius > 0) parts.push(`Feather:${m.mosaic_feather_radius}`);
     if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') parts.push(`Blend:${m.mosaic_blend_mask}`);
+    // Feather only takes effect with the facefusion blend mask — only surface
+    // it in the summary when it's actually active, so it can't read as "on"
+    // under Blend Mask = None.
+    if (m.mosaic_feather_radius > 0 && m.mosaic_blend_mask === 'facefusion') {
+      parts.push(`Feather:${m.mosaic_feather_radius}`);
+    }
   }
   parts.push(`Enc: ${p.encoder.codec.toUpperCase()}/${p.encoder.preset}/QP${p.encoder.qp}`);
   return parts.join(' · ');
@@ -495,6 +505,46 @@ function _updateRestorationButtonStates() {
   }
 }
 
+// ── Control enable/disable (gray out knobs that don't apply) ──────────────
+// A control that can't affect the current run should be disabled, not left
+// looking live. Set the input disabled AND dim its row so it reads as inert.
+function _setCtrlEnabled(el, enabled) {
+  if (!el) return;
+  el.disabled = !enabled;
+  const row = el.closest('.ctrl-row');
+  if (row) row.style.opacity = enabled ? '' : '0.45';
+}
+
+function _updateControlEnableStates() {
+  // Feather only applies with Blend Mask = FaceFusion (the legacy "none" mask
+  // has no feather parameter). Gray it out under None so it can't read as on.
+  const blend = document.getElementById('ctrlMosaicBlendMask');
+  const feather = document.getElementById('ctrlMosaicFeather');
+  _setCtrlEnabled(feather, !!(blend && blend.value === 'facefusion'));
+
+  // Mask Colour + Opacity only matter in Mask Preview (pseudo) mode.
+  const maskPrev = document.getElementById('ctrlMosaicMaskPreview');
+  const previewOn = !!(maskPrev && maskPrev.checked);
+  _setCtrlEnabled(document.getElementById('ctrlMosaicMaskColor'), previewOn);
+  _setCtrlEnabled(document.getElementById('ctrlMosaicMaskOpacity'), previewOn);
+
+  // Detection FP16 is baked into a compiled detection .engine — AutoBackend
+  // reads the engine's binding precision and ignores the constructor flag, so
+  // the toggle only affects the PyTorch (.pt) path. Gray it when Use Tensor is
+  // on AND an engine exists for the selected model (if no engine, it falls
+  // back to .pt where FP16 *does* matter, so leave it live there).
+  const detTrt = document.getElementById('ctrlMosaicDetTrt');
+  const detModel = document.getElementById('ctrlMosaicDetModel');
+  const detFp16 = document.getElementById('ctrlMosaicDetFp16');
+  const mv = detModel ? (detModel.value || '') : '';
+  const detHasEngine = /\.engine$/i.test(mv) || _mosaicDetEngines[mv] === true;
+  const detFp16Inert = !!(detTrt && detTrt.checked && detHasEngine);
+  _setCtrlEnabled(detFp16, !detFp16Inert);
+  // NOTE: Restoration FP16 is intentionally NOT grayed — it selects the
+  // fp16-vs-fp32 engine SET (different compiled files), so it has a real
+  // effect even with Use Tensor on.
+}
+
 // Wrap the face-swap _updateButtonStates so any call updates both modes.
 // init.js declares it with `function _updateButtonStates(){}`, which both
 // creates a global binding AND a property on window. Setting only
@@ -534,6 +584,15 @@ if (typeof loadVideo === 'function') {
 ['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateRestorationButtonStates);
+});
+
+// Controls whose value changes which OTHER controls are inert → recompute
+// enable/disable state. (Blend Mask → Feather; Mask Preview → colour/opacity;
+// Det Use Tensor / Det Model → Det FP16.)
+['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicDetTrt',
+ 'ctrlMosaicDetModel'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', _updateControlEnableStates);
 });
 
 // Controls that affect which compiled engine set applies re-evaluate the
@@ -912,6 +971,12 @@ function _mmStartPolling() {
 async function mmCompile() {
   if (_mmSelected.size === 0) return;
   const log = document.getElementById('mmLog');
+  // Compile and download share the single #mmLog pane and the GPU; don't let
+  // them run at once (their logs would overwrite each other tick-by-tick).
+  if (_mmDlPoll) {
+    if (log) log.textContent = 'A download is running — wait for it to finish before compiling.';
+    return;
+  }
   const imgsz = parseInt(document.getElementById('mmImgsz').value, 10) || 640;
   const maxClip = parseInt(document.getElementById('mmMaxClip').value, 10) || 60;
   const force = document.getElementById('mmForce').checked;
@@ -933,18 +998,31 @@ async function openManageModels() {
   modal.classList.remove('hidden');
   await mmLoadSources();
   await mmPopulateList();
-  const s = await apiGet('/api/compile-log');   // resume if a compile is running
-  if (s && s.running) {
+  // Resume whichever background job is still running server-side (either, not
+  // both — they can't run concurrently). Check compile first, then download.
+  const cs = await apiGet('/api/compile-log');
+  if (cs && cs.running) {
     const log = document.getElementById('mmLog');
-    if (log) log.textContent = s.log || '';
+    if (log) log.textContent = cs.log || '';
     _mmStartPolling();
+  } else {
+    const ds = await apiGet('/api/download-log');
+    if (ds && ds.running) {
+      const log = document.getElementById('mmLog');
+      if (log) log.textContent = ds.log || '';
+      _mmStartDlPolling();
+    }
   }
 }
 
 function closeManageModels() {
   const modal = document.getElementById('manageModelsModal');
   if (modal) modal.classList.add('hidden');
-  if (_mmPoll) { clearInterval(_mmPoll); _mmPoll = null; }  // leave compile running server-side
+  // Stop BOTH polls (the jobs keep running server-side; openManageModels
+  // resumes whichever is still active). Previously only _mmPoll was cleared,
+  // so a download poll kept firing every 800ms against the hidden modal.
+  if (_mmPoll) { clearInterval(_mmPoll); _mmPoll = null; }
+  if (_mmDlPoll) { clearInterval(_mmDlPoll); _mmDlPoll = null; }
 }
 
 // ── Download (Hugging Face) ───────────────────────────────
@@ -1047,19 +1125,10 @@ function _mmSetDownloading(on) {
   btn.textContent = on ? '⏳ Downloading…' : `Download (${_mmDlSelected.size} selected)`;
 }
 
-async function mmDownload() {
-  if (_mmDlSelected.size === 0) return;
+function _mmStartDlPolling() {
   const log = document.getElementById('mmLog');
-  _mmSetDownloading(true);
-  if (log) log.textContent = 'Starting download…';
-  const res = await apiPost('/api/download-models',
-    { url: _mmCurrentRepoUrl, files: [..._mmDlSelected] });
-  if (!res || res.error) {
-    if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
-    _mmSetDownloading(false);
-    return;
-  }
   if (_mmDlPoll) clearInterval(_mmDlPoll);
+  _mmSetDownloading(true);
   _mmDlPoll = setInterval(async () => {
     const s = await apiGet('/api/download-log');
     if (!s) return;
@@ -1071,6 +1140,26 @@ async function mmDownload() {
       if (typeof populateMosaicModelDropdowns === 'function') populateMosaicModelDropdowns();  // AND in the Control Panel dropdowns (so they're selectable)
     }
   }, 800);
+}
+
+async function mmDownload() {
+  if (_mmDlSelected.size === 0) return;
+  const log = document.getElementById('mmLog');
+  // Shared #mmLog / GPU — don't run alongside a compile.
+  if (_mmPoll) {
+    if (log) log.textContent = 'A compile is running — wait for it to finish before downloading.';
+    return;
+  }
+  _mmSetDownloading(true);
+  if (log) log.textContent = 'Starting download…';
+  const res = await apiPost('/api/download-models',
+    { url: _mmCurrentRepoUrl, files: [..._mmDlSelected] });
+  if (!res || res.error) {
+    if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
+    _mmSetDownloading(false);
+    return;
+  }
+  _mmStartDlPolling();
 }
 
 // Slider readouts — self-contained (kept out of the config system).

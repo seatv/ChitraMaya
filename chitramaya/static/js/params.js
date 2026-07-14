@@ -185,6 +185,11 @@ function applyConfig(cfg) {
   document.querySelectorAll('.ctrl-dial').forEach(dial => {
     dial.dispatchEvent(new Event('input'));
   });
+
+  // Config values were set directly (no change events fire), so recompute
+  // which controls are inert for the just-loaded settings (e.g. Feather under
+  // Blend Mask = None, Mask colour/opacity when Preview is off).
+  if (typeof _updateControlEnableStates === 'function') _updateControlEnableStates();
 }
 
 // getDefaultConfig removed — defaults come from server /api/default-config

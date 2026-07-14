@@ -105,13 +105,15 @@ def create_parser() -> argparse.ArgumentParser:
                    help="NVENC preset P1-P7 (P1 fastest, P7 highest quality, default: P7)")
     p.add_argument("--enc-qp", type=int, default=None,
                    help="Constant QP (lower = better quality, larger file; default: 20)")
-    p.add_argument("--enc-format", default=None)
     p.add_argument("--enc-gpu-id", type=int, default=None)
     p.add_argument("--enc-sync-before-encode", action=argparse.BooleanOptionalAction, default=None)
 
     # --- Threading: async encoder thread ---
     p.add_argument("--async-encoder", action=argparse.BooleanOptionalAction, default=None,
-                   help="Run NVENC encoding on a background thread, overlapping with main pipeline. Default: enabled.")
+                   help="Run NVENC encoding on a background thread, overlapping with the main "
+                        "pipeline. Default: DISABLED (opt in). Worth up to ~20-25%% wall time on "
+                        "encode-heavy runs with plenty of VRAM, but adds a ~500-600MB frame queue "
+                        "at 4K and can hit NVENC error 8 on saturated/VRAM-tight cards.")
     p.add_argument("--async-encoder-queue", type=int, default=None,
                    help="Max BGRA frames queued for async encoder (default: 16, ~530MB VRAM at 4K)")
 
@@ -155,13 +157,13 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-clip-size", type=int, default=None)
     p.add_argument("--rest-border-ratio", type=float, default=None)
     p.add_argument("--rest-pad-mode", default=None)
-    p.add_argument("--rest-feather-radius", type=int, default=None)
+    p.add_argument("--rest-feather-radius", type=int, default=None,
+                   help="Feather (px) for the restored-region edge when --rest-blendmask "
+                        "facefusion is set (0 = auto). No effect with blendmask none.")
     p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None,
-                   help="Mainline compositor blendmask mode (default: none)")
-    p.add_argument("--rest-compositor-quantize-before-resize", action=argparse.BooleanOptionalAction, default=None,
-                   help="Generic compositor: quantize restored patch to uint8 grid before resize/composite")
-    p.add_argument("--rest-compositor-resize-backend", choices=["torch", "image_utils"], default=None,
-                   help="Generic compositor resize path (torch=F.interpolate, image_utils=torchvision/cv2 path)")
+                   help="Compositor blend-mask mode: none = legacy rectangular mask; "
+                        "facefusion = shape-aware soft edge following the mosaic mask "
+                        "(tuned by --rest-feather-radius).")
     p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None,
                    help="Analysis/tuning mode: use fixed synth_mosaic.rois for every frame instead of detector boxes")
 
@@ -183,11 +185,10 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--trk-match-pad-px", type=int, default=None,
                    help="Pad previous ROI when matching new detections to scenes (default 8)")
 
-    # --- Visualization (pseudo / debug overlays) ---
-    p.add_argument("--vis-box-color", type=_parse_rgb_triplet, default=None)
-    p.add_argument("--vis-box-thickness", type=int, default=None)
-    p.add_argument("--vis-show-confidence", action=argparse.BooleanOptionalAction, default=None)
-    p.add_argument("--vis-show-class", action=argparse.BooleanOptionalAction, default=None)
+    # --- Visualization (pseudo mode fill) ---
+    # NOTE: box-overlay knobs (--vis-box-*) were removed — they only fed the
+    # unreachable PseudoRestorer draw path. The live pseudo mode
+    # (PseudoClipRestorer) uses the fill color/opacity below.
     p.add_argument("--vis-fill-color", type=_parse_rgb_triplet, default=None)
     p.add_argument("--vis-fill-opacity", type=float, default=None)
 
@@ -209,7 +210,6 @@ def create_parser() -> argparse.ArgumentParser:
 
     # --- Runtime debug flags (not config.json leaf keys) ---
     p.add_argument("--debug", action="store_true", help="Verbose debug logging")
-    p.add_argument("--profile-sync", action="store_true", help="torch synchronize() around timings")
 
     return p
 
@@ -280,7 +280,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("encoder", "codec"), args.enc_codec)
     _set_if_not_none(cfg, ("encoder", "preset"), args.enc_preset)
     _set_if_not_none(cfg, ("encoder", "qp"), args.enc_qp)
-    _set_if_not_none(cfg, ("encoder", "format"), args.enc_format)
     _set_if_not_none(cfg, ("encoder", "gpu_id"), args.enc_gpu_id)
     _set_if_not_none(cfg, ("encoder", "sync_before_encode"), args.enc_sync_before_encode)
     _set_if_not_none(cfg, ("encoder", "async_encoder"), args.async_encoder)
@@ -310,8 +309,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "pad_mode"), args.rest_pad_mode)
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
     _set_if_not_none(cfg, ("restoration", "blendmask"), args.rest_blendmask)
-    _set_if_not_none(cfg, ("restoration", "compositor_quantize_before_resize"), args.rest_compositor_quantize_before_resize)
-    _set_if_not_none(cfg, ("restoration", "compositor_resize_backend"), args.rest_compositor_resize_backend)
     _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
 
     # [CHANGE 2] FrameStore backpressure
@@ -323,11 +320,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("scene_tracking", "crop_sticky"), args.trk_crop_sticky)
     _set_if_not_none(cfg, ("scene_tracking", "match_pad_px"), args.trk_match_pad_px)
 
-    # Visualization
-    _set_if_not_none(cfg, ("visualization", "box_color"), list(args.vis_box_color) if args.vis_box_color is not None else None)
-    _set_if_not_none(cfg, ("visualization", "box_thickness"), args.vis_box_thickness)
-    _set_if_not_none(cfg, ("visualization", "show_confidence"), args.vis_show_confidence)
-    _set_if_not_none(cfg, ("visualization", "show_class"), args.vis_show_class)
+    # Visualization (pseudo-mode fill only)
     _set_if_not_none(cfg, ("visualization", "fill_color"), list(args.vis_fill_color) if args.vis_fill_color is not None else None)
     _set_if_not_none(cfg, ("visualization", "fill_opacity"), args.vis_fill_opacity)
 
@@ -357,8 +350,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # Runtime-only toggles
     if args.debug:
         cfg.set("debug_enabled", value=True)
-    if args.profile_sync:
-        cfg.set("profile_sync", value=True)
 
     # Validation
     inp = Path(str(cfg.get("input", default="")))
