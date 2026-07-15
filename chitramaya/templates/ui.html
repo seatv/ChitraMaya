@@ -127,6 +127,8 @@
           <button class="vc-btn" id="vcPlayBtn" title="Play / Pause (Space)">▶</button>
           <button class="vc-btn" id="vcEndBtn" title="Seek to End">⏭</button>
           <div style="flex:1"></div>
+          <button class="vc-btn" id="vcSbsBtn" style="font-size:11px; letter-spacing:1px;"
+                  title="SBS View — projected per-eye 180° preview with original/restored wipe compare">SBS</button>
           <button class="vc-btn" id="vcVolumeBtn" title="Volume (M)">🔊</button>
           <button class="vc-btn" id="vcFsBtn" title="Fullscreen (F)">⛶</button>
         </div>
@@ -394,6 +396,8 @@
     <button class="action-btn primary"   id="restoreBtn"       data-mode="restoration" hidden disabled>Restore</button>
     <button class="action-btn secondary" id="restorePreviewBtn" data-mode="restoration" hidden disabled>Preview</button>
     <button class="action-btn primary"   id="restoreSaveBtn"   data-mode="restoration" hidden disabled>Restore &amp; Save</button>
+    <button class="action-btn secondary" id="addMosaicBtn"     data-mode="restoration" hidden
+            title="Pixelate up to three rectangles (SFW censor) and save — uses the marked segment if one is set, otherwise the whole video">Add Mosaic</button>
 
     <button id="fsBtn" class="fs-btn" title="Fullscreen (F)">Fullscreen</button>
   </div>
@@ -436,6 +440,55 @@
     <div class="modal-buttons">
       <button class="modal-btn modal-btn-cancel" id="tensorModalManage">Manage Models</button>
       <button class="modal-btn modal-btn-confirm" id="tensorModalContinue">Continue on PyTorch</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Add Mosaic Modal ────────────────────────────────────── -->
+<style>
+  #addMosaicModal .modal { width: min(480px, 92vw); text-align: left; }
+  #addMosaicModal .am-grid { display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 6px 8px;
+      align-items: center; margin: 10px 0; }
+  #addMosaicModal .am-grid input { width: 100%; box-sizing: border-box; padding: 4px 6px;
+      background: #1c2530; color: inherit; border: 1px solid #33455c; border-radius: 4px; }
+  #addMosaicModal .am-head { font-size: 11px; opacity: .7; text-align: center; }
+  #addMosaicModal .am-row-lbl { font-size: 12px; opacity: .8; }
+  #addMosaicModal .am-opts { display: flex; gap: 16px; align-items: center; margin: 8px 0 4px; }
+  #addMosaicModal .am-opts input[type=number] { width: 64px; padding: 4px 6px;
+      background: #1c2530; color: inherit; border: 1px solid #33455c; border-radius: 4px; }
+  #amScope { display: block; margin-top: 6px; font-size: 12px; opacity: .8; }
+</style>
+<div class="modal-overlay hidden" id="addMosaicModal">
+  <div class="modal">
+    <div class="modal-title">Add Mosaic (SFW censor)</div>
+    <div class="modal-message">
+      Pixelate up to three rectangles. Coordinates are <b>pixels, inclusive</b>
+      (t,l,b,r). For SBS video enter them <b>per-eye</b> (as seen in one eye's
+      view) and keep "Apply to both SBS eyes" on. Leave unused rows empty.
+      <span id="amScope"></span>
+    </div>
+    <div class="am-grid">
+      <span></span><span class="am-head">Top</span><span class="am-head">Left</span>
+      <span class="am-head">Bottom</span><span class="am-head">Right</span>
+      <span class="am-row-lbl">Rect 1</span>
+      <input id="am1t" type="number" min="0"><input id="am1l" type="number" min="0">
+      <input id="am1b" type="number" min="0"><input id="am1r" type="number" min="0">
+      <span class="am-row-lbl">Rect 2</span>
+      <input id="am2t" type="number" min="0"><input id="am2l" type="number" min="0">
+      <input id="am2b" type="number" min="0"><input id="am2r" type="number" min="0">
+      <span class="am-row-lbl">Rect 3</span>
+      <input id="am3t" type="number" min="0"><input id="am3l" type="number" min="0">
+      <input id="am3b" type="number" min="0"><input id="am3r" type="number" min="0">
+    </div>
+    <div class="am-opts">
+      <label>Block <input id="amBlock" type="number" min="2" max="128" value="16"
+             title="Mosaic cell size in pixels"></label>
+      <label><input id="amSbs" type="checkbox" checked> Apply to both SBS eyes</label>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-btn" id="amRedraw" title="Adjust the rectangles on the video">Draw again</button>
+      <button class="modal-btn modal-btn-cancel" id="amCancel">Cancel</button>
+      <button class="modal-btn modal-btn-confirm" id="amSubmit">Add &amp; Save</button>
     </div>
   </div>
 </div>
@@ -543,6 +596,7 @@
 <script src="/static/js/params.js?v={{ cachebust }}"></script>
 <script src="/static/js/init.js?v={{ cachebust }}"></script>
 <script src="/static/js/mosaic.js?v={{ cachebust }}"></script>
+<script type="module" src="/static/js/sbs_viewer.js?v={{ cachebust }}"></script>
 
 </body>
 </html>

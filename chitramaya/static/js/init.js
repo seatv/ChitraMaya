@@ -564,6 +564,9 @@ async function resetProject() {
   // Clear Test Frame (FOI) state: regions cache, strip, and any open enlarge.
   if (typeof _foiReset === 'function') _foiReset();
 
+  // Clear Add Mosaic state: drawn rectangles, modal inputs, draw mode.
+  if (typeof _amReset === 'function') _amReset();
+
   // Clear player
   try { player.pause(); } catch {}
   try { player.removeAttribute('src'); player.load(); } catch {}
