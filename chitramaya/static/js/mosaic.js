@@ -482,6 +482,17 @@ function _updateRestorationButtonStates() {
     restoreSaveBtn.title = '';
   }
 
+  // Add Mosaic: active whenever a video is loaded; inactive only while an
+  // add-mosaic is actively in progress (draw mode, modal, or encoding).
+  // No models needed — it's a pure decode->pixelate->encode pass.
+  const addMosaicBtn = document.getElementById('addMosaicBtn');
+  if (addMosaicBtn) {
+    const busy = (typeof _amIsBusy === 'function') ? _amIsBusy() : false;
+    addMosaicBtn.disabled = !hasVideo || busy;
+    addMosaicBtn.classList.toggle('primary', hasVideo && !busy);
+    addMosaicBtn.classList.toggle('secondary', !(hasVideo && !busy));
+  }
+
   // Preview: enabled + highlighted when a restored preview is ready.
   // state.previewReady is shared with face-swap; clearSegment() in
   // player.js resets it, so we don't need a separate flag.
@@ -1378,6 +1389,415 @@ if (typeof player !== 'undefined' && player) {
   player.addEventListener('loadedmetadata', _updateTestFrameLabel);
 }
 _updateTestFrameLabel();
+
+
+// ── Add Mosaic (SFW censor) ───────────────────────────────
+// Decode -> pixelate up to 3 rectangles -> encode. No detection/restoration.
+// Uses the marked segment if one is set, otherwise the whole video. The
+// saved output becomes the preview (and the SBS viewer's "restored" side,
+// so you can wipe-compare original vs censored).
+
+const _amModal = document.getElementById('addMosaicModal');
+
+function _amFmtTime(t) {
+  const m = Math.floor(t / 60), s = (t % 60).toFixed(1).padStart(4, '0');
+  return `${m}:${s}`;
+}
+
+function _amOpenModal() {
+  // Prefill SBS from the detection Split SBS control; scope from segment marks.
+  const sbsCtl = document.getElementById('ctrlMosaicSbsSplit');
+  document.getElementById('amSbs').checked = !!(sbsCtl && sbsCtl.checked);
+  const seg = state.segmentEndTime > state.segmentStartTime;
+  document.getElementById('amScope').textContent = seg
+    ? `Scope: marked segment ${_amFmtTime(state.segmentStartTime)} - ${_amFmtTime(state.segmentEndTime)}`
+    : 'Scope: whole video (mark a segment first to limit it).';
+  _amModal.classList.remove('hidden');
+  _updateRestorationButtonStates();
+}
+
+document.getElementById('addMosaicBtn').addEventListener('click', () => {
+  if (!state.videoPath) {
+    alert('Load a video first.');
+    return;
+  }
+  // Draw-first flow: drag rectangles on the paused video, then the modal
+  // opens pre-filled for numeric fine-tuning. "Type coordinates" skips
+  // straight to the modal.
+  _amEnterDraw();
+});
+
+document.getElementById('amCancel').addEventListener('click', () => {
+  _amModal.classList.add('hidden');
+  _updateRestorationButtonStates();
+});
+
+const _amRedrawBtn = document.getElementById('amRedraw');
+if (_amRedrawBtn) _amRedrawBtn.addEventListener('click', () => {
+  _amModal.classList.add('hidden');
+  _amEnterDraw();   // previous rectangles are kept for adjustment
+});
+
+// ── Add Mosaic: draw rectangles on the player ─────────────
+// A fixed-position overlay tracks the <video>'s displayed content box
+// (object-fit: contain math, so letterbox bars are excluded). It swallows
+// all mouse events while active — no play/pause conflict with the player's
+// click handler. Up to 3 rects, drawn in FULL-FRAME video pixels; per-eye
+// conversion happens when the modal is filled. With Split SBS on, a dashed
+// ghost mirrors each rect on the other eye live.
+
+var _amDraw = { active: false, rects: [], drag: null, layer: null, banner: null };
+var _amJobRunning = false;
+
+// True while the user is actively working on a mosaic: drawing, in the
+// modal, or the encode job is running. Drives the Add Mosaic button state.
+function _amIsBusy() {
+  const modalOpen = _amModal && !_amModal.classList.contains('hidden');
+  return _amDraw.active || modalOpen || _amJobRunning;
+}
+
+// Full reset — called by New (resetProject in init.js) so rectangles never
+// leak from one project/video into the next.
+function _amReset() {
+  if (_amDraw.active) _amExitDraw(false);
+  _amDraw.rects = [];
+  _amDraw.drag = null;
+  _amJobRunning = false;
+  for (let i = 1; i <= 3; i++) {
+    ['t', 'l', 'b', 'r'].forEach(k => {
+      const el = document.getElementById(`am${i}${k}`);
+      if (el) el.value = '';
+    });
+  }
+  if (_amModal) _amModal.classList.add('hidden');
+}
+
+(function _amInjectDrawCss() {
+  const st = document.createElement('style');
+  st.textContent = `
+    #amDrawLayer { position: fixed; z-index: 9000; cursor: crosshair;
+      touch-action: none; }
+    #amDrawLayer .am-rect { position: absolute; border: 2px solid #ff4444;
+      background: rgba(255,68,68,0.12); box-sizing: border-box; }
+    #amDrawLayer .am-rect .am-x { position: absolute; top: -10px; right: -10px;
+      width: 20px; height: 20px; line-height: 18px; text-align: center;
+      background: #ff4444; color: #fff; border-radius: 50%; font-size: 12px;
+      cursor: pointer; user-select: none; }
+    #amDrawLayer .am-rect .am-dim { position: absolute; left: 0; bottom: -18px;
+      font: 11px monospace; color: #ffb3b3; background: #000a;
+      padding: 0 4px; white-space: nowrap; }
+    #amDrawLayer .am-ghost { position: absolute; border: 2px dashed #ff8888;
+      box-sizing: border-box; pointer-events: none; opacity: .7; }
+    #amDrawBanner { position: fixed; z-index: 9001;
+      transform: translateX(-50%); display: flex; gap: 10px;
+      align-items: center; background: #1a222ce6; border: 1px solid #33455c;
+      border-radius: 6px; padding: 6px 12px; font-size: 12px; color: #cfd8e3;
+      pointer-events: none; /* drawing works "through" the banner... */ }
+    #amDrawBanner button { background: #243040; color: #cfd8e3;
+      border: 1px solid #33455c; border-radius: 4px; padding: 3px 10px;
+      font: inherit; cursor: pointer;
+      pointer-events: auto; /* ...but its buttons stay clickable */ }
+    #amDrawBanner button:hover { background: #2d3c50; }
+    #amDrawBanner button.primary { background: #4da3ff; border-color: #4da3ff;
+      color: #08121e; }`;
+  document.head.appendChild(st);
+})();
+
+// Displayed content box of the <video> (object-fit: contain).
+function _amMetrics() {
+  const vw = player.videoWidth, vh = player.videoHeight;
+  if (!vw || !vh) return null;
+  const r = player.getBoundingClientRect();
+  const scale = Math.min(r.width / vw, r.height / vh);
+  return {
+    vw, vh, scale,
+    x: r.left + (r.width - vw * scale) / 2,
+    y: r.top + (r.height - vh * scale) / 2,
+    w: vw * scale, h: vh * scale,
+  };
+}
+
+function _amSbsOn() {
+  const c = document.getElementById('ctrlMosaicSbsSplit');
+  return !!(c && c.checked);
+}
+
+function _amEnterDraw() {
+  if (_amDraw.active) return;
+  const m = _amMetrics();
+  if (!m) {
+    // Metadata not ready (or no playable video) — fall back to manual entry.
+    _amOpenModal();
+    return;
+  }
+  try { player.pause(); } catch (e) { /* noop */ }
+
+  // Drop stale rectangles that don't fit the current video (e.g. a new
+  // video of a different size was loaded without pressing New).
+  if (_amDraw.rects.some(rc => rc.r >= m.vw || rc.b >= m.vh)) {
+    _amDraw.rects = [];
+  }
+
+  if (!_amDraw.layer) {
+    const layer = document.createElement('div');
+    layer.id = 'amDrawLayer';
+    document.body.appendChild(layer);
+    _amDraw.layer = layer;
+
+    const banner = document.createElement('div');
+    banner.id = 'amDrawBanner';
+    banner.innerHTML =
+      '<span id="amDrawHint"></span>' +
+      '<button id="amDrawDone" class="primary" title="Enter">Done</button>' +
+      '<button id="amDrawType">Type coordinates</button>' +
+      '<button id="amDrawCancel" title="Esc">Cancel</button>';
+    document.body.appendChild(banner);
+    _amDraw.banner = banner;
+
+    banner.querySelector('#amDrawDone').onclick = () => _amExitDraw(true);
+    banner.querySelector('#amDrawType').onclick = () => { _amExitDraw(false); _amOpenModal(); };
+    banner.querySelector('#amDrawCancel').onclick = () => { _amDraw.rects = []; _amExitDraw(false); };
+
+    layer.addEventListener('pointerdown', _amDrawDown);
+    layer.addEventListener('pointermove', _amDrawMove);
+    layer.addEventListener('pointerup', _amDrawUp);
+    window.addEventListener('resize', _amRender);
+  }
+
+  _amDraw.active = true;
+  _amDraw.layer.style.display = 'block';
+  _amDraw.banner.style.display = 'flex';
+  window.addEventListener('keydown', _amDrawKeys, true);
+  _amRender();
+  _updateRestorationButtonStates();
+}
+
+function _amExitDraw(openModal) {
+  _amDraw.active = false;
+  _amDraw.drag = null;
+  if (_amDraw.layer) _amDraw.layer.style.display = 'none';
+  if (_amDraw.banner) _amDraw.banner.style.display = 'none';
+  window.removeEventListener('keydown', _amDrawKeys, true);
+  if (openModal) {
+    _amFillFromRects();
+    _amOpenModal();
+  }
+  _updateRestorationButtonStates();
+}
+
+function _amDrawKeys(e) {
+  if (!_amDraw.active) return;
+  if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); _amDraw.rects = []; _amExitDraw(false); }
+  else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); _amExitDraw(true); }
+}
+
+function _amClientToVideo(e, m) {
+  return {
+    x: Math.max(0, Math.min(m.vw - 1, Math.round((e.clientX - m.x) / m.scale))),
+    y: Math.max(0, Math.min(m.vh - 1, Math.round((e.clientY - m.y) / m.scale))),
+  };
+}
+
+function _amDrawDown(e) {
+  if (e.target.classList && e.target.classList.contains('am-x')) {
+    const idx = parseInt(e.target.dataset.idx, 10);
+    _amDraw.rects.splice(idx, 1);
+    _amRender();
+    return;
+  }
+  if (_amDraw.rects.length >= 3) { _amRender(); return; }
+  const m = _amMetrics(); if (!m) return;
+  _amDraw.drag = { start: _amClientToVideo(e, m), end: _amClientToVideo(e, m) };
+  _amDraw.layer.setPointerCapture(e.pointerId);
+  e.preventDefault();
+}
+
+function _amDrawMove(e) {
+  if (!_amDraw.drag) return;
+  const m = _amMetrics(); if (!m) return;
+  _amDraw.drag.end = _amClientToVideo(e, m);
+  _amRender();
+}
+
+function _amDrawUp() {
+  if (!_amDraw.drag) return;
+  const { start, end } = _amDraw.drag;
+  _amDraw.drag = null;
+  const t = Math.min(start.y, end.y), b = Math.max(start.y, end.y);
+  const l = Math.min(start.x, end.x), r = Math.max(start.x, end.x);
+  if ((b - t) >= 8 && (r - l) >= 8 && _amDraw.rects.length < 3) {
+    _amDraw.rects.push({ t, l, b, r });
+  }
+  _amRender();
+}
+
+function _amRender() {
+  if (!_amDraw.active || !_amDraw.layer) return;
+  const m = _amMetrics(); if (!m) return;
+  const layer = _amDraw.layer;
+  layer.style.left = m.x + 'px';
+  layer.style.top = m.y + 'px';
+  layer.style.width = m.w + 'px';
+  layer.style.height = m.h + 'px';
+  _amDraw.banner.style.top = Math.max(8, m.y + 10) + 'px';
+  _amDraw.banner.style.left = (m.x + m.w / 2) + 'px';   // centered over content
+
+  const sbs = _amSbsOn();
+  const half = m.vw / 2;
+  let html = '';
+  const all = _amDraw.rects.slice();
+  if (_amDraw.drag) {
+    const { start, end } = _amDraw.drag;
+    all.push({ t: Math.min(start.y, end.y), l: Math.min(start.x, end.x),
+               b: Math.max(start.y, end.y), r: Math.max(start.x, end.x), _live: true });
+  }
+  all.forEach((rc, i) => {
+    const px = (v) => (v * m.scale);
+    html += `<div class="am-rect" style="left:${px(rc.l)}px;top:${px(rc.t)}px;` +
+            `width:${px(rc.r - rc.l)}px;height:${px(rc.b - rc.t)}px;">` +
+            (rc._live ? '' : `<span class="am-x" data-idx="${i}" title="Remove">x</span>`) +
+            `<span class="am-dim">${rc.r - rc.l}x${rc.b - rc.t}px</span></div>`;
+    if (sbs) {
+      // Dashed ghost on the other eye (same per-eye position).
+      const onRight = ((rc.l + rc.r) / 2) >= half;
+      const gl = onRight ? rc.l - half : rc.l + half;
+      const gr = onRight ? rc.r - half : rc.r + half;
+      if (gr > 0 && gl < m.vw) {
+        html += `<div class="am-ghost" style="left:${px(gl)}px;top:${px(rc.t)}px;` +
+                `width:${px(gr - gl)}px;height:${px(rc.b - rc.t)}px;"></div>`;
+      }
+    }
+  });
+  layer.innerHTML = html;
+
+  const hint = _amDraw.banner.querySelector('#amDrawHint');
+  const n = _amDraw.rects.length;
+  hint.textContent = n >= 3
+    ? 'Add Mosaic: 3/3 rectangles (x to remove one).'
+    : `Add Mosaic: drag to draw a rectangle (${n}/3)` +
+      (sbs ? ' — either eye; the dashed ghost mirrors it' : '') + '.';
+}
+
+// Convert drawn full-frame rects to modal values (per-eye when SBS is on).
+function _amFillFromRects() {
+  const m = _amMetrics();
+  const sbs = _amSbsOn();
+  const half = m ? Math.floor(m.vw / 2) : 0;
+  for (let i = 1; i <= 3; i++) {
+    const rc = _amDraw.rects[i - 1];
+    ['t', 'l', 'b', 'r'].forEach(k => {
+      const el = document.getElementById(`am${i}${k}`);
+      if (!rc) { el.value = ''; return; }
+      let v = rc[k];
+      if (sbs && (k === 'l' || k === 'r')) {
+        const onRight = ((rc.l + rc.r) / 2) >= half;
+        v = onRight ? v - half : Math.min(v, half - 1);
+        v = Math.max(0, v);
+      }
+      el.value = v;
+    });
+  }
+}
+
+function _amGatherRois() {
+  const rois = [];
+  const errs = [];
+  for (let i = 1; i <= 3; i++) {
+    const vals = ['t', 'l', 'b', 'r'].map(k =>
+      document.getElementById(`am${i}${k}`).value.trim());
+    if (vals.every(v => v === '')) continue;            // unused row
+    if (vals.some(v => v === '')) {
+      errs.push(`Rect ${i}: all four values are required.`);
+      continue;
+    }
+    const [t, l, b, r] = vals.map(v => parseInt(v, 10));
+    if ([t, l, b, r].some(v => isNaN(v) || v < 0)) {
+      errs.push(`Rect ${i}: values must be non-negative integers.`);
+    } else if (b <= t || r <= l) {
+      errs.push(`Rect ${i}: needs bottom > top and right > left.`);
+    } else {
+      rois.push([t, l, b, r]);
+    }
+  }
+  return { rois, errs };
+}
+
+document.getElementById('amSubmit').addEventListener('click', async () => {
+  const { rois, errs } = _amGatherRois();
+  if (errs.length) { alert(errs.join('\n')); return; }
+  if (!rois.length) { alert('Enter at least one rectangle (t,l,b,r).'); return; }
+  const block = Math.max(2, parseInt(document.getElementById('amBlock').value, 10) || 16);
+  const sbs = document.getElementById('amSbs').checked;
+
+  // Reuse the app's output/temp dirs + encoder settings.
+  const gp = gatherMosaicParams();
+  const startTime = state.segmentStartTime || 0;
+  const endTime = state.segmentEndTime || 0;
+
+  const result = await apiPost('/api/add-mosaic', {
+    params: {
+      rois, block, sbs,
+      output_dir: gp.output_dir,
+      temp_dir: gp.temp_dir,
+      encoder: gp.encoder,
+    },
+    start_time: startTime,
+    end_time: endTime,
+  });
+  if (result.error) {
+    alert('Failed to start: ' + result.error);
+    return;
+  }
+  _amModal.classList.add('hidden');
+  _amJobRunning = true;
+  _updateRestorationButtonStates();
+
+  _showProgressModal('Adding Mosaic...',
+    `${rois.length} rect(s), block=${block}${sbs ? ', both SBS eyes' : ''}`);
+
+  const pollInterval = _pollMosaicProgress({
+    onComplete: (prog) => {
+      clearInterval(pollInterval);
+      progressTitle.textContent = 'Mosaic Added';
+      progressPercent.textContent =
+        `${prog.frame} frames -> ${prog.output_path || 'saved'}`;
+      progressBar.style.width = '100%';
+      progressEta.textContent = '';
+      progressCancel.textContent = 'Close';
+      state.previewReady = true;
+      _amJobRunning = false;
+      _updateRestorationButtonStates();
+    },
+    onError: (prog) => {
+      clearInterval(pollInterval);
+      const cancelled = prog.status === 'cancelled' && prog.frame > 0;
+      if (cancelled) {
+        progressTitle.textContent = `Cancelled — ${prog.frame} frames processed`;
+        progressPercent.textContent = 'Partial output was saved and remuxed.';
+        state.previewReady = true;
+      } else {
+        progressTitle.textContent = prog.status === 'error' ? 'Error' : 'Cancelled';
+        progressPercent.textContent = prog.error || 'No frames processed';
+      }
+      progressBar.style.width = '0%';
+      progressCancel.textContent = 'Close';
+      _amJobRunning = false;
+      _updateRestorationButtonStates();
+    },
+  });
+
+  progressCancel.textContent = 'Stop';
+  progressCancel.onclick = async () => {
+    const prog = await apiGet('/api/progress');
+    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled')) {
+      progressModal.classList.add('hidden');
+      clearInterval(pollInterval);
+      _updateRestorationButtonStates();
+    } else {
+      await apiPost('/api/cancel');
+    }
+  };
+});
 
 
 // ── Init: populate dropdowns + first state pass ───────────
