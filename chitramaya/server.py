@@ -673,6 +673,141 @@ class SwapServer:
                     result.frames, result.detections, result.restorations, output_path)
         return output_path
 
+    def add_mosaic(self, start_time: float, end_time: float, params: dict) -> str:
+        """Apply synthetic mosaic rectangles (SFW censoring) and save.
+
+        No detection/restoration -- a straight decode -> pixelate -> encode
+        pass (chitramaya.mosaic.add_mosaic). If a segment is marked
+        (end > start) only that range is extracted (same NVDEC-safe recipe
+        as segment restore) and mosaiced; otherwise the whole video.
+        The result is saved to the output dir and becomes the preview.
+        """
+        import subprocess
+        import tempfile
+        from chitramaya.mosaic.add_mosaic import run_add_mosaic
+
+        if not self.video_path:
+            raise RuntimeError("No video loaded")
+
+        rois_raw = params.get("rois") or []
+        rois = []
+        for item in rois_raw[:3]:
+            if isinstance(item, (list, tuple)) and len(item) == 4:
+                t, l, b, r = (int(v) for v in item)
+                if b > t and r > l:
+                    rois.append((t, l, b, r))
+        if not rois:
+            raise RuntimeError("No valid rectangles. Each needs t,l,b,r with b>t and r>l.")
+
+        block = max(2, int(params.get("block", 16)))
+        sbs = bool(params.get("sbs", False))
+        enc = params.get("encoder", {}) or {}
+
+        payload_out = str(params.get("output_dir", "") or "").strip()
+        if payload_out:
+            self.output_dir = payload_out
+        input_path = Path(self.video_path)
+        out_dir = self.output_dir or str(input_path.parent)
+        os.makedirs(out_dir, exist_ok=True)
+
+        info = self.video_info or {}
+        vid_fps = float(info.get("fps", 30.0))
+        segment = end_time > start_time + 0.01
+
+        if segment:
+            output_path = str(Path(out_dir) / f"{input_path.stem}-mosaic-seg.mp4")
+            payload_temp = str(params.get("temp_dir", "") or "").strip()
+            if payload_temp:
+                self.temp_dir = payload_temp
+            temp_dir = self.temp_dir if self.temp_dir else tempfile.gettempdir()
+            os.makedirs(temp_dir, exist_ok=True)
+            src = os.path.join(temp_dir, "chitramaya_addmosaic_seg_input.mp4")
+            n_seg_frames = max(1, int(round((end_time - start_time) * vid_fps)))
+            total = n_seg_frames
+        else:
+            output_path = str(Path(out_dir) / f"{input_path.stem}-mosaic.mp4")
+            src = self.video_path
+            total = info.get("num_frames", 0)
+
+        self._cancel_flag.clear()
+        self._progress = {
+            "status": "processing",
+            "frame": 0,
+            "total": total,
+            "fps": 0,
+            "eta": "extracting..." if segment else "starting...",
+            "detections": 0,
+            "restorations": 0,
+            "buffered": 0,
+            "output_path": output_path,
+            "mosaic_mode": "add-mosaic",
+        }
+
+        if segment:
+            # Same extraction recipe as mosaic_segment: crf 10 (NOT 0 --
+            # NVDEC-safe on Ampere), frame-exact cut, no audio (remuxed from
+            # the extract by the encoder).
+            logger.info("AddMosaic: extracting segment %.2f -> %.2f", start_time, end_time)
+            extract_cmd = [
+                "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
+                "-ss", f"{start_time:.3f}",
+                "-i", self.video_path,
+                "-frames:v", str(n_seg_frames),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
+                "-pix_fmt", "yuv420p", "-bf", "0",
+                "-an",
+                src,
+            ]
+            result_proc = subprocess.run(extract_cmd, capture_output=True, text=True,
+                                         timeout=120, encoding="utf-8", errors="replace")
+            if result_proc.returncode != 0:
+                raise RuntimeError(f"Segment extraction failed: {result_proc.stderr[-200:]}")
+            if not Path(src).exists() or Path(src).stat().st_size < 1024:
+                raise RuntimeError("Segment extraction produced no output")
+            self._progress["eta"] = "-"
+
+        def _cb(frame, cb_total, fps_now):
+            self._progress.update({
+                "frame": frame,
+                "total": cb_total or total,
+                "fps": round(fps_now, 1),
+                "eta": "-",
+            })
+
+        try:
+            frames = run_add_mosaic(
+                src, output_path, rois,
+                block=block, sbs=sbs,
+                codec=str(enc.get("codec", "hevc")),
+                preset=str(enc.get("preset", "P5")),
+                qp=int(enc.get("qp", 18)),
+                progress_cb=_cb,
+                cancel_flag=self._cancel_flag,
+            )
+        except Exception as e:
+            logger.exception("add_mosaic failed")
+            self._progress["status"] = "error"
+            self._progress["error"] = _describe_gpu_error(e)
+            return ""
+
+        if self._cancel_flag.is_set():
+            self._progress["status"] = "cancelled"
+        else:
+            out_p = Path(output_path)
+            if not out_p.exists() or out_p.stat().st_size < 1024:
+                self._progress["status"] = "error"
+                self._progress["error"] = "Output file was not created"
+            else:
+                self._progress["status"] = "complete"
+                self._progress["frame"] = frames
+                # The mosaiced file is a real deliverable: it becomes the
+                # preview (non-temp, so clear-preview never deletes it).
+                self.preview_path = output_path
+                self._preview_is_temp = False
+
+        logger.info("add_mosaic: %d frames -> %s", frames, output_path)
+        return output_path
+
     def mosaic_segment(self, start_time: float, end_time: float, params: dict) -> str:
         """Process a video segment for preview. Mirrors swap_segment.
 
@@ -1084,6 +1219,22 @@ def api_mosaic_full():
         server.mosaic_full(params)
 
     return _run_mosaic_threaded("mosaic-full", data, _do)
+
+
+@app.route("/api/add-mosaic", methods=["POST"])
+def api_add_mosaic():
+    """Apply synthetic mosaic rectangles (SFW censoring). Body:
+    { params: { rois: [[t,l,b,r]..], block, sbs, output_dir, temp_dir,
+      encoder: {codec,preset,qp} }, start_time, end_time }."""
+    data = request.get_json(force=True)
+
+    def _do(server, data):
+        params = data.get("params", {})
+        start_time = float(data.get("start_time", 0))
+        end_time = float(data.get("end_time", 0))
+        server.add_mosaic(start_time, end_time, params)
+
+    return _run_mosaic_threaded("add-mosaic", data, _do)
 
 
 @app.route("/api/mosaic-foi", methods=["POST"])
@@ -1789,6 +1940,24 @@ def serve_preview_video():
         return Response("No preview available", status=404)
 
     return _serve_file(server.preview_path)
+
+
+@app.route("/api/sbs-status", methods=["GET"])
+def api_sbs_status():
+    """Source availability for the SBS viewer (static/js/sbs_viewer.js).
+
+    ``preview_is_segment`` tells the viewer that the restored preview is a
+    disposable segment clip whose t=0 is the segment start, so it offsets
+    the original's clock to keep the wipe compare aligned.
+    """
+    server = _get_server()
+    has_video = bool(server.video_path and Path(server.video_path).exists())
+    has_preview = bool(server.preview_path and Path(server.preview_path).exists())
+    return jsonify({
+        "has_video": has_video,
+        "has_preview": has_preview,
+        "preview_is_segment": bool(has_preview and server._preview_is_temp),
+    })
 
 
 def _serve_file(filepath: str) -> Response:

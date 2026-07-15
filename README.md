@@ -12,8 +12,16 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 - **Live segment preview.** Mark a segment, preview just that range, and decide whether to commit to a full run before encoding the whole video.
 - **Hardware-accelerated throughout.** NVDEC decode, TensorRT-accelerated BasicVSR++ restoration, and NVENC encode keep frames on the GPU end to end.
 - **Compiles for your GPU.** No models are shipped. You download the model checkpoints and compile TensorRT engines *for your specific card* — all from inside the app.
+- **Made for VR/SBS content.** Per-eye detection for side-by-side video, and **SBS View**: a projected look-around preview (like a headset, on your desktop) with a draggable wipe to compare original vs restored inside the projection.
+- **Add Mosaic.** The inverse operation — draw up to three rectangles on the video and pixelate them — for producing shareable SFW clips.
 
 ![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](docs/InAction-FramePreview.png)
+
+## Terms & Conditions
+
+By downloading or using this software, in whole or in part, you agree to use it only for purposes that are lawful in your jurisdiction.
+
+You are solely responsible for what you create with it and for complying with all applicable local, regional, and international laws — including, without limitation, those governing privacy, consent, publicity, defamation, and intellectual property. The authors and contributors of this software accept no responsibility and shall not be held liable for any use of the software or for anything produced with it. If you are unsure whether a use is lawful where you are, consult a legal professional before proceeding.
 
 ---
 
@@ -34,13 +42,19 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 
 ### 2. Download and extract
 
-Grab the latest release from the **[Releases](https://github.com/seatv/ChitraMaya/releases)** page. The installer is split into three parts to fit the download limit:
+Grab the latest release from the **[Releases](https://github.com/seatv/ChitraMaya/releases)** page.
 
-- `ChitraMaya-install.exe`
-- `ChitraMaya-install.7z`
-- `ChitraMaya-install.7z.002`
+> [!CAUTION]
+> ### ⚠️ The installer is $${\color{red}THREE}$$ files — you need $${\color{red}ALL\ THREE}$$.
+>
+> The `.exe` **by itself is not the program**; it is only the unpacker for the
+> other two parts. Download **all three** into the **same folder**:
+>
+> - [ ] `ChitraMaya-install.7z.001`
+> - [ ] `ChitraMaya-install.7z.002`
+> - [ ] `ChitraMaya-install.exe`
 
-Put **ALL THREE** parts in the same folder and run `ChitraMaya-install.exe` — it reassembles and extracts automatically. You'll get a `ChitraMaya` folder containing `ChitraMaya.exe`, a `models\` folder, and `Compile-All-Engines.ps1`.
+Run `ChitraMaya-install.exe` — it reassembles the parts and extracts automatically. You'll get a `ChitraMaya` folder containing `ChitraMaya.exe`, a `models\` folder, and `Compile-All-Engines.ps1`. If the install fails immediately, check that all three downloads completed and are in one folder.
 
 ### 3. Get the models
 
@@ -85,6 +99,37 @@ A few things worth knowing before a full run:
 ![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
 
 ![Playing the restored result back in the built-in player](docs/InAction-RestoreAndSavePlaying.png)
+
+### 6. Compare in 3D — SBS View
+
+For side-by-side VR content, the flat player shows two distorted fisheye-looking halves. **SBS View** (the button next to the volume control) projects the video the way a headset would — a natural look-around view — and lets you compare the original against your restored output side by side *inside* that projection.
+
+It helps to understand the two independent choices in the top bar, because they answer different questions:
+
+- **Eye (L / R)** — *which eye's image am I inspecting?* SBS video carries two pictures; this picks one. Your choice applies to everything on screen at once.
+- **View (Original / Restored / Wipe)** — *which video fills the screen?* **Original** is the loaded video, **Restored** is your most recent output (run a restore, or Add Mosaic, first — until then only Original is available), and **Wipe** shows both at once, split by a draggable divider: **original on the left of the divider, restored on the right**. The divider splits the two *videos*, not the two eyes.
+
+So "Eye = L, View = Wipe" means: show the left eye's picture, original left of the divider, restored right of it. Drag the divider across a restored region and watch it flip between mosaic and clean — that's the money shot.
+
+Everything else in one place:
+
+- **Look around:** drag with the mouse. **Zoom:** mouse wheel (FOV 30–110). **Reset view** or `0` recenters.
+- **Playback:** both videos play together, frame-locked. Space = play/pause; `«  ‹  ›  »` buttons (or ←/→ arrows) skip by your configured skip amounts; `,` / `.` step a single frame; `m` unmutes (audio comes from the restored side). The `fN` counter in the time display is the current frame number.
+- **Speed** (0.1×–1×): slow motion for close inspection — and if a very large original struggles to keep up with the restored side, a slower speed lets it stay in sync.
+- **Offset:** aligns the clocks when the restored side is a *segment* preview (its 0:00 is the segment start). Auto-filled; you rarely need to touch it.
+- **Esc** closes and frees the viewer's decoders.
+
+> SBS View is a desktop editing aid, not a headset mode — for viewing in VR, open the output file in your usual VR player. It currently assumes equirect-180 side-by-side (left|right) content.
+
+### 7. Add Mosaic — make SFW clips
+
+The inverse of restoration: pixelate up to three regions and save. Useful for producing shareable, safe-for-work demo clips (this project's own demo material is made with it).
+
+1. Load a video; optionally mark a segment to limit the scope.
+2. Click **Add Mosaic**. The player pauses and a crosshair appears — **drag rectangles directly on the video** (up to three). Each shows its size and a ✕ to remove it. You can still scrub the timeline to a better frame while drawing.
+3. For SBS video (with **Split SBS** on), draw on *either* eye — a dashed ghost mirrors the rectangle to the other eye at the same per-eye position, and both eyes get mosaiced.
+4. **Done** opens a dialog with the exact pixel coordinates for fine-tuning (**Draw again** goes back to the video with your rectangles intact). Set **Block** for the mosaic cell size (16 is the classic look).
+5. **Add & Save** encodes to `<name>-mosaic.mp4` (or `-mosaic-seg.mp4` for a segment) in your output folder. The result becomes the preview — open **SBS View** and wipe-compare original vs censored to verify placement in both eyes.
 
 ---
 
@@ -202,6 +247,8 @@ A few things are intentionally incomplete or have known limitations in this rele
 - **Detection Image Size is UI-selectable only at compile time.** You can compile a detection engine at 960 (or any multiple of 32) from **Manage Models**, but the UI restore path always detects at 640. To *run* at a non-640 size, drive it from the CLI with `--det-imgsz` until the runtime UI control lands.
 - **Detection FP16 applies only to the PyTorch path.** For a compiled TensorRT detection engine, precision is baked in at compile time, so the runtime **Detection FP16** toggle has no effect — the app now grays it out when a compiled engine is selected. It still applies to `.pt` PyTorch detection runs.
 - **Test Frame preview rows can accumulate.** Running **Test Frame** repeatedly on the same frame may stack preview rows in the strip until you press **New** or the next result replaces them. Cosmetic; a fix is planned.
+- **SBS View assumes equirect-180 side-by-side (left|right)** content; fisheye layouts aren't projected correctly yet (a projection selector is planned). Playback in the viewer uses the app's embedded browser decoder, not NVDEC — a very large (8K) HEVC master may not play there even though it restores fine; a downscaled copy will.
+- **Add Mosaic rectangles are per-eye for SBS** and are clamped to the eye you drew them in — a rectangle can't span the eye seam. Both eyes receive the mosaic at the same per-eye position (no parallax offset), so pad rectangles generously on close subjects.
 
 Found something else? Please open an issue — **without** attaching any explicit content (see the issue template).
 
