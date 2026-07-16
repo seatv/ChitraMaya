@@ -141,6 +141,10 @@ class MosaicConfig:
     mosaic_mask_color: str = "#FF00FF"  # hex; converted to RGB for visualization.fill_color
     mosaic_mask_opacity: float = 0.70
 
+    # Auto-censor (Auto Mosaic): pixelate detected regions instead of restoring.
+    mosaic_censor: bool = False
+    mosaic_censor_block: int = 16
+
     # Post
     mosaic_color_match: bool = False
 
@@ -165,6 +169,8 @@ class MosaicConfig:
             mask_preview=bool(self.mosaic_mask_preview),
             mask_color=_hex_to_rgb(self.mosaic_mask_color),
             mask_opacity=float(self.mosaic_mask_opacity),
+            censor=bool(self.mosaic_censor),
+            censor_block=int(self.mosaic_censor_block),
             detection_fp16=bool(self.mosaic_detection_fp16),
             restoration_fp16=bool(self.mosaic_restoration_fp16),
             use_trt=bool(self.mosaic_restoration_trt),

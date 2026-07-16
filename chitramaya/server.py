@@ -609,7 +609,8 @@ class SwapServer:
         encoder_dict = params.get("encoder", {})
         if not mosaic_cfg.detection_model:
             raise RuntimeError("Detection model path not set")
-        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
+        if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
+                and not mosaic_cfg.mosaic_censor):
             raise RuntimeError("Restoration model path not set")
 
         # Output path. Priority: payload output_dir (the value in the UI box at
@@ -620,7 +621,8 @@ class SwapServer:
         input_path = Path(self.video_path)
         out_dir = self.output_dir or str(input_path.parent)
         os.makedirs(out_dir, exist_ok=True)
-        suffix = "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored"
+        suffix = ("-censored" if mosaic_cfg.mosaic_censor
+                  else "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored")
         output_path = str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4")
 
         info = self.video_info or {}
@@ -671,6 +673,116 @@ class SwapServer:
 
         logger.info("mosaic_full: %d frames, %d det, %d res → %s",
                     result.frames, result.detections, result.restorations, output_path)
+        return output_path
+
+    def auto_mosaic(self, start_time: float, end_time: float, params: dict) -> str:
+        """Auto-censor: detect regions with the selected detection model and
+        pixelate them (SFW). Reuses the full mosaic pipeline in ``mosaic`` mode
+        (detect -> track -> pixelate mask -> composite -> encode); no
+        restoration model needed. Whole video, or the marked segment if set.
+        """
+        import subprocess
+        import tempfile
+        from chitramaya.models import MosaicConfig
+
+        if not self.video_path:
+            raise RuntimeError("No video loaded")
+
+        # Force censor mode on; a detection model is the only hard requirement.
+        p = dict(params.get("mosaic", params))
+        p["mosaic_censor"] = True
+        mosaic_cfg = MosaicConfig.from_dict(p)
+        encoder_dict = params.get("encoder", {})
+        if not mosaic_cfg.detection_model:
+            raise RuntimeError("Detection model path not set (select the NSFW detection model)")
+
+        payload_out = str(params.get("output_dir", "") or "").strip()
+        if payload_out:
+            self.output_dir = payload_out
+        input_path = Path(self.video_path)
+        out_dir = self.output_dir or str(input_path.parent)
+        os.makedirs(out_dir, exist_ok=True)
+
+        info = self.video_info or {}
+        vid_fps = float(info.get("fps", 30.0))
+        segment = end_time > start_time + 0.01
+
+        if segment:
+            output_path = str(Path(out_dir) / f"{input_path.stem}-censored-seg.mp4")
+            payload_temp = str(params.get("temp_dir", "") or "").strip()
+            if payload_temp:
+                self.temp_dir = payload_temp
+            temp_dir = self.temp_dir if self.temp_dir else tempfile.gettempdir()
+            os.makedirs(temp_dir, exist_ok=True)
+            src = os.path.join(temp_dir, "chitramaya_autocensor_seg_input.mp4")
+            n_seg_frames = max(1, int(round((end_time - start_time) * vid_fps)))
+            total = n_seg_frames
+        else:
+            output_path = str(Path(out_dir) / f"{input_path.stem}-censored.mp4")
+            src = self.video_path
+            total = info.get("num_frames", 0)
+
+        self._cancel_flag.clear()
+        self._progress = {
+            "status": "processing", "frame": 0, "total": total, "fps": 0,
+            "eta": "extracting..." if segment else "loading models...",
+            "detections": 0, "restorations": 0, "buffered": 0,
+            "output_path": output_path, "mosaic_mode": "auto-censor",
+        }
+
+        if segment:
+            # Same crf-10 NVDEC-safe frame-exact extraction as mosaic_segment.
+            extract_cmd = [
+                "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
+                "-ss", f"{start_time:.3f}", "-i", self.video_path,
+                "-frames:v", str(n_seg_frames),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
+                "-pix_fmt", "yuv420p", "-bf", "0", "-an", src,
+            ]
+            rp = subprocess.run(extract_cmd, capture_output=True, text=True,
+                                timeout=120, encoding="utf-8", errors="replace")
+            if rp.returncode != 0:
+                raise RuntimeError(f"Segment extraction failed: {rp.stderr[-200:]}")
+            if not Path(src).exists() or Path(src).stat().st_size < 1024:
+                raise RuntimeError("Segment extraction produced no output")
+            self._progress["eta"] = "-"
+
+        pipeline = self._ensure_mosaic_pipeline(mosaic_cfg, encoder_dict=encoder_dict)
+        if segment:
+            original_write_diag = pipeline.config.write_diagnostics
+            pipeline.config.write_diagnostics = False
+        try:
+            result = pipeline.process_file(
+                src, output_path,
+                progress_cb=self._mosaic_progress_cb,
+                use_tqdm=False,
+                cancel_flag=self._cancel_flag,
+            )
+        except Exception as e:
+            logger.exception("auto_mosaic failed")
+            self._progress["status"] = "error"
+            self._progress["error"] = _describe_gpu_error(e)
+            return ""
+        finally:
+            if segment:
+                pipeline.config.write_diagnostics = original_write_diag
+
+        if self._cancel_flag.is_set():
+            self._progress["status"] = "cancelled"
+        else:
+            out_p = Path(output_path)
+            if not out_p.exists() or out_p.stat().st_size < 1024:
+                self._progress["status"] = "error"
+                self._progress["error"] = "Output file was not created"
+            else:
+                self._progress["status"] = "complete"
+                self._progress["frame"] = result.frames
+                self._progress["detections"] = result.detections
+                self.preview_path = output_path
+                self._preview_is_temp = False
+
+        logger.info("auto_mosaic: %d frames, %d det -> %s",
+                    result.frames, result.detections, output_path)
         return output_path
 
     def add_mosaic(self, start_time: float, end_time: float, params: dict) -> str:
@@ -829,7 +941,8 @@ class SwapServer:
         encoder_dict = params.get("encoder", {})
         if not mosaic_cfg.detection_model:
             raise RuntimeError("Detection model path not set")
-        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
+        if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
+                and not mosaic_cfg.mosaic_censor):
             raise RuntimeError("Restoration model path not set")
 
         # Temp files. Priority: payload temp_dir -> persisted self.temp_dir ->
@@ -952,7 +1065,8 @@ class SwapServer:
         encoder_dict = params.get("encoder", {})
         if not mosaic_cfg.detection_model:
             return {"error": "No detection model selected"}
-        if not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview:
+        if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
+                and not mosaic_cfg.mosaic_censor):
             return {"error": "No restoration model selected"}
 
         info = self.video_info
@@ -1219,6 +1333,22 @@ def api_mosaic_full():
         server.mosaic_full(params)
 
     return _run_mosaic_threaded("mosaic-full", data, _do)
+
+
+@app.route("/api/auto-mosaic", methods=["POST"])
+def api_auto_mosaic():
+    """Auto-censor: detect + pixelate using the selected detection model.
+    Body: { params: { mosaic:{...detection knobs, mosaic_censor_block},
+      encoder, output_dir, temp_dir }, start_time, end_time }."""
+    data = request.get_json(force=True)
+
+    def _do(server, data):
+        params = data.get("params", {})
+        start_time = float(data.get("start_time", 0))
+        end_time = float(data.get("end_time", 0))
+        server.auto_mosaic(start_time, end_time, params)
+
+    return _run_mosaic_threaded("auto-mosaic", data, _do)
 
 
 @app.route("/api/add-mosaic", methods=["POST"])
@@ -1576,7 +1706,8 @@ def _hf_token() -> str:
     return ""
 
 
-_HF_UA = "ChitraMaya/1.1 (+https://github.com/seatv/ChitraMaya)"
+from chitramaya import __version__ as _CM_VERSION
+_HF_UA = f"ChitraMaya/{_CM_VERSION} (+https://github.com/seatv/ChitraMaya)"
 
 
 def _hf_open(url: str, timeout: int = 60, *, max_redirects: int = 5):
@@ -2119,7 +2250,7 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
 
         api = Api()
         window = webview.create_window(
-            "ChitraMaya",
+            f"ChitraMaya {_CM_VERSION}",
             url,
             js_api=api,
             width=1600,

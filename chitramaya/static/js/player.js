@@ -521,6 +521,40 @@ const vcFsBtn     = document.getElementById('vcFsBtn');
 const seekbar     = document.getElementById('seekbar');
 const seekbarNeedle = document.getElementById('seekbarNeedle');
 
+// ── Playback speed ────────────────────────────────────────
+// Discrete steps spanning the full range Chromium/WebView2 honors
+// (~0.0625×–16×), spaced multiplicatively so the slider feels even. Index 5
+// = 1×. Used to slow down for spotting missed mosaics or speed up to skim.
+const VC_SPEEDS = [0.0625, 0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 16];
+const VC_SPEED_DEFAULT_IDX = 5;
+const vcSpeed    = document.getElementById('vcSpeed');
+const vcSpeedVal = document.getElementById('vcSpeedVal');
+
+function _vcFmtSpeed(v) {
+  // 1 -> "1×", 0.25 -> "0.25×", 0.0625 -> "0.06×"
+  const s = Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return s + '×';
+}
+function applyPlaybackRate() {
+  if (!vcSpeed) return;
+  const rate = VC_SPEEDS[parseInt(vcSpeed.value, 10)] || 1;
+  try { player.playbackRate = rate; } catch (e) { /* noop */ }
+  if (vcSpeedVal) vcSpeedVal.textContent = _vcFmtSpeed(rate);
+}
+if (vcSpeed) {
+  vcSpeed.addEventListener('input', applyPlaybackRate);
+  // Double-click anywhere on the control resets to 1×.
+  const wrap = document.getElementById('vcSpeedWrap');
+  if (wrap) wrap.addEventListener('dblclick', () => {
+    vcSpeed.value = String(VC_SPEED_DEFAULT_IDX);
+    applyPlaybackRate();
+  });
+  // A new src (load video, or toggle original/preview) resets the element's
+  // rate to 1 — reapply the chosen speed so it persists across those swaps.
+  player.addEventListener('loadedmetadata', applyPlaybackRate);
+  applyPlaybackRate();
+}
+
 // Seek to start/end
 if (vcStartBtn) {
   vcStartBtn.addEventListener('click', () => {

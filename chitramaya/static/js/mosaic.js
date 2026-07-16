@@ -54,6 +54,14 @@ setActiveTab('restoration');
       fmt();
     }
   });
+  // Censor Block is an integer px value (not a 0-1 ratio).
+  const bdial = document.getElementById('ctrlMosaicCensorBlock');
+  const bval = document.getElementById('valMosaicCensorBlock');
+  if (bdial && bval) {
+    const bf = () => { bval.textContent = bdial.value; };
+    bdial.addEventListener('input', bf);
+    bf();
+  }
 })();
 
 
@@ -70,6 +78,7 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
   'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
+  'ctrlMosaicCensor', 'ctrlMosaicCensorBlock',
   'ctrlAsyncEncoder',
 ];
 
@@ -290,11 +299,14 @@ function showTensorModal(missing) {
 async function checkTensorBeforeRun() {
   await _refreshEngineCaches();
   const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
+  // Add Mosaic (censor) skips restoration entirely, like Preview Detection —
+  // don't gate on a restoration engine that will never run.
+  const censor = document.getElementById('ctrlMosaicCensor').checked;
   const missing = [];
   if (document.getElementById('ctrlMosaicDetTrt').checked && !_tensorEngineAvailable('det')) {
     missing.push('det');
   }
-  if (!maskPreview && document.getElementById('ctrlMosaicRestTrt').checked
+  if (!maskPreview && !censor && document.getElementById('ctrlMosaicRestTrt').checked
       && !_tensorEngineAvailable('rest')) {
     missing.push('rest');
   }
@@ -406,6 +418,8 @@ function gatherMosaicParams() {
       mosaic_mask_preview: document.getElementById('ctrlMosaicMaskPreview').checked,
       mosaic_mask_color: document.getElementById('ctrlMosaicMaskColor').value,
       mosaic_mask_opacity: parseInt(document.getElementById('ctrlMosaicMaskOpacity').value) / 100.0,
+      mosaic_censor: document.getElementById('ctrlMosaicCensor').checked,
+      mosaic_censor_block: parseInt(document.getElementById('ctrlMosaicCensorBlock').value) || 16,
       mosaic_max_clip_size: parseInt(document.getElementById('ctrlMosaicMaxClip').value),
       mosaic_restoration_fp16: document.getElementById('ctrlMosaicRestFp16').checked,
       mosaic_roi_dilate: parseInt(document.getElementById('ctrlMosaicRoiDilate').value),
@@ -459,7 +473,10 @@ function _updateRestorationButtonStates() {
   const detModel = document.getElementById('ctrlMosaicDetModel').value;
   const restModel = document.getElementById('ctrlMosaicRestModel').value;
   const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
-  const hasModels = detModel && (maskPreview || restModel);
+  const censor = document.getElementById('ctrlMosaicCensor').checked;
+  // Censor and Mask Preview both skip restoration, so they only need a
+  // detection model; normal restore needs a restoration model.
+  const hasModels = detModel && (maskPreview || censor || restModel);
   const hasSegment = state.segmentEndTime > state.segmentStartTime;
   const inPreview = state.previewMode || false;
 
@@ -533,11 +550,16 @@ function _updateControlEnableStates() {
   const feather = document.getElementById('ctrlMosaicFeather');
   _setCtrlEnabled(feather, !!(blend && blend.value === 'facefusion'));
 
-  // Mask Colour + Opacity only matter in Mask Preview (pseudo) mode.
+  // Mask Colour + Opacity only matter in Preview Detection (pseudo) mode.
   const maskPrev = document.getElementById('ctrlMosaicMaskPreview');
   const previewOn = !!(maskPrev && maskPrev.checked);
   _setCtrlEnabled(document.getElementById('ctrlMosaicMaskColor'), previewOn);
   _setCtrlEnabled(document.getElementById('ctrlMosaicMaskOpacity'), previewOn);
+
+  // Block only matters in Add Mosaic (censor) mode.
+  const censorEl = document.getElementById('ctrlMosaicCensor');
+  _setCtrlEnabled(document.getElementById('ctrlMosaicCensorBlock'),
+                  !!(censorEl && censorEl.checked));
 
   // Detection FP16 is baked into a compiled detection .engine — AutoBackend
   // reads the engine's binding precision and ignores the constructor flag, so
@@ -591,17 +613,36 @@ if (typeof loadVideo === 'function') {
   console.log('[mosaic] loadVideo wrapped');
 }
 
+// Alternate Execution Modes are mutually exclusive: Add Mosaic (censor) and
+// Preview Detection (mask preview) can't both be on. Checking one clears the
+// other, then refresh dependent UI state.
+(function _wireModeExclusivity() {
+  const censor = document.getElementById('ctrlMosaicCensor');
+  const preview = document.getElementById('ctrlMosaicMaskPreview');
+  if (censor) censor.addEventListener('change', () => {
+    if (censor.checked && preview) preview.checked = false;
+    _updateControlEnableStates();
+    _updateRestorationButtonStates();
+  });
+  if (preview) preview.addEventListener('change', () => {
+    if (preview.checked && censor) censor.checked = false;
+    _updateControlEnableStates();
+    _updateRestorationButtonStates();
+  });
+})();
+
 // Re-check on relevant changes
-['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview'].forEach(id => {
+['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview',
+ 'ctrlMosaicCensor'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateRestorationButtonStates);
 });
 
 // Controls whose value changes which OTHER controls are inert → recompute
 // enable/disable state. (Blend Mask → Feather; Mask Preview → colour/opacity;
-// Det Use Tensor / Det Model → Det FP16.)
-['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicDetTrt',
- 'ctrlMosaicDetModel'].forEach(id => {
+// Add Mosaic → Block; Det Use Tensor / Det Model → Det FP16.)
+['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicCensor',
+ 'ctrlMosaicDetTrt', 'ctrlMosaicDetModel'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateControlEnableStates);
 });
@@ -1211,6 +1252,13 @@ if (manageModelsBtn) manageModelsBtn.addEventListener('click', openManageModels)
 // → see, without the overlay closing.
 let _foiRegions = [];      // latest results
 let _foiOpenIdx = null;    // region index currently enlarged over the player, or null
+
+// Test Frame pane labels: in Add Mosaic (censor) mode the "before" is the
+// clean original and the "after" is the pixelated result.
+function _foiPaneLabels() {
+  const c = document.getElementById('ctrlMosaicCensor');
+  return (c && c.checked) ? ['Original', 'Censored'] : ['Mosaic', 'Restored'];
+}
 let _foiRunning = false;   // true while a test is in flight (protects the label)
 
 // Button reads "Test Frame N" for the current playhead, so it's unambiguous
@@ -1305,12 +1353,13 @@ async function runFoiPreview() {
     // Rebuild the strip now that the new result is in hand (swap in place, so
     // it never blanks while refreshing).
     container.innerHTML = '';
+    const _lbl = _foiPaneLabels();
     _foiRegions.forEach((r, i) => {
       const row = document.createElement('div');
       row.className = 'foi-row';
       row.title = 'Click to enlarge over the player';
       if (i === _foiOpenIdx) row.classList.add('foi-row-active');
-      row.innerHTML = cell('Mosaic', r.mosaic) + cell('Restored', r.restored);
+      row.innerHTML = cell(_lbl[0], r.mosaic) + cell(_lbl[1], r.restored);
       row.addEventListener('click', () => openFoiEnlarge(i));
       container.appendChild(row);
     });
@@ -1342,10 +1391,11 @@ function openFoiEnlarge(idx) {
   const rest = document.getElementById('zoomImage');
   if (!overlay || !orig || !rest) return;
 
-  // Labels: first panel Mosaic, second Restored.
+  // Labels: censor mode = Original|Censored, else Mosaic|Restored.
+  const _lbl = _foiPaneLabels();
   const labels = overlay.querySelectorAll('.zoom-label');
-  if (labels[0]) labels[0].textContent = 'Mosaic';
-  if (labels[1]) labels[1].textContent = 'Restored';
+  if (labels[0]) labels[0].textContent = _lbl[0];
+  if (labels[1]) labels[1].textContent = _lbl[1];
 
   orig.src = r.mosaic ? ('data:image/jpeg;base64,' + r.mosaic) : '';
   rest.src = r.restored ? ('data:image/jpeg;base64,' + r.restored) : '';
@@ -1561,12 +1611,18 @@ function _amEnterDraw() {
     banner.innerHTML =
       '<span id="amDrawHint"></span>' +
       '<button id="amDrawDone" class="primary" title="Enter">Done</button>' +
+      '<button id="amDrawAuto" title="Detect regions automatically instead of drawing">Auto-detect</button>' +
       '<button id="amDrawType">Type coordinates</button>' +
       '<button id="amDrawCancel" title="Esc">Cancel</button>';
     document.body.appendChild(banner);
     _amDraw.banner = banner;
 
     banner.querySelector('#amDrawDone').onclick = () => _amExitDraw(true);
+    banner.querySelector('#amDrawAuto').onclick = () => {
+      _amExitDraw(false);
+      const a = document.getElementById('amAuto'); if (a) a.checked = true;
+      _amOpenModal();
+    };
     banner.querySelector('#amDrawType').onclick = () => { _amExitDraw(false); _amOpenModal(); };
     banner.querySelector('#amDrawCancel').onclick = () => { _amDraw.rects = []; _amExitDraw(false); };
 
@@ -1735,27 +1791,36 @@ function _amGatherRois() {
 }
 
 document.getElementById('amSubmit').addEventListener('click', async () => {
-  const { rois, errs } = _amGatherRois();
-  if (errs.length) { alert(errs.join('\n')); return; }
-  if (!rois.length) { alert('Enter at least one rectangle (t,l,b,r).'); return; }
   const block = Math.max(2, parseInt(document.getElementById('amBlock').value, 10) || 16);
-  const sbs = document.getElementById('amSbs').checked;
-
-  // Reuse the app's output/temp dirs + encoder settings.
   const gp = gatherMosaicParams();
   const startTime = state.segmentStartTime || 0;
   const endTime = state.segmentEndTime || 0;
+  const auto = document.getElementById('amAuto').checked;
 
-  const result = await apiPost('/api/add-mosaic', {
-    params: {
-      rois, block, sbs,
-      output_dir: gp.output_dir,
-      temp_dir: gp.temp_dir,
-      encoder: gp.encoder,
-    },
-    start_time: startTime,
-    end_time: endTime,
-  });
+  let result, summary;
+  if (auto) {
+    // Auto-detect: pixelate regions found by the selected Detection model.
+    if (!gp.mosaic.detection_model) {
+      alert('Select a Detection model first (e.g. the NSFW detection model) in the Control Panel.');
+      return;
+    }
+    const mosaic = Object.assign({}, gp.mosaic, { mosaic_censor_block: block });
+    result = await apiPost('/api/auto-mosaic', {
+      params: { mosaic, encoder: gp.encoder, output_dir: gp.output_dir, temp_dir: gp.temp_dir },
+      start_time: startTime, end_time: endTime,
+    });
+    summary = `auto-detect, block=${block}${gp.mosaic.mosaic_sbs_split ? ', SBS per-eye' : ''}`;
+  } else {
+    const { rois, errs } = _amGatherRois();
+    if (errs.length) { alert(errs.join('\n')); return; }
+    if (!rois.length) { alert('Enter at least one rectangle (t,l,b,r), or tick Auto-detect.'); return; }
+    const sbs = document.getElementById('amSbs').checked;
+    result = await apiPost('/api/add-mosaic', {
+      params: { rois, block, sbs, output_dir: gp.output_dir, temp_dir: gp.temp_dir, encoder: gp.encoder },
+      start_time: startTime, end_time: endTime,
+    });
+    summary = `${rois.length} rect(s), block=${block}${sbs ? ', both SBS eyes' : ''}`;
+  }
   if (result.error) {
     alert('Failed to start: ' + result.error);
     return;
@@ -1764,8 +1829,7 @@ document.getElementById('amSubmit').addEventListener('click', async () => {
   _amJobRunning = true;
   _updateRestorationButtonStates();
 
-  _showProgressModal('Adding Mosaic...',
-    `${rois.length} rect(s), block=${block}${sbs ? ', both SBS eyes' : ''}`);
+  _showProgressModal(auto ? 'Auto Mosaic (detecting)...' : 'Adding Mosaic...', summary);
 
   const pollInterval = _pollMosaicProgress({
     onComplete: (prog) => {
