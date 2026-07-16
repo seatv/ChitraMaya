@@ -127,6 +127,15 @@
           <button class="vc-btn" id="vcPlayBtn" title="Play / Pause (Space)">▶</button>
           <button class="vc-btn" id="vcEndBtn" title="Seek to End">⏭</button>
           <div style="flex:1"></div>
+          <div id="vcSpeedWrap"
+               style="display:flex; align-items:center; gap:6px; margin-right:6px;"
+               title="Playback speed — slow down to spot missed mosaics, speed up to skim. Double-click to reset to 1×.">
+            <span style="font-size:11px; opacity:.6;">⏩</span>
+            <input type="range" id="vcSpeed" min="0" max="13" step="1" value="5"
+                   style="width:96px; accent-color: var(--accent); cursor:pointer;">
+            <span id="vcSpeedVal"
+                  style="font-size:11px; min-width:38px; text-align:right; font-variant-numeric:tabular-nums; opacity:.85;">1×</span>
+          </div>
           <button class="vc-btn" id="vcSbsBtn" style="font-size:11px; letter-spacing:1px;"
                   title="SBS View — projected per-eye 180° preview with original/restored wipe compare">SBS</button>
           <button class="vc-btn" id="vcVolumeBtn" title="Volume (M)">🔊</button>
@@ -272,16 +281,31 @@
             </div>
           </div>
 
-          <!-- Mask Preview (pseudo flat-fill; fast coverage check) -->
+          <!-- Alternate Execution Modes: Add Mosaic (censor / pixelate) and
+               Preview Detection (pseudo flat-fill). Mutually exclusive; with
+               neither checked the pipeline restores as normal. -->
           <div class="ctrl-section" id="sectMaskPreview">
             <div class="ctrl-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
-              <span class="expand-icon">▼</span> Mask Preview
+              <span class="expand-icon">▼</span> Alternate Execution Modes
             </div>
             <div class="ctrl-section-body">
               <div class="ctrl-row">
+                <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicCensor">
+                <span class="ctrl-label" style="min-width:auto;"
+                      title="Add Mosaic (SFW censor): instead of restoring, PIXELATE each detected region. Uses the selected Detection model (e.g. the NSFW model); no restoration model needed. Test Frame, Restore and Restore & Save all run in this mode — output is saved as -censored.mp4. Mutually exclusive with Preview Detection.">Add Mosaic</span>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label" title="Mosaic cell size in pixels for Add Mosaic mode (bigger = coarser blocks).">Block</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicCensorBlock"
+                         min="4" max="64" step="2" value="16">
+                  <span class="ctrl-value" id="valMosaicCensorBlock">16</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicMaskPreview">
                 <span class="ctrl-label" style="min-width:auto;"
-                      title="Fast coverage check: instead of restoring, fills each detected region with a flat colour (set below) so you can see exactly what will be detected and restored - without waiting for restoration. Any mosaic still visible in the preview is a detection miss; adjust Score or Image Size. Uncheck to restore for real.">Preview Mask Only</span>
+                      title="Fast coverage check: instead of restoring, fills each detected region with a flat colour (set below) so you can see exactly what the detector found - without waiting for restoration. Any mosaic still visible is a detection miss; adjust Score or Image Size. Mutually exclusive with Add Mosaic.">Preview Detection</span>
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label" title="Flat fill colour for detected regions">Mask Colour</span>
@@ -461,6 +485,11 @@
 <div class="modal-overlay hidden" id="addMosaicModal">
   <div class="modal">
     <div class="modal-title">Add Mosaic (SFW censor)</div>
+    <label class="mm-check" style="margin:2px 0 10px; display:flex; gap:8px; align-items:center;"
+           title="Detect regions automatically with the selected Detection model (e.g. the NSFW model) and pixelate them, instead of drawing rectangles by hand.">
+      <input type="checkbox" id="amAuto"> <b>Auto-detect regions</b>
+      <span style="opacity:.7; font-size:12px;">— uses the selected Detection model; drawn rectangles are ignored</span>
+    </label>
     <div class="modal-message">
       Pixelate up to three rectangles. Coordinates are <b>pixels, inclusive</b>
       (t,l,b,r). For SBS video enter them <b>per-eye</b> (as seen in one eye's

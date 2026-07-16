@@ -588,6 +588,14 @@ class Pipeline:
             r, g, b = [int(x) for x in fill]  # config is RGB
             return PseudoClipRestorer(device=self.device, fill_color_bgr=(b, g, r), fill_opacity=op)
 
+        # Mosaic (auto-censor) mode: pixelate the detected mask instead of
+        # restoring it. Reuses the entire detect/track/composite path; no
+        # restoration model required.
+        if self.mode == "mosaic" or self.restorer_name == "mosaic":
+            from chitramaya.mosaic.restorer.mosaic_clip_restorer import MosaicClipRestorer
+            block = int(self.cfg.get("visualization", "block", default=16))
+            return MosaicClipRestorer(device=self.device, block=block)
+
         if not self.rest_model:
             raise FileNotFoundError("Restoration model path is empty (check config.json or --rest-model)")
 
@@ -1765,6 +1773,9 @@ class MosaicPipelineConfig:
     mask_preview: bool = False
     mask_color: tuple = (255, 0, 255)
     mask_opacity: float = 0.70
+    # Auto-censor: pixelate detected regions instead of restoring them.
+    censor: bool = False
+    censor_block: int = 16
     detection_fp16: bool = True
     restoration_fp16: bool = True
     use_trt: bool = True
@@ -1804,7 +1815,7 @@ class MosaicPipelineConfig:
 _MPC_CONSUMED_FIELDS = frozenset({
     "detection_model", "restoration_model", "detection_score",
     "detection_batch_size", "max_clip_size", "mask_preview", "mask_color",
-    "mask_opacity", "detection_fp16", "restoration_fp16", "use_trt",
+    "mask_opacity", "censor", "censor_block", "detection_fp16", "restoration_fp16", "use_trt",
     "codec", "preset", "qp", "async_encoder", "write_diagnostics",
     "sbs_enabled", "sbs_layout",
     "sbs_det_split", "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
@@ -1879,10 +1890,13 @@ class MosaicPipeline:
         data: dict = {
             "input": str(input_path),
             "output": str(output_path),
-            "mode": ("pseudo" if bool(getattr(c, "mask_preview", False)) else "real"),
+            "mode": ("mosaic" if bool(getattr(c, "censor", False))
+                     else "pseudo" if bool(getattr(c, "mask_preview", False))
+                     else "real"),
             "visualization": {
                 "fill_color": list(getattr(c, "mask_color", (255, 0, 255))),
                 "fill_opacity": float(getattr(c, "mask_opacity", 0.70)),
+                "block": int(getattr(c, "censor_block", 16)),
             },
             "store_max_frames": int(getattr(c, "store_max_frames", 0)),
             "sbs_enabled": bool(getattr(c, "sbs_enabled", False)),
