@@ -495,8 +495,15 @@
 
 <!-- ── Manage Models Modal ─────────────────────────────────── -->
 <style>
-  #manageModelsModal .modal { width: min(760px, 92vw); max-width: 92vw; text-align: left; }
-  .mm-body { display: flex; flex-direction: column; gap: 14px; margin: 8px 0 12px; }
+  #manageModelsModal .modal { width: min(760px, 92vw); max-width: 92vw; text-align: left;
+      /* Issue #3: on 1080p the fetch/local lists + compile + log can grow past
+         the viewport and push the Close button off-screen. Cap the modal to the
+         viewport and let the body scroll, keeping the title and Close pinned. */
+      max-height: 90vh; display: flex; flex-direction: column; }
+  #manageModelsModal .modal-title { flex: 0 0 auto; }
+  #manageModelsModal .modal-buttons { flex: 0 0 auto; }
+  .mm-body { display: flex; flex-direction: column; gap: 14px; margin: 8px 0 12px;
+      flex: 1 1 auto; overflow-y: auto; min-height: 0; padding-right: 4px; }
   .mm-section-title { font: 600 12px sans-serif; color: var(--text-dim,#9a9a9a); text-transform: uppercase;
                       letter-spacing: .04em; margin-bottom: 6px; }
   .mm-list { max-height: 180px; overflow-y: auto; border: 1px solid var(--border,#2a2a2a);

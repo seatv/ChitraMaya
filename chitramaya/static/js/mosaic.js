@@ -1036,6 +1036,18 @@ function closeManageModels() {
   if (_mmDlPoll) { clearInterval(_mmDlPoll); _mmDlPoll = null; }
 }
 
+// Issue #3: Escape closes Manage Models (any in-progress compile/download
+// keeps running server-side and resumes on reopen). Only fires while the
+// modal is open, so it never steals Escape from other contexts.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('manageModelsModal');
+  if (modal && !modal.classList.contains('hidden')) {
+    e.preventDefault();
+    closeManageModels();
+  }
+});
+
 // ── Download (Hugging Face) ───────────────────────────────
 let _mmDlPoll = null;
 let _mmFetchFiles = [];            // [{path, size}]

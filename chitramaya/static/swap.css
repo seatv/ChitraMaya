@@ -973,6 +973,11 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   padding: 24px;
   min-width: 400px;
   max-width: 500px;
+  /* Safety net: no modal may ever grow past the viewport and strand its
+     buttons off-screen (issue #3). Manage Models refines this with a pinned
+     header/footer + scrolling body; this covers every other modal. */
+  max-height: 90vh;
+  overflow-y: auto;
 }
 
 .modal-title {
