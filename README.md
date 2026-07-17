@@ -4,12 +4,6 @@ A TensorRT-accelerated mosaic restoration studio with a real-time visual editor.
 
 ![ChitraMaya — the mosaic input and the restored result, side by side](docs/InAction.png)
 
-## Terms & Conditions
-
-By downloading or using any part of this software you agree that you will use it for only actions legally permitted in your geographic jurisdiction.
-We are NOT, cannot, and will not be held responsible for any actions performed by users of this software. Users must understand and comply with all relevant local, regional, and international laws pertaining to this technology. This includes laws related to privacy, defamation, intellectual property rights, and other relevant legislation. Users should consult legal professionals if they have any doubts regarding the legal implications of their creations.
-
-
 ## Why ChitraMaya?
 
 Some restoration tools are batch processors: set parameters, run a full pass, look at the result, repeat. ChitraMaya is built the other way around — as an **interactive editor**.
@@ -19,7 +13,7 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 - **Hardware-accelerated throughout.** NVDEC decode, TensorRT-accelerated BasicVSR++ restoration, and NVENC encode keep frames on the GPU end to end.
 - **Compiles for your GPU.** No models are shipped. You download the model checkpoints and compile TensorRT engines *for your specific card* — all from inside the app.
 - **Made for VR/SBS content.** Per-eye detection for side-by-side video, and **SBS View**: a projected look-around preview (like a headset, on your desktop) with a draggable wipe to compare original vs restored inside the projection.
-- **Add Mosaic.** The inverse operation — draw up to three rectangles on the video and pixelate them — for producing shareable SFW clips.
+- **Add Mosaic.** The inverse operation — pixelate regions to produce shareable SFW clips. Draw rectangles by hand (precise, reliable), or let the app auto-detect regions with a detection model (**experimental** — see the warning below).
 
 ![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](docs/InAction-FramePreview.png)
 
@@ -28,6 +22,9 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 By downloading or using this software, in whole or in part, you agree to use it only for purposes that are lawful in your jurisdiction.
 
 You are solely responsible for what you create with it and for complying with all applicable local, regional, and international laws — including, without limitation, those governing privacy, consent, publicity, defamation, and intellectual property. The authors and contributors of this software accept no responsibility and shall not be held liable for any use of the software or for anything produced with it. If you are unsure whether a use is lawful where you are, consult a legal professional before proceeding.
+
+> [!CAUTION]
+> **Automatic mosaic detection is experimental and must not be relied on to censor content.** The "Auto-detect" / censor mode uses a third-party NSFW detection model that does **not** reliably find all explicit content — it will miss regions and whole frames. Do not use it to make content safe for publication, distribution, or any purpose where missed content has consequences. For censoring you can trust, use the **manual draw-rectangles** Add Mosaic and **review every frame of the output yourself** before sharing. See [Known Issues](#known-issues--not-yet-implemented).
 
 ---
 
@@ -129,13 +126,24 @@ Everything else in one place:
 
 ### 7. Add Mosaic — make SFW clips
 
-The inverse of restoration: pixelate up to three regions and save. Useful for producing shareable, safe-for-work demo clips (this project's own demo material is made with it).
+The inverse of restoration: pixelate regions and save, for producing shareable, safe-for-work clips (this project's own demo material is made with it). There are two ways to place the mosaic — a **reliable manual** way and an **experimental automatic** way.
+
+**Manual (reliable) — draw the rectangles.**
 
 1. Load a video; optionally mark a segment to limit the scope.
-2. Click **Add Mosaic**. The player pauses and a crosshair appears — **drag rectangles directly on the video** (up to three). Each shows its size and a ✕ to remove it. You can still scrub the timeline to a better frame while drawing.
+2. Click the **Add Mosaic** button. The player pauses and a crosshair appears — **drag rectangles directly on the video** (up to three). Each shows its size and a ✕ to remove it. You can still scrub the timeline to a better frame while drawing.
 3. For SBS video (with **Split SBS** on), draw on *either* eye — a dashed ghost mirrors the rectangle to the other eye at the same per-eye position, and both eyes get mosaiced.
 4. **Done** opens a dialog with the exact pixel coordinates for fine-tuning (**Draw again** goes back to the video with your rectangles intact). Set **Block** for the mosaic cell size (16 is the classic look).
 5. **Add & Save** encodes to `<name>-mosaic.mp4` (or `-mosaic-seg.mp4` for a segment) in your output folder. The result becomes the preview — open **SBS View** and wipe-compare original vs censored to verify placement in both eyes.
+
+**Automatic (experimental) — let a model find the regions.**
+
+> [!CAUTION]
+> **This is experimental and will miss content. Do not use it to censor anything you intend to share.** It depends on a third-party NSFW detection model whose accuracy is limited — it misses regions and whole frames, and it is *not* production-grade. Treat any automatic result as a rough draft that **you must review frame by frame** (the playback-speed control and SBS View wipe help), and fix by hand. When it matters, use the manual method above.
+
+Auto mode reuses the detection pipeline: pick a detection model (e.g. an NSFW detector) as the **Detection** model, then under **Alternate Execution Modes** in the Control Panel tick **Add Mosaic** and set **Block**. Now **Test Frame** shows each detected region as **Original → Censored** (the fast way to see what the model catches and misses on a given frame), **Restore** previews a censored segment, and **Restore & Save** writes `<name>-censored.mp4`. A detection model is all it needs — no restoration model. The one-shot **Auto-detect** button inside the Add Mosaic dialog does the same thing for a single run.
+
+To review coverage: play the output back with the new **playback-speed control** (left of the SBS button — slow down to catch a one-frame gap, speed up to skim), and use **SBS View → Wipe** to compare against the original in both eyes.
 
 ---
 
@@ -250,6 +258,7 @@ A few things are intentionally incomplete or have known limitations in this rele
 
 **Known limitations:**
 
+- **Automatic mosaic detection is experimental — do not rely on it to censor.** The Auto-detect / censor mode depends on a third-party NSFW detection model that does not reliably detect all explicit content; it misses regions and whole frames and is not suitable for production censoring. Use the manual draw-rectangles Add Mosaic for anything you intend to share, and review every frame of any output yourself. Evaluating stronger detectors is on the roadmap.
 - **Detection Image Size is UI-selectable only at compile time.** You can compile a detection engine at 960 (or any multiple of 32) from **Manage Models**, but the UI restore path always detects at 640. To *run* at a non-640 size, drive it from the CLI with `--det-imgsz` until the runtime UI control lands.
 - **Detection FP16 applies only to the PyTorch path.** For a compiled TensorRT detection engine, precision is baked in at compile time, so the runtime **Detection FP16** toggle has no effect — the app now grays it out when a compiled engine is selected. It still applies to `.pt` PyTorch detection runs.
 - **Test Frame preview rows can accumulate.** Running **Test Frame** repeatedly on the same frame may stack preview rows in the strip until you press **New** or the next result replaces them. Cosmetic; a fix is planned.
