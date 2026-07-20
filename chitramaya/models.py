@@ -107,6 +107,7 @@ class MosaicConfig:
     # Detection
     mosaic_detection_score: float = 0.25
     mosaic_detection_batch_size: int = 4
+    mosaic_det_imgsz: int = 640         # detector input size (multiple of 32); 960 for dense VR
     mosaic_iou: float = 0.70            # detection NMS IoU threshold
     mosaic_detection_fp16: bool = True  # detection engine precision
     mosaic_detection_trt: bool = True   # use TRT .engine for detection if available (else .pt)
@@ -116,6 +117,12 @@ class MosaicConfig:
     # are kept from crossing the seam. Layout (lr/rl) is irrelevant — the
     # split/merge is position-preserving, so we always split at w//2.
     mosaic_sbs_split: bool = False
+
+    # CM-045 VR projection: "none" | "fisheye". With "fisheye", each eye is
+    # warped hequirect->fisheye for detection/tracking/restoration (studios
+    # that mosaic in viewing space), and restored regions are inverse-warped
+    # back onto the original frames. Requires mosaic_sbs_split.
+    mosaic_vr_projection: str = "none"
 
     # Restoration
     mosaic_max_clip_size: int = 90
@@ -162,6 +169,7 @@ class MosaicConfig:
             restoration_model=self.restoration_model,
             detection_score=float(self.mosaic_detection_score),
             detection_batch_size=int(self.mosaic_detection_batch_size),
+            det_imgsz=int(self.mosaic_det_imgsz),
             max_clip_size=int(self.mosaic_max_clip_size),
             temporal_overlap=int(self.mosaic_temporal_overlap),
             crossfade=bool(self.mosaic_crossfade),
@@ -183,6 +191,7 @@ class MosaicConfig:
             sbs_enabled=bool(self.mosaic_sbs_split),
             sbs_layout="lr",
             sbs_det_split=bool(self.mosaic_sbs_split),
+            vr_projection=str(self.mosaic_vr_projection or "none").lower(),
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),

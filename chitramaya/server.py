@@ -517,10 +517,22 @@ class SwapServer:
             if det.lower().endswith(".pt"):
                 eng = _detection_engine_path(det)
                 if eng and os.path.isfile(eng):
-                    import dataclasses
-                    mosaic_cfg = dataclasses.replace(
-                        mosaic_cfg, detection_model=eng.replace("\\", "/"),
-                    )
+                    # The engine's input size is baked at compile time. If the
+                    # user asked for a different Image Size, honor the USER
+                    # (PyTorch at the requested size) and say so loudly —
+                    # never silently detect at a size they didn't choose.
+                    eng_sz = _detection_engine_imgsz(eng)
+                    want_sz = int(getattr(mosaic_cfg, "mosaic_det_imgsz", 640) or 640)
+                    if eng_sz is not None and eng_sz != want_sz:
+                        print(f"[Detector] Image Size {want_sz} requested but the "
+                              f"compiled engine is {eng_sz}; using PyTorch (.pt) at "
+                              f"{want_sz}. For TRT speed, recompile the detection "
+                              f"engine at {want_sz} in Manage Models.")
+                    else:
+                        import dataclasses
+                        mosaic_cfg = dataclasses.replace(
+                            mosaic_cfg, detection_model=eng.replace("\\", "/"),
+                        )
                 else:
                     logger.warning(
                         "[mosaic] Tensor Detection requested but no engine for %s; "
@@ -545,6 +557,13 @@ class SwapServer:
             str(mosaic_cfg.mosaic_mask_color),
             round(float(mosaic_cfg.mosaic_mask_opacity), 4),
             bool(mosaic_cfg.mosaic_sbs_split),
+            # Cache-busting additions (Batch 17). Missing entries here mean a
+            # cached pipeline silently keeps the OLD value of a changed knob:
+            round(float(mosaic_cfg.mosaic_detection_score), 4),  # was missing
+            int(mosaic_cfg.mosaic_det_imgsz),                    # new dial
+            bool(mosaic_cfg.mosaic_censor),                      # censor mode
+            int(mosaic_cfg.mosaic_censor_block),                 # censor block
+            str(mosaic_cfg.mosaic_vr_projection),                # CM-045 (Batch 19)
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
 
@@ -1171,6 +1190,24 @@ class SwapServer:
             sbs = bool(mosaic_cfg.mosaic_sbs_split)
             seam = W // 2
 
+            # CM-045: with VR Projection active, detection boxes are in
+            # fisheye space but orig/comp frames are the original projection.
+            # Map each box to its hequirect bounding box so the Test Frame
+            # panes crop the right region of the real frames.
+            _vrp = str(getattr(mosaic_cfg, "mosaic_vr_projection", "none") or "none").lower()
+            if _vrp == "fisheye" and sbs and boxes:
+                from chitramaya.mosaic.vr_projection import (
+                    fisheye_box_to_hequirect_bbox,
+                )
+                eye_w = W // 2
+                mapped = []
+                for (t, l, b, r) in boxes:
+                    off = 0 if int(l) < seam else seam
+                    mt, ml, mb, mr = fisheye_box_to_hequirect_bbox(
+                        (int(t), int(l) - off, int(b), int(r) - off), eye_w, H)
+                    mapped.append((mt, ml + off, mb, mr + off))
+                boxes = mapped
+
             def _encode(img, t, l, b, r):
                 crop = img[t:b + 1, l:r + 1]
                 ok, buf = cv2.imencode(".jpg", crop,
@@ -1401,6 +1438,32 @@ def api_session_status():
         "paths": info.paths,
         "is_us": info.is_us,
     })
+
+
+def _detection_engine_imgsz(engine_path: str) -> int | None:
+    """Read the imgsz a compiled Ultralytics .engine was built at.
+
+    Ultralytics engines start with a 4-byte little-endian metadata length
+    followed by a JSON blob that includes "imgsz". Returns the size (int) or
+    None if the metadata can't be read — callers must treat None as unknown
+    and not block on it.
+    """
+    import json
+    import struct
+    try:
+        with open(engine_path, "rb") as f:
+            meta_len = struct.unpack("<i", f.read(4))[0]
+            if not (0 < meta_len < 100_000):
+                return None
+            meta = json.loads(f.read(meta_len).decode("utf-8", errors="replace"))
+        imgsz = meta.get("imgsz")
+        if isinstance(imgsz, (list, tuple)) and imgsz:
+            return int(imgsz[0])
+        if isinstance(imgsz, (int, float)):
+            return int(imgsz)
+    except Exception:
+        pass
+    return None
 
 
 def _detection_engine_path(pt_path: str) -> str:
@@ -2016,9 +2079,11 @@ def api_default_config():
         "ctrlMosaicDetScore": str(int(m.mosaic_detection_score * 100)),
         "ctrlMosaicDetIou": str(int(m.mosaic_iou * 100)),
         "ctrlMosaicDetBatch": str(m.mosaic_detection_batch_size),
+        "ctrlMosaicDetImgsz": str(m.mosaic_det_imgsz),
         "ctrlMosaicDetFp16": m.mosaic_detection_fp16,
         "ctrlMosaicDetTrt": m.mosaic_detection_trt,
         "ctrlMosaicSbsSplit": m.mosaic_sbs_split,
+        "ctrlMosaicVrProjection": m.mosaic_vr_projection,
 
         # Restoration
         "ctrlMosaicRestModel": m.restoration_model,

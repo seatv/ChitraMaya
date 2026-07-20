@@ -26,7 +26,11 @@ import PyNvVideoCodec as nvc
 
 
 def _raw_ext(codec: str) -> str:
-    return ".hevc" if codec in ("hevc", "h265") else ".h264"
+    if codec in ("hevc", "h265"):
+        return ".hevc"
+    if codec == "av1":
+        return ".av1"    # raw low-overhead OBU stream (ffmpeg 'av1' demuxer)
+    return ".h264"
 
 
 def _create_nvenc_with_fallback(
@@ -94,7 +98,23 @@ def _ffmpeg_input_fmt(codec: str) -> str:
         return "hevc"
     if codec in ("h264", "avc"):
         return "h264"
+    if codec == "av1":
+        # NVENC emits a low-overhead OBU stream; ffmpeg's demuxer for that is
+        # "obu" ("av1" is the Annex-B demuxer and REJECTS low-overhead
+        # streams with "No sequence header available" — verified empirically).
+        return "obu"
     raise ValueError(f"Unsupported codec: {codec}")
+
+
+def _av1_encode_supported(gpu_id: int) -> bool | None:
+    """NVENC AV1 encode exists on Ada (sm_89) and Blackwell (sm_120+) only —
+    Ampere/Turing can DECODE AV1 but cannot encode it. Returns None if the
+    capability can't be determined (then we let NVENC itself decide)."""
+    try:
+        major, minor = torch.cuda.get_device_capability(int(gpu_id))
+        return (major, minor) >= (8, 9)
+    except Exception:
+        return None
 
 
 def _fps_to_rational(fps: float) -> str:
@@ -208,6 +228,22 @@ class Encoder:
         self.multipass = str(multipass)
         self.temporal_aq = bool(temporal_aq)
 
+        # AV1 preflight: fail fast with a clear message on GPUs that cannot
+        # encode AV1, instead of a cryptic NVENC creation error mid-run.
+        if self.codec == "av1":
+            sup = _av1_encode_supported(self.gpu_id)
+            if sup is False:
+                try:
+                    cap = torch.cuda.get_device_capability(self.gpu_id)
+                    cap_s = f"sm_{cap[0]}{cap[1]}"
+                except Exception:
+                    cap_s = "this GPU"
+                raise RuntimeError(
+                    f"AV1 encoding requires an RTX 40-series (Ada) or newer "
+                    f"NVENC; {cap_s} cannot encode AV1 (it can only decode it). "
+                    f"Choose HEVC or H.264 in the Encoder panel."
+                )
+
         # Determine if we need remux
         suffix = Path(self.output_path).suffix.lower()
         self._container = "mp4" if suffix in (".mp4", ".m4v", ".mov") else (
@@ -230,6 +266,16 @@ class Encoder:
         # everything else (bf, aq, lookahead, multipass, tune) defaults
         # to whatever NVENC + the card pick. Keeps the encoder workload
         # as light as possible to avoid hardware saturation.
+        # AV1's constant-QP scale is qindex 0-255, not the 0-51 QP scale H.264/
+        # HEVC use. Map the UI's HEVC-style QP by the standard rough 4x
+        # equivalence so the same slider value means a similar quality across
+        # codecs (e.g. QP18 -> qindex 72). Logged so runs are auditable.
+        effective_qp = self.qp
+        if self.codec == "av1":
+            effective_qp = min(255, self.qp * 4)
+            print(f"[Encoder] AV1 rate control: QP{self.qp} (HEVC scale) -> "
+                  f"qindex {effective_qp} (AV1 scale)")
+
         base_opts = {
             "codec": self.codec,
             "preset": self.preset,
@@ -237,7 +283,7 @@ class Encoder:
             "gop": str(gop),
             "idrperiod": str(gop),
             "rc": "constqp",
-            "constqp": str(self.qp),
+            "constqp": str(effective_qp),
         }
 
         # Optional/advanced quality options — only populated if a caller
@@ -263,9 +309,22 @@ class Encoder:
             quality_opts["multipass"] = self.multipass
 
         enc_opts = {**base_opts, **quality_opts}
-        self._encoder, used_opts = _create_nvenc_with_fallback(
-            self.width, self.height, "ARGB", enc_opts, base_opts
-        )
+        try:
+            self._encoder, used_opts = _create_nvenc_with_fallback(
+                self.width, self.height, "ARGB", enc_opts, base_opts
+            )
+        except Exception as e:
+            if self.codec == "av1":
+                # Capability probe passed (or was inconclusive) but NVENC still
+                # refused — most likely an older driver / PyNvVideoCodec build
+                # without AV1 encode support.
+                raise RuntimeError(
+                    "NVENC refused to create an AV1 encoder. AV1 encoding needs "
+                    "an RTX 40-series (Ada) or newer GPU AND a recent NVIDIA "
+                    "driver / PyNvVideoCodec build. Choose HEVC or H.264, or "
+                    f"update the driver. (Underlying error: {e})"
+                ) from e
+            raise
         self._active_opts = used_opts
 
         # Pretty-print active quality settings so the user can see what's on.
@@ -332,7 +391,19 @@ class Encoder:
         elif self._needs_remux and not self._remux_ok:
             print(f"[Encoder] Raw bitstream kept for debugging: {self._raw_path}")
 
-        print(f"[Encoder] Done: {self.output_path}")
+        if self._needs_remux and not self._remux_ok:
+            # Do NOT print a cheerful "Done" over a broken output (field
+            # event: a 19h45m AV1 run ended with a failed remux and a
+            # misleading Done line). Every encoded frame is safe in the raw
+            # bitstream; tell the user exactly how to wrap it.
+            print(f"[Encoder] *** REMUX FAILED — {self.output_path} is NOT a "
+                  f"playable file. ***")
+            print(f"[Encoder] All encoded frames are preserved in: {self._raw_path}")
+            print(f"[Encoder] Recover with: ffmpeg -r {self.fps_str} "
+                  f"-i \"{self._raw_path}\" -c:v copy \"{self.output_path}\" "
+                  f"(then re-add audio from the source with -itsoffset if needed)")
+        else:
+            print(f"[Encoder] Done: {self.output_path}")
 
     def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg") -> bool:
         """Run one ffmpeg command; return True on rc==0. Shared by both remux
@@ -369,6 +440,24 @@ class Encoder:
             return False
 
         input_fmt = _ffmpeg_input_fmt(self.codec)
+
+        # AV1 container sniff (field event 7/18/2026, 19h45m run nearly lost):
+        # PyNvVideoCodec's NVENC AV1 emits an IVF-WRAPPED bitstream ("DKIF"
+        # magic), not raw low-overhead OBU — forcing -f obu on IVF fails with
+        # "No sequence header available" and the remux dies AFTER the whole
+        # encode. Sniff the first 4 bytes: IVF -> let ffmpeg auto-probe (it
+        # reads IVF natively); anything else -> keep the explicit demuxer.
+        input_fmt_args = ["-f", input_fmt]
+        if self.codec == "av1":
+            try:
+                with open(raw_path, "rb") as _rf:
+                    magic = _rf.read(4)
+                if magic == b"DKIF":
+                    input_fmt_args = []            # IVF: auto-probe
+                    print("[Encoder] AV1 raw bitstream is IVF-wrapped (DKIF); "
+                          "using ffmpeg auto-probe for remux")
+            except Exception:
+                pass
 
         # Reintroduce the source's start-PTS offset between audio and video.
         # NVDEC numbers frames from 0 and NVENC emits a raw elementary stream
@@ -408,6 +497,8 @@ class Encoder:
                 tag_args = ["-tag:v", "hvc1"]
             elif self.codec in ("h264", "avc"):
                 tag_args = ["-tag:v", "avc1"]
+            elif self.codec == "av1":
+                tag_args = ["-tag:v", "av01"]
 
         timescale_args = (
             ["-video_track_timescale", "90000"] if self._container == "mp4" else []
@@ -451,7 +542,7 @@ class Encoder:
                          "-fflags", "+genpts",
                          "-analyzeduration", "10M", "-probesize", "50M",
                          "-r", self.fps_str,
-                         "-f", input_fmt, "-i", str(raw_path),
+                         *input_fmt_args, "-i", str(raw_path),
                          "-map", "0:v:0", "-c:v", "copy"]
                 step1 += tag_args + timescale_args + [str(temp_video)]
                 if not self._run_ffmpeg(step1, "video-container"):
@@ -483,7 +574,7 @@ class Encoder:
                    "-fflags", "+genpts",
                    "-analyzeduration", "10M", "-probesize", "50M",
                    "-r", self.fps_str,
-                   "-f", input_fmt, "-i", str(raw_path)]
+                   *input_fmt_args, "-i", str(raw_path)]
             if has_audio_source:
                 if audio_delay > 0:
                     cmd += ["-itsoffset", f"{audio_delay:.6f}"]
