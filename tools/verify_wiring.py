@@ -47,6 +47,8 @@ def main() -> int:
         async_encoder=True,          # opt-in flag must reach the pipeline
         use_trt=False,               # -> restoration.backend = pytorch
         mask_preview=False,
+        det_imgsz=736,               # Batch 17 — runtime Image Size dial
+        vr_projection="fisheye",     # Batch 19 (CM-045) — VR Projection mode
     )
 
     # Drive _build_base_config without constructing detector/restorer.
@@ -73,6 +75,8 @@ def main() -> int:
         "enc_qp": (host.enc_qp, 21),
         "async_encoder (opt-in)": (host.async_encoder, True),
         "rest_backend (use_trt=False)": (host.rest_backend, "pytorch"),
+        "det_imgsz (Image Size dial)": (host.det_imgsz, 736),
+        "vr_projection (CM-045 fisheye)": (host.vr_projection, "fisheye"),
     }
 
     failed = []

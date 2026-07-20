@@ -28,6 +28,7 @@ from chitramaya.mosaic.detector.core import Detection, Detector as YoloDetector
 from chitramaya.mosaic.core.clip import Clip
 from chitramaya.mosaic.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from chitramaya.mosaic.restorer.compositor import composite_clip_into_store
+from chitramaya.mosaic.vr_projection import composite_clip_into_store_projected
 from chitramaya.mosaic.utils.config_util import Config
 from chitramaya.video.decoder import Decoder
 from chitramaya.video.encoder import Encoder
@@ -468,6 +469,23 @@ class Pipeline:
         self.sbs_layout: str = str(self.cfg.get("sbs_layout", default="lr")).lower()
         self.sbs_det_split: bool = bool(self.cfg.get("sbs_det_split", default=False))
 
+        # CM-045 (Batch 19): optional per-eye hequirect->fisheye projection.
+        # "fisheye" warps each SBS eye before detection/tracking/restoration
+        # (for studios that mosaic in viewing space, so blocks arrive warped
+        # in the raw frame), then inverse-warps ONLY the restored regions
+        # back onto the pristine original frames at composite time.
+        self.vr_projection: str = str(
+            self.cfg.get("vr_projection", default="none") or "none"
+        ).lower()
+        from chitramaya.mosaic.vr_projection import VR_PROJECTION_MODES
+        if self.vr_projection not in VR_PROJECTION_MODES:
+            raise ValueError(
+                f"Invalid vr_projection: {self.vr_projection!r} "
+                f"(expected one of {VR_PROJECTION_MODES})"
+            )
+        # Built lazily on the first frame (needs frame dims + device).
+        self._vrproj = None
+
         self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
         self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
         self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
@@ -817,6 +835,25 @@ class Pipeline:
             _sbs_mode = "ON (per-eye)" if self.sbs_det_split else "OFF (whole frame)"
             print(f"[SBS] Enabled: layout={self.sbs_layout}, per-eye detection {_sbs_mode}")
 
+        # CM-045: VR projection needs SBS geometry (an eye = half the frame).
+        if self.vr_projection != "none" and not self.sbs_enabled:
+            print("[VRProj] Warning: VR Projection requires Split SBS; "
+                  "disabling projection for this run (enable Split SBS to use it).")
+            self.vr_projection = "none"
+        if self.vr_projection == "fisheye":
+            from chitramaya.mosaic.vr_projection import VRProjection
+            self._vrproj = VRProjection(w // 2, h, self.device)
+            # Build grids + scratch canvases EAGERLY so the FrameStore's
+            # VRAM-aware sizing (below) sees their allocation and budgets
+            # around them instead of overcommitting.
+            self._vrproj.grid_fwd()
+            self._vrproj.grid_inv()
+            self._vrproj._ensure_canvases()
+            print(f"[VRProj] Fisheye projection ACTIVE: per-eye hequirect->fisheye "
+                  f"(FOV 180, eye {w // 2}x{h}, grids ~{self._vrproj.vram_estimate_mb():.0f} MB). "
+                  f"Detection/tracking/restoration run in fisheye space; restored "
+                  f"regions are inverse-warped onto the original frames.")
+
         # ChitraMaya's Encoder has a slimmer signature than gRestorer's.
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
         _mux_audio_bool = str(self.mux_audio).lower() != "none"
@@ -1032,6 +1069,19 @@ class Pipeline:
             # Convert RGB -> BGR uint8 once per frame (LADA parity + reuse everywhere)
             batch_bgr_u8: List[torch.Tensor] = [rgb_hwc_to_bgr_hwc_u8(rgb) for rgb in batch_rgb]
 
+            # CM-045: with VR projection active, analysis (detection/tracking/
+            # restoration crops) runs on the fisheye-warped frames while the
+            # store keeps the ORIGINAL frames — restored regions are
+            # inverse-warped back at composite time.
+            if self._vrproj is not None:
+                t0_warp = time.perf_counter()
+                batch_analysis_u8: List[torch.Tensor] = [
+                    self._vrproj.warp_frame_to_fisheye(bgr) for bgr in batch_bgr_u8
+                ]
+                metrics.t_prepare += (time.perf_counter() - t0_warp)
+            else:
+                batch_analysis_u8 = batch_bgr_u8
+
             # -----------------------------
             # Detect (optional)
             # -----------------------------
@@ -1047,7 +1097,7 @@ class Pipeline:
                     left_frames: List[torch.Tensor] = []
                     right_frames: List[torch.Tensor] = []
                     half_w = w // 2
-                    for bgr in batch_bgr_u8:
+                    for bgr in batch_analysis_u8:
                         l, r = split_frame_lr(bgr, layout=self.sbs_layout)
                         left_frames.append(l.contiguous())
                         right_frames.append(r.contiguous())
@@ -1084,7 +1134,7 @@ class Pipeline:
                         detections.append(det)
                 else:
                     t0 = time.perf_counter()
-                    detections = detector.detect_batch(batch_bgr_u8)
+                    detections = detector.detect_batch(batch_analysis_u8)
                     metrics.t_det += (time.perf_counter() - t0)
             else:
                 detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
@@ -1151,23 +1201,46 @@ class Pipeline:
                 # compositor mutates store frames in place, so clone now.
                 if _foi_target is not None and frame_num == _foi_target:
                     foi_capture["original"] = bgr_u8.detach().clone()
+                    # CM-045: also snapshot the fisheye analysis frame so the
+                    # detection overlay pane can render boxes/masks in the
+                    # space they were detected in.
+                    if self._vrproj is not None:
+                        foi_capture["analysis"] = (
+                            batch_analysis_u8[i].detach().clone()
+                        )
+
+                # CM-045: with projection active, the tracker (and therefore
+                # clip crops + gap-fill buffer) consumes the fisheye frame;
+                # boxes/masks are already in fisheye coords.
+                analysis_u8 = batch_analysis_u8[i]
 
                 t0 = time.perf_counter()
-                step = tracker.step_frame(frame_num, bgr_u8, boxes, masks_list)
+                step = tracker.step_frame(frame_num, analysis_u8, boxes, masks_list)
                 metrics.t_track += (time.perf_counter() - t0)
 
                 if step.new_clips and restorer is not None:
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
-                        composite_clip_into_store(
-                            clip=clip,
-                            restored_frames_u8=restored,
-                            store_bgr_u8=store.frames_bgr_u8,
-                            model_dtype=restorer.model_dtype,
-                            blendmask=self.rest_blendmask,
-                            feather_radius=self.feather_radius,
-                        )
+                        if self._vrproj is not None:
+                            composite_clip_into_store_projected(
+                                clip=clip,
+                                restored_frames_u8=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                vrproj=self._vrproj,
+                                model_dtype=restorer.model_dtype,
+                                blendmask=self.rest_blendmask,
+                                feather_radius=self.feather_radius,
+                            )
+                        else:
+                            composite_clip_into_store(
+                                clip=clip,
+                                restored_frames_u8=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                model_dtype=restorer.model_dtype,
+                                blendmask=self.rest_blendmask,
+                                feather_radius=self.feather_radius,
+                            )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
                         metrics.t_restore += (time.perf_counter() - t0)
@@ -1791,6 +1864,9 @@ class MosaicPipelineConfig:
     sbs_enabled: bool = False
     sbs_layout: str = "lr"
     sbs_det_split: bool = False
+    # CM-045: "none" | "fisheye" — per-eye hequirect->fisheye analysis warp
+    # for studios that apply mosaic in viewing space (requires sbs_enabled).
+    vr_projection: str = "none"
     store_max_frames: int = 0
     det_imgsz: int = 640
     det_iou: float = 0.70
@@ -1818,7 +1894,7 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "mask_opacity", "censor", "censor_block", "detection_fp16", "restoration_fp16", "use_trt",
     "codec", "preset", "qp", "async_encoder", "write_diagnostics",
     "sbs_enabled", "sbs_layout",
-    "sbs_det_split", "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
+    "sbs_det_split", "vr_projection", "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
     "use_seg_masks", "feather_radius", "blendmask",
 })
 _MPC_INERT_FIELDS = frozenset({
@@ -1902,6 +1978,7 @@ class MosaicPipeline:
             "sbs_enabled": bool(getattr(c, "sbs_enabled", False)),
             "sbs_layout": str(getattr(c, "sbs_layout", "lr")),
             "sbs_det_split": bool(getattr(c, "sbs_det_split", False)),
+            "vr_projection": str(getattr(c, "vr_projection", "none") or "none"),
             "roi_dilate": int(getattr(c, "roi_dilate", 0)),
             "use_seg_masks": bool(getattr(c, "use_seg_masks", True)),
             "detection": {

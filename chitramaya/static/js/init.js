@@ -57,6 +57,26 @@ tempPath.addEventListener('keydown', async (e) => {
   }
 });
 
+// ── Current-file display in the top bar ───────────────────
+// Filename shown prominently; the FULL path lives in the tooltip.
+function setCurrentFileDisplay(path) {
+  const el = document.getElementById('currentFileName');
+  const wrap = document.getElementById('currentFileWrap');
+  if (!el) return;
+  if (path) {
+    // Full path, front-ellipsized (the span is direction:rtl so overflow
+    // trims the FRONT and the filename end stays visible). The LRM mark
+    // keeps the LTR path from bidi-reordering its edge punctuation.
+    el.textContent = '‎' + path;
+    el.style.color = 'var(--text, #ddd)';
+    if (wrap) wrap.title = path;
+  } else {
+    el.textContent = 'No video loaded';
+    el.style.color = 'var(--text-dim, #9a9a9a)';
+    if (wrap) wrap.title = '';
+  }
+}
+
 // ── Video Load (called from player.js via chitramayaSetVideoFromPath) ───
 
 async function onVideoLoad(path) {
@@ -92,6 +112,9 @@ async function onVideoLoad(path) {
 
   // Enable detect button
   detectBtn.disabled = false;
+
+  // Top-bar current-file display (full path in tooltip)
+  setCurrentFileDisplay(path);
 
   console.log('[ChitraMaya] Video loaded:', result.info);
 }
@@ -566,6 +589,9 @@ async function resetProject() {
 
   // Clear Add Mosaic state: drawn rectangles, modal inputs, draw mode.
   if (typeof _amReset === 'function') _amReset();
+
+  // Clear the top-bar current-file display.
+  setCurrentFileDisplay(null);
 
   // Clear player
   try { player.pause(); } catch {}

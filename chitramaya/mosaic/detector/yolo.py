@@ -300,6 +300,18 @@ class MosaicDetectionModel:
                 max_det=self.max_det,
                 nc=self.nc,
                 end2end=getattr(self.model, "end2end", False),
+                # NMS time-limit patch (CM-041), field event 7/18/2026: at the
+                # ultralytics default (0.05s/img -> 2.2s cap at batch 4), dense
+                # 8K SBS frames under full pipeline load (restore + encode +
+                # CPU-decode contention) intermittently exceed the cap — and on
+                # exceed ultralytics BREAKS its batch loop, silently returning
+                # EMPTY detections for the remaining frames in the batch
+                # (missed mosaics). lada_yolo.py has carried this patch (0.3)
+                # all along; the default detector never did. 2.0s/img -> 10s
+                # cap at batch 4. This is a cap, not a delay — it costs
+                # nothing unless NMS is genuinely that slow, and then
+                # correctness beats latency.
+                max_time_img=2.0,
             )
 
         dets: List[FrameDetections] = []

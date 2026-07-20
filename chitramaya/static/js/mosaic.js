@@ -72,8 +72,8 @@ setActiveTab('restoration');
 
 const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicDetModel', 'ctrlMosaicDetScore', 'ctrlMosaicDetIou',
-  'ctrlMosaicDetBatch', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
-  'ctrlMosaicSbsSplit',
+  'ctrlMosaicDetBatch', 'ctrlMosaicDetImgsz', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
+  'ctrlMosaicSbsSplit', 'ctrlMosaicVrProjection',
   'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
@@ -412,9 +412,15 @@ function gatherMosaicParams() {
       mosaic_detection_score: score / 100.0,
       mosaic_iou: parseInt(document.getElementById('ctrlMosaicDetIou').value) / 100.0,
       mosaic_detection_batch_size: parseInt(document.getElementById('ctrlMosaicDetBatch').value),
+      mosaic_det_imgsz: parseInt(document.getElementById('ctrlMosaicDetImgsz').value) || 640,
       mosaic_detection_fp16: document.getElementById('ctrlMosaicDetFp16').checked,
       mosaic_detection_trt: document.getElementById('ctrlMosaicDetTrt').checked,
       mosaic_sbs_split: document.getElementById('ctrlMosaicSbsSplit').checked,
+      // CM-045: projection is only meaningful with Split SBS on; send "none"
+      // otherwise so a stale dropdown can never silently activate it.
+      mosaic_vr_projection: (document.getElementById('ctrlMosaicSbsSplit').checked
+        ? ((document.getElementById('ctrlMosaicVrProjection') || {}).value || 'none')
+        : 'none'),
       mosaic_mask_preview: document.getElementById('ctrlMosaicMaskPreview').checked,
       mosaic_mask_color: document.getElementById('ctrlMosaicMaskColor').value,
       mosaic_mask_opacity: parseInt(document.getElementById('ctrlMosaicMaskOpacity').value) / 100.0,
@@ -544,7 +550,8 @@ function _setCtrlEnabled(el, enabled) {
 }
 
 function _updateControlEnableStates() {
-  // Feather only applies with Blend Mask = FaceFusion (the legacy "none" mask
+  // Feather only applies with Blend Mask = Face Swap (internal value
+  // "facefusion" kept for saved-config compat; the legacy "none" mask
   // has no feather parameter). Gray it out under None so it can't read as on.
   const blend = document.getElementById('ctrlMosaicBlendMask');
   const feather = document.getElementById('ctrlMosaicFeather');
@@ -576,6 +583,15 @@ function _updateControlEnableStates() {
   // NOTE: Restoration FP16 is intentionally NOT grayed — it selects the
   // fp16-vs-fp32 engine SET (different compiled files), so it has a real
   // effect even with Use Tensor on.
+
+  // CM-045: VR Projection depends on Split SBS (an eye = half the frame).
+  // gatherMosaicParams additionally forces "none" when SBS is off, so a
+  // stale dropdown can never silently activate projection.
+  const sbsEl = document.getElementById('ctrlMosaicSbsSplit');
+  const vrpEl = document.getElementById('ctrlMosaicVrProjection');
+  const sbsOn = !!(sbsEl && sbsEl.checked);
+  _setCtrlEnabled(vrpEl, sbsOn);
+  if (vrpEl) vrpEl.title = sbsOn ? '' : 'Enable Split SBS to use VR Projection.';
 }
 
 // Wrap the face-swap _updateButtonStates so any call updates both modes.
@@ -631,6 +647,7 @@ if (typeof loadVideo === 'function') {
   });
 })();
 
+
 // Re-check on relevant changes
 ['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview',
  'ctrlMosaicCensor'].forEach(id => {
@@ -642,7 +659,7 @@ if (typeof loadVideo === 'function') {
 // enable/disable state. (Blend Mask → Feather; Mask Preview → colour/opacity;
 // Add Mosaic → Block; Det Use Tensor / Det Model → Det FP16.)
 ['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicCensor',
- 'ctrlMosaicDetTrt', 'ctrlMosaicDetModel'].forEach(id => {
+ 'ctrlMosaicDetTrt', 'ctrlMosaicDetModel', 'ctrlMosaicSbsSplit'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateControlEnableStates);
 });

@@ -99,8 +99,10 @@ def create_parser() -> argparse.ArgumentParser:
     # into the encoder defaults - safe values that match Lada quality where it
     # helps and avoid the card-specific NVENC error 8 path. A free-form
     # `--enc-options` for ffmpeg-style overrides is reserved for the future.
-    p.add_argument("--enc-codec", choices=["hevc", "h264"], default=None,
-                   help="Output codec (default: hevc)")
+    p.add_argument("--enc-codec", choices=["hevc", "h264", "av1"], default=None,
+                   help="Output codec (default: hevc). av1 requires an RTX "
+                        "40-series (Ada) or newer NVENC; QP is mapped to the "
+                        "AV1 qindex scale (x4) automatically")
     p.add_argument("--enc-preset", default=None,
                    help="NVENC preset P1-P7 (P1 fastest, P7 highest quality, default: P7)")
     p.add_argument("--enc-qp", type=int, default=None,
@@ -207,6 +209,12 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--sbs-layout", choices=["lr", "rl"], default=None, help="SBS layout: lr=left|right, rl=right|left")
     p.add_argument("--sbs-det-split", action="store_true", help="Run detector per-half (better per-eye)")
     p.add_argument("--no-sbs-det-split", action="store_true", help="Disable per-half detection")
+    p.add_argument("--vr-projection", choices=["none", "fisheye"], default=None,
+                   help="CM-045: per-eye analysis projection. 'fisheye' warps each "
+                        "SBS eye hequirect->fisheye for detection/restoration "
+                        "(studios that mosaic in viewing space: square blocks in "
+                        "the headset, warped in the raw frame) and inverse-warps "
+                        "restored regions back. Requires --sbs.")
 
     # --- Runtime debug flags (not config.json leaf keys) ---
     p.add_argument("--debug", action="store_true", help="Verbose debug logging")
@@ -343,6 +351,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cfg.set("sbs_det_split", value=True)
     if args.no_sbs_det_split:
         cfg.set("sbs_det_split", value=False)
+    _set_if_not_none(cfg, ("vr_projection",), args.vr_projection)
 
     # Detector Switch (CLI overrides config/default)
     if args.det_type is not None:

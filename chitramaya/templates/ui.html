@@ -14,13 +14,22 @@
   <!-- ── Top Header Bar ─────────────────────────────────── -->
   <div class="app-header">
     <span class="logo">ChitraMaya</span>
-    <div style="display:flex; align-items:center; gap:6px; flex:1; margin:0 14px; min-width:0;">
+    <div style="display:flex; align-items:center; gap:6px; flex:1; margin:0 8px 0 14px; min-width:0;">
       <button class="header-btn" id="outputBtn" title="Select output folder">📁 Output</button>
-      <input type="text" class="left-footer-path" id="outputPath" placeholder="Output folder..."
-             title="Paste path and press Enter" style="flex:1; min-width:80px;">
+      <input type="text" class="left-footer-path" id="outputPath" placeholder="Output..."
+             title="Paste path and press Enter" style="flex:1; min-width:60px;">
       <button class="header-btn" id="tempBtn" title="Select temp folder">📁 Temp</button>
-      <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp folder..."
-             title="Paste path and press Enter" style="flex:1; min-width:80px;">
+      <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp..."
+             title="Paste path and press Enter" style="flex:1; min-width:60px;">
+    </div>
+    <div id="currentFileWrap"
+         style="display:flex; align-items:center; gap:7px; flex:2; min-width:0; margin-right:10px;
+                padding:3px 10px; background:var(--panel-bg,#161616); border:1px solid var(--border,#2a2a2a);
+                border-radius:5px;">
+      <span style="opacity:.55; flex:0 0 auto;">🎬</span>
+      <span id="currentFileName"
+            style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;
+                   direction:rtl; text-align:left; color:var(--text-dim,#9a9a9a);">No video loaded</span>
     </div>
     <button class="stc-btn" id="stcBtn"
             title="Not affiliated with Save the Children. If you find ChitraMaya useful, please consider donating — this opens their official donation page.">&#10084;&#65039; Save The Children</button>
@@ -211,9 +220,26 @@
                 </div>
               </div>
               <div class="ctrl-row">
+                <span class="ctrl-label"
+                      title="Detector input resolution (multiple of 32). Higher (e.g. 960) downscales the frame less, so small or faint mosaics detect better, at the cost of slower detection and more VRAM. 640 is the tested default; 960 suits dense VR content. With Use Tensor on, the compiled engine must match this size - if it doesn't, the run falls back to PyTorch at this size and the log tells you to recompile at the new size in Manage Models.">Image Size</span>
+                <div class="ctrl-dial-container">
+                  <input type="range" class="ctrl-dial" id="ctrlMosaicDetImgsz"
+                         min="640" max="960" step="32" value="640">
+                  <span class="ctrl-value" id="valMosaicDetImgsz">640</span>
+                </div>
+              </div>
+              <div class="ctrl-row">
                 <input type="checkbox" class="ctrl-checkbox" id="ctrlMosaicSbsSplit">
                 <span class="ctrl-label" style="min-width:auto;"
                       title="Side-by-side stereo (VR): split each eye, detect separately, merge, and keep restorations from crossing the seam.">Split SBS</span>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label"
+                      title="For VR studios that apply the mosaic in VIEWING space: blocks look square in the headset but arrive warped in the raw frame, which detection and restoration handle poorly. Fisheye warps each eye so those blocks become square again, analyzes there, and warps only the restored regions back - background pixels are never resampled. Leave Off for content whose mosaic already looks square in the flat player (most studios). Requires Split SBS.">VR Projection</span>
+                <select class="ctrl-select" id="ctrlMosaicVrProjection">
+                  <option value="none" selected>Off</option>
+                  <option value="fisheye">Fisheye (square-in-headset mosaics)</option>
+                </select>
               </div>
             </div>
           </div>
@@ -259,7 +285,7 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Soften the edge where the restored patch meets the original frame by N pixels (0-64). Higher hides the seam for a smoother blend; 0 = auto. Applies when Blend Mask = FaceFusion (the shape-aware edge). With Blend Mask = None it has no effect.">Feather</span>
+                      title="Soften the edge where the restored patch meets the original frame by N pixels (0-64). Higher hides the seam for a smoother blend; 0 = auto. Applies when Blend Mask = Face Swap (the shape-aware edge). With Blend Mask = None it has no effect.">Feather</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicFeather"
                          min="0" max="64" value="0">
@@ -267,10 +293,13 @@
                 </div>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="How the restored patch is blended back into the frame. None = a rectangular blended region (can leave a hard ice-block edge around the mosaic). FaceFusion = the blend follows the mosaic actual shape with a soft inward edge, reducing that rectangle - usually cleaner, especially on SBS/VR content.">Blend Mask</span>
+                <span class="ctrl-label" title="How the restored patch is blended back into the frame. None = a rectangular blended region (can leave a hard ice-block edge around the mosaic). Face Swap = the blend follows the mosaic actual shape with a soft inward edge, reducing that rectangle - usually cleaner, especially on SBS/VR content. (Blending scheme adapted from Rope's face-swap compositor.)">Blend Mask</span>
                 <select class="ctrl-select" id="ctrlMosaicBlendMask">
                   <option value="none" selected>None</option>
-                  <option value="facefusion">FaceFusion</option>
+                  <!-- Display name "Face Swap" (the scheme is Rope's face-swap
+                       blend); internal value stays "facefusion" for saved-config
+                       and CLI compatibility. -->
+                  <option value="facefusion">Face Swap</option>
                 </select>
               </div>
               <div class="ctrl-row">
@@ -337,9 +366,11 @@
         <div class="ctrl-section-body">
           <div class="ctrl-row">
             <span class="ctrl-label" title="Output video codec (NVENC)">Codec</span>
-            <select class="ctrl-select" id="ctrlCodec">
+            <select class="ctrl-select" id="ctrlCodec"
+                    title="Output codec. AV1 needs an RTX 40-series (Ada) or newer to ENCODE (30-series can only decode it); ~30% smaller files than HEVC at the same quality, and previews play in the app without any HEVC extensions.">
               <option value="hevc" selected>HEVC</option>
               <option value="h264">H.264</option>
+              <option value="av1">AV1 (RTX 40+)</option>
             </select>
           </div>
           <div class="ctrl-row">
