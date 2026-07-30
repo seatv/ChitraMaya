@@ -29,6 +29,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.serving import WSGIRequestHandler
 
+from chitramaya.winproc import NOWINDOW
+
 logger = logging.getLogger(__name__)
 
 
@@ -264,7 +266,7 @@ class SwapServer:
             # back to the system codepage (cp1252 on Windows) which crashes on any
             # non-ASCII filename or metadata.
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                                    encoding='utf-8', errors='replace')
+                                    encoding='utf-8', errors='replace', **NOWINDOW)
             data = _json.loads(result.stdout)
 
             # Find video stream
@@ -359,7 +361,7 @@ class SwapServer:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, timeout=10,
+                cmd, capture_output=True, timeout=10, **NOWINDOW,
             )
             if result.returncode != 0 or len(result.stdout) != w * h * 3:
                 logger.warning("ffmpeg frame extraction failed at t=%.3f (got %d bytes, expected %d)",
@@ -564,6 +566,8 @@ class SwapServer:
             bool(mosaic_cfg.mosaic_censor),                      # censor mode
             int(mosaic_cfg.mosaic_censor_block),                 # censor block
             str(mosaic_cfg.mosaic_vr_projection),                # CM-045 (Batch 19)
+            str(mosaic_cfg.mosaic_secondary),                    # CM-077 (Batch 20)
+            str(mosaic_cfg.mosaic_temporal_stability),           # CM-078 (Batch 26)
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
 
@@ -617,6 +621,23 @@ class SwapServer:
             "mosaic_mode": str(mode),
         })
 
+    @staticmethod
+    def _unique_output_path(path: str) -> str:
+        """Never overwrite a finished output: if the target exists, append
+        -2, -3, ... before the extension (repeated A/B runs keep every
+        result). First run keeps the clean name."""
+        p = Path(path)
+        if not p.exists():
+            return str(p)
+        n = 2
+        while True:
+            cand = p.with_name(f"{p.stem}-{n}{p.suffix}")
+            if not cand.exists():
+                print(f"[ChitraMaya] Output exists; writing {cand.name} instead"
+                      if n == 2 else f"[ChitraMaya] Writing {cand.name}")
+                return str(cand)
+            n += 1
+
     def mosaic_full(self, params: dict) -> str:
         """Process full video with mosaic restoration. Runs in BG thread."""
         from chitramaya.models import MosaicConfig
@@ -634,7 +655,7 @@ class SwapServer:
 
         # Output path. Priority: payload output_dir (the value in the UI box at
         # submit-time) -> persisted self.output_dir -> input's parent directory.
-        payload_out = str(params.get("output_dir", "") or "").strip()
+        payload_out = str(params.get("output_dir", "") or "").strip().strip('"').strip("'").strip()
         if payload_out:
             self.output_dir = payload_out
         input_path = Path(self.video_path)
@@ -642,7 +663,8 @@ class SwapServer:
         os.makedirs(out_dir, exist_ok=True)
         suffix = ("-censored" if mosaic_cfg.mosaic_censor
                   else "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored")
-        output_path = str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4")
+        output_path = self._unique_output_path(
+            str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4"))
 
         info = self.video_info or {}
         total_frames = info.get("num_frames", 0)
@@ -694,6 +716,209 @@ class SwapServer:
                     result.frames, result.detections, result.restorations, output_path)
         return output_path
 
+    @staticmethod
+    def _clean_path(p) -> str:
+        """Strip surrounding quotes + whitespace. Windows 'Copy as path'
+        produces "D:\\Folder" WITH literal quotes -- accept it as-is."""
+        return str(p or "").strip().strip('"').strip("'").strip()
+
+    def _mosaic_folder_target(self, params: dict) -> dict:
+        """Resolve a batch request's target and build the plan (CM-079).
+
+        READ-ONLY: no server-state mutation, no GPU, no mkdir. Shared by the
+        /api/mosaic-folder-plan dry-run (which the batch modal calls to fill
+        its file lists) and by mosaic_folder itself, so what the UI shows is
+        by construction what the batch will do.
+
+        Two input shapes:
+          folder + recursive/skip_existing/video_extensions
+              -> enumerate the folder (ChitraMaya's own outputs excluded),
+                 skip-existing marks files whose output is already present.
+          files: [paths]   (explicit queue from the batch modal)
+              -> process exactly these, in this order; skip-existing does
+                 NOT apply (moving a file into the queue IS the override --
+                 an existing output just collides into '-2' naming).
+        """
+        from chitramaya.models import MosaicConfig
+        from chitramaya.mosaic import batch as _batch
+
+        folder = self._clean_path(params.get("folder", ""))
+        files = params.get("files") or None
+
+        mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
+        suffix = ("-censored" if mosaic_cfg.mosaic_censor
+                  else "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored")
+
+        if files:
+            inputs = []
+            for f in files:
+                p = Path(self._clean_path(f))
+                if not p.is_file():
+                    raise RuntimeError(f"Not a file: {p}")
+                inputs.append(p)
+            if not inputs:
+                raise RuntimeError("Empty file list")
+            if not folder:
+                folder = str(inputs[0].parent)
+            skip_existing = False
+        else:
+            if not folder:
+                raise RuntimeError("No folder specified")
+            if not os.path.isdir(folder):
+                raise RuntimeError(f"Not a folder: {folder}")
+            recursive = bool(params.get("recursive", False))
+            exts = params.get("video_extensions") or None
+            inputs = _batch.enumerate_videos(folder, extensions=exts,
+                                             recursive=recursive)
+            skip_existing = bool(params.get("skip_existing", True))
+
+        payload_out = self._clean_path(params.get("output_dir", ""))
+        out_dir = payload_out or self.output_dir or folder
+        plan = _batch.plan_batch(inputs, out_dir, suffix,
+                                 skip_existing=skip_existing)
+        return {
+            "folder": folder,
+            "out_dir": out_dir,
+            "suffix": suffix,
+            "payload_out": payload_out,
+            "mosaic_cfg": mosaic_cfg,
+            "plan": plan,
+        }
+
+    def mosaic_folder(self, params: dict) -> str:
+        """Batch: process every video in a folder with the current settings
+        (CM-079, Batch 22). Reuses the warm pipeline across all files (models
+        load once). Restore or censor mode follow the same config rules as
+        mosaic_full. Runs in a BG thread.
+
+        params adds, beyond the usual mosaic/encoder blocks:
+          folder            : input folder (required unless files given)
+          files             : explicit list of videos to process, in order
+                              (Batch 23 -- the modal's queue). Overrides
+                              enumerate/skip logic.
+          recursive         : bool (default False)
+          skip_existing     : bool (default True) -- resume without redoing
+          video_extensions  : optional list like ["mp4","mkv"]
+        Per-file errors are isolated (one file's failure -- including a GPU
+        hang -- does not abort the batch)."""
+        from chitramaya.mosaic import batch as _batch
+
+        target = self._mosaic_folder_target(params)
+        folder = target["folder"]
+        out_dir = target["out_dir"]
+        plan = target["plan"]
+        mosaic_cfg = target["mosaic_cfg"]
+        encoder_dict = params.get("encoder", {})
+
+        if not mosaic_cfg.detection_model:
+            raise RuntimeError("Detection model path not set")
+        if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
+                and not mosaic_cfg.mosaic_censor):
+            raise RuntimeError("Restoration model path not set")
+
+        if target["payload_out"]:
+            self.output_dir = target["payload_out"]
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Announce the plan so skips are never a mystery: every file gets a
+        # line, and skipped ones say WHY (which existing output blocked them).
+        n_skip = sum(1 for it in plan if it.skip)
+        print(f"[ChitraMaya] mosaic-folder plan: {len(plan)} file(s) in {folder}"
+              f" -> {out_dir}  ({len(plan) - n_skip} to process, {n_skip} skipped)")
+        for i, it in enumerate(plan):
+            if it.skip:
+                print(f"[ChitraMaya]   [{i + 1}/{len(plan)}] "
+                      f"{Path(it.input_path).name} -> SKIPPED: {it.skip_reason} "
+                      f"({Path(it.output_path).name})")
+            else:
+                print(f"[ChitraMaya]   [{i + 1}/{len(plan)}] "
+                      f"{Path(it.input_path).name} -> {Path(it.output_path).name}")
+
+        self._cancel_flag.clear()
+        # Batch-level progress block (polled by the UI alongside per-file frame
+        # progress, which _mosaic_progress_cb keeps writing for the live file).
+        self._progress = {
+            "status": "processing",
+            "mode": "batch",
+            "frame": 0, "total": 0, "fps": 0, "eta": "planning...",
+            "detections": 0, "restorations": 0, "buffered": 0,
+            "batch": {
+                "folder": folder,
+                "total": len(plan),
+                "index": 0,
+                "current_file": "",
+                "done": 0, "skipped": 0, "errors": 0,
+                "files": [
+                    {"name": Path(it.input_path).name,
+                     "status": ("skipped" if it.skip else "pending"),
+                     "error": it.skip_reason}
+                    for it in plan
+                ],
+            },
+        }
+
+        if not any(not it.skip for it in plan):
+            self._progress["status"] = "complete"
+            self._progress["eta"] = "-"
+            print(f"[ChitraMaya] mosaic-folder: nothing to do "
+                  f"({len(plan)} file(s), all skipped or none found) in {folder}")
+            return out_dir
+
+        pipeline = self._ensure_mosaic_pipeline(mosaic_cfg, encoder_dict=encoder_dict)
+
+        def _process_one(input_path: str, output_path: str):
+            # Collision-safe like the single-file path; reset per-file progress.
+            final_out = self._unique_output_path(output_path)
+            self._progress["frame"] = 0
+            self._progress["total"] = 0
+            self._progress["restorations"] = 0
+            return pipeline.process_file(
+                input_path, final_out,
+                progress_cb=self._mosaic_progress_cb,
+                use_tqdm=False,
+                cancel_flag=self._cancel_flag,
+            )
+
+        bp = self._progress["batch"]
+
+        def _on_start(idx, item):
+            bp["index"] = idx + 1
+            bp["current_file"] = Path(item.input_path).name
+            bp["files"][idx]["status"] = "processing"
+            self._progress["eta"] = "processing..."
+            print(f"[ChitraMaya] mosaic-folder [{idx + 1}/{bp['total']}]: "
+                  f"{Path(item.input_path).name}")
+
+        def _on_done(idx, res):
+            bp["files"][idx]["status"] = res.status
+            bp["files"][idx]["seconds"] = round(float(res.seconds), 1)
+            bp["files"][idx]["frames"] = int(res.frames)
+            if res.error:
+                bp["files"][idx]["error"] = res.error
+            if res.status == "done":
+                bp["done"] += 1
+            elif res.status == "skipped":
+                bp["skipped"] += 1
+            elif res.status == "error":
+                bp["errors"] += 1
+                print(f"[ChitraMaya] mosaic-folder: FILE FAILED "
+                      f"({Path(res.input_path).name}): {res.error} -- continuing")
+
+        summary = _batch.run_batch(
+            plan, _process_one,
+            on_file_start=_on_start, on_file_done=_on_done,
+            cancel_flag=self._cancel_flag,
+        )
+
+        if self._cancel_flag.is_set():
+            self._progress["status"] = "cancelled"
+        else:
+            self._progress["status"] = "complete"
+        self._progress["eta"] = "-"
+        self._progress["batch"]["summary"] = summary.line()
+        print(f"[ChitraMaya] mosaic-folder done: {summary.line()}")
+        return out_dir
+
     def auto_mosaic(self, start_time: float, end_time: float, params: dict) -> str:
         """Auto-censor: detect regions with the selected detection model and
         pixelate them (SFW). Reuses the full mosaic pipeline in ``mosaic`` mode
@@ -715,7 +940,7 @@ class SwapServer:
         if not mosaic_cfg.detection_model:
             raise RuntimeError("Detection model path not set (select the NSFW detection model)")
 
-        payload_out = str(params.get("output_dir", "") or "").strip()
+        payload_out = str(params.get("output_dir", "") or "").strip().strip('"').strip("'").strip()
         if payload_out:
             self.output_dir = payload_out
         input_path = Path(self.video_path)
@@ -727,7 +952,8 @@ class SwapServer:
         segment = end_time > start_time + 0.01
 
         if segment:
-            output_path = str(Path(out_dir) / f"{input_path.stem}-censored-seg.mp4")
+            output_path = self._unique_output_path(
+                str(Path(out_dir) / f"{input_path.stem}-censored-seg.mp4"))
             payload_temp = str(params.get("temp_dir", "") or "").strip()
             if payload_temp:
                 self.temp_dir = payload_temp
@@ -737,7 +963,8 @@ class SwapServer:
             n_seg_frames = max(1, int(round((end_time - start_time) * vid_fps)))
             total = n_seg_frames
         else:
-            output_path = str(Path(out_dir) / f"{input_path.stem}-censored.mp4")
+            output_path = self._unique_output_path(
+                str(Path(out_dir) / f"{input_path.stem}-censored.mp4"))
             src = self.video_path
             total = info.get("num_frames", 0)
 
@@ -759,7 +986,7 @@ class SwapServer:
                 "-pix_fmt", "yuv420p", "-bf", "0", "-an", src,
             ]
             rp = subprocess.run(extract_cmd, capture_output=True, text=True,
-                                timeout=120, encoding="utf-8", errors="replace")
+                                timeout=120, encoding="utf-8", errors="replace", **NOWINDOW)
             if rp.returncode != 0:
                 raise RuntimeError(f"Segment extraction failed: {rp.stderr[-200:]}")
             if not Path(src).exists() or Path(src).stat().st_size < 1024:
@@ -834,7 +1061,7 @@ class SwapServer:
         sbs = bool(params.get("sbs", False))
         enc = params.get("encoder", {}) or {}
 
-        payload_out = str(params.get("output_dir", "") or "").strip()
+        payload_out = str(params.get("output_dir", "") or "").strip().strip('"').strip("'").strip()
         if payload_out:
             self.output_dir = payload_out
         input_path = Path(self.video_path)
@@ -846,7 +1073,8 @@ class SwapServer:
         segment = end_time > start_time + 0.01
 
         if segment:
-            output_path = str(Path(out_dir) / f"{input_path.stem}-mosaic-seg.mp4")
+            output_path = self._unique_output_path(
+                str(Path(out_dir) / f"{input_path.stem}-mosaic-seg.mp4"))
             payload_temp = str(params.get("temp_dir", "") or "").strip()
             if payload_temp:
                 self.temp_dir = payload_temp
@@ -856,7 +1084,8 @@ class SwapServer:
             n_seg_frames = max(1, int(round((end_time - start_time) * vid_fps)))
             total = n_seg_frames
         else:
-            output_path = str(Path(out_dir) / f"{input_path.stem}-mosaic.mp4")
+            output_path = self._unique_output_path(
+                str(Path(out_dir) / f"{input_path.stem}-mosaic.mp4"))
             src = self.video_path
             total = info.get("num_frames", 0)
 
@@ -890,7 +1119,7 @@ class SwapServer:
                 src,
             ]
             result_proc = subprocess.run(extract_cmd, capture_output=True, text=True,
-                                         timeout=120, encoding="utf-8", errors="replace")
+                                         timeout=120, encoding="utf-8", errors="replace", **NOWINDOW)
             if result_proc.returncode != 0:
                 raise RuntimeError(f"Segment extraction failed: {result_proc.stderr[-200:]}")
             if not Path(src).exists() or Path(src).stat().st_size < 1024:
@@ -1014,7 +1243,7 @@ class SwapServer:
             seg_input,
         ]
         result_proc = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=120,
-                                     encoding='utf-8', errors='replace')
+                                     encoding='utf-8', errors='replace', **NOWINDOW)
         if result_proc.returncode != 0:
             raise RuntimeError(f"Segment extraction failed: {result_proc.stderr[-200:]}")
         seg_path = Path(seg_input)
@@ -1136,7 +1365,7 @@ class SwapServer:
                 seg_input,
             ]
             proc = subprocess.run(extract_cmd, capture_output=True, text=True,
-                                  timeout=180, encoding="utf-8", errors="replace")
+                                  timeout=180, encoding="utf-8", errors="replace", **NOWINDOW)
             if proc.returncode != 0:
                 return {"error": f"FOI extract failed: {proc.stderr[-200:]}"}
 
@@ -1372,6 +1601,73 @@ def api_mosaic_full():
     return _run_mosaic_threaded("mosaic-full", data, _do)
 
 
+@app.route("/api/mosaic-folder", methods=["POST"])
+def api_mosaic_folder():
+    """Batch-process every video in a folder (CM-079). Body:
+    { params: { folder, recursive?, skip_existing?, video_extensions?,
+      mosaic:{...}, encoder:{...}, output_dir? } }. Restore or censor mode
+    follows the mosaic config (mosaic_censor / mask_preview) exactly as the
+    single-file path does. Reuses warm models across all files."""
+    data = request.get_json(force=True)
+
+    def _do(server, data):
+        params = data.get("params", {})
+        server.mosaic_folder(params)
+
+    return _run_mosaic_threaded("mosaic-folder", data, _do)
+
+
+@app.route("/api/mosaic-folder-plan", methods=["POST"])
+def api_mosaic_folder_plan():
+    """Dry-run the batch planner (Batch 23). Body: { params: { folder,
+    recursive?, video_extensions?, mosaic:{...}, output_dir? } }.
+
+    Read-only and fast (no lock, no GPU): enumerates the folder exactly as
+    the batch would (ChitraMaya's own outputs excluded) and annotates each
+    file with whether its output already exists. The batch modal calls this
+    to fill its Folder / Queue lists, so what the user sees is precisely
+    what the batch will do."""
+    data = request.get_json(force=True)
+    params = data.get("params", {})
+    try:
+        target = _get_server()._mosaic_folder_target(params)
+        return jsonify({
+            "folder": target["folder"],
+            "out_dir": target["out_dir"],
+            "suffix": target["suffix"],
+            "files": [
+                {
+                    "name": Path(it.input_path).name,
+                    "path": it.input_path,
+                    "output_name": Path(it.output_path).name,
+                    "output_exists": bool(it.skip or Path(it.output_path).exists()),
+                }
+                for it in target["plan"]
+            ],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/console")
+def api_console():
+    """Incremental console feed for the UI drawer (Batch 23). Query:
+    ?since=<seq> returns only lines newer than that cursor; pass the
+    response's 'next' back as the following poll's 'since'. Everything the
+    process prints (batch rosters, skip reasons, recovery banners, watchdog
+    alarms) is mirrored here -- packaged .exe users have no console window,
+    so this drawer is the only place they can see it."""
+    from chitramaya.console_buffer import get_buffer
+    buf = get_buffer()
+    if buf is None:
+        return jsonify({"next": 0, "lines": []})
+    try:
+        since = int(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        since = 0
+    return jsonify(buf.snapshot(since))
+
+
 @app.route("/api/auto-mosaic", methods=["POST"])
 def api_auto_mosaic():
     """Auto-censor: detect + pixelate using the selected detection model.
@@ -1578,6 +1874,7 @@ def _run_compile(models, imgsz, max_clip, force):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **NOWINDOW,
             )
             for line in proc.stdout:
                 with _compile_lock:
@@ -2094,6 +2391,13 @@ def api_default_config():
         "ctrlMosaicBlendMask": m.mosaic_blend_mask,
         "ctrlMosaicSegMasks": m.mosaic_use_seg_masks,
         "ctrlMosaicRestTrt": m.mosaic_restoration_trt,
+        "ctrlMosaicSecondary": m.mosaic_secondary,
+        "ctrlMosaicTemporalFix": str(m.mosaic_temporal_stability),
+
+        # Batch folder (CM-079) — modal defaults. (Batch 23: the skip-existing
+        # checkbox was replaced by the visible dual-list queue; already-
+        # processed files start un-queued instead of silently skipped.)
+        "batchRecursive": False,
 
         # Mask Preview
         "ctrlMosaicMaskPreview": m.mosaic_mask_preview,
@@ -2240,6 +2544,19 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
         debug: Enable Flask debug mode.
         console: Open WebView2 DevTools console on startup.
     """
+    # Batch 23/24: mirror stdout/stderr into the ring buffer behind
+    # /api/console BEFORE anything else prints, so the UI console drawer sees
+    # the whole session. Batch 24 builds the UI exe WINDOWED (console=False):
+    # sys.stdout/stderr are None there, the tee becomes the only stdout, and
+    # ChitraMaya-console.log (next to the exe / in the working dir) is the
+    # post-mortem for crashes that happen before the drawer is opened.
+    from chitramaya.console_buffer import install as _install_console
+    try:
+        _log_path = str(_app_base_dir() / "ChitraMaya-console.log")
+    except Exception:
+        _log_path = None
+    _install_console(log_path=_log_path)
+
     global _server
     _server = SwapServer(models_dir=models_dir, gpu_id=gpu_id)
 

@@ -59,3 +59,10 @@ pywebview>=6.2
 
 # ── CLI progress bars (mosaic pipeline + batch mode) ──────────────────
 tqdm>=4.67
+
+# ── NVML bindings (Batch 23 stall-watchdog PCIe canary) ───────────────
+# Official NVIDIA NVML wrapper (imports as `pynvml`). Used to watch the
+# PCIe link generation during a run: a Gen down-train preceded "GPU has
+# been lost" by ~18s on a 5060 Ti field incident, so the watchdog alarms
+# on it. Optional at runtime -- if missing, the canary is silently off.
+nvidia-ml-py>=12.0

@@ -54,7 +54,7 @@ def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gRestorer", description="GPU-centric video mosaic remover")
 
     # Required I/O
-    p.add_argument("--input", required=True, help="Input video file")
+    p.add_argument("--input", required=True, help="Input video FILE, or a FOLDER to batch-process every video in it (CM-079)")
     p.add_argument("--output", required=True, help="Output video file")
 
     # Config + high-level mode
@@ -173,6 +173,12 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--store-max-frames", type=int, default=None,
                    help="Max frames in FrameStore (0=auto, -1=unlimited; controls VRAM backpressure)")
 
+    # CM-081 (Batch 23): stall watchdog + PCIe canary
+    p.add_argument("--watchdog-stall-seconds", type=int, default=None,
+                   help="Stall watchdog: if frame progress stops for this many seconds, "
+                        "print an alarm + all-thread stack dump (and watch the PCIe link "
+                        "for down-training via NVML). Default 120; 0 disables.")
+
     # --- Tracker stabilization + TTL ---
     p.add_argument("--trk-ttl-after-end", type=int, default=None,
                    help="Frames a scene lingers after its last real detection. "
@@ -215,6 +221,18 @@ def create_parser() -> argparse.ArgumentParser:
                         "(studios that mosaic in viewing space: square blocks in "
                         "the headset, warped in the raw frame) and inverse-warps "
                         "restored regions back. Requires --sbs.")
+    p.add_argument("--secondary-restoration", choices=["none", "rtx-2x", "rtx-4x"],
+                   default=None,
+                   help="CM-077: upscale restored crops with NVIDIA Maxine RTX "
+                        "Super-Res (2x or 4x) before paste-back, sharpening regions "
+                        "larger than the 256 clip size. Needs an RTX GPU, a recent "
+                        "driver, and 'pip install nvidia-vfx'; ~1.5 GB extra VRAM. "
+                        "Falls back gracefully if unavailable.")
+    p.add_argument("--temporal-stability", type=int, choices=[0, 1, 2, 3], default=None,
+                   help="CM-078: temporal stabilization of restored crops "
+                        "(vs_temporalfix): 0=off (default), 1..3=strength. Needs the "
+                        "temporalfix .pth weights next to the restoration model or "
+                        "in models/. Falls back gracefully if missing.")
 
     # --- Runtime debug flags (not config.json leaf keys) ---
     p.add_argument("--debug", action="store_true", help="Verbose debug logging")
@@ -335,6 +353,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # Batch processing
     _set_if_not_none(cfg, ("batch_processing", "video_extensions"), args.batch_video_extensions)
     _set_if_not_none(cfg, ("batch_processing", "skip_existing"), args.batch_skip_existing)
+    _set_if_not_none(cfg, ("monitoring", "watchdog_stall_seconds"), args.watchdog_stall_seconds)
 
     # Debug section
     _set_if_not_none(cfg, ("debug", "save_detection_frames"), args.debug_save_detection_frames)
@@ -352,6 +371,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if args.no_sbs_det_split:
         cfg.set("sbs_det_split", value=False)
     _set_if_not_none(cfg, ("vr_projection",), args.vr_projection)
+    _set_if_not_none(cfg, ("secondary_restoration",), args.secondary_restoration)
+    _set_if_not_none(cfg, ("temporal_stability",), args.temporal_stability)
 
     # Detector Switch (CLI overrides config/default)
     if args.det_type is not None:

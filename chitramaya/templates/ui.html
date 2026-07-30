@@ -67,6 +67,21 @@
         .foi-na { display:flex; align-items:center; justify-content:center;
                   width:90px; height:64px; color:#555; font:12px sans-serif; }
         .foi-empty { font:12px sans-serif; color:var(--text-dim,#8a8a8a); padding:8px; }
+        /* Batch 28: Test Frame result history navigator (enlarge, right
+           pane). Up to 5 runs on the SAME frame stack up; < > flips the
+           Restored pane between them for knob-change A/B. */
+        #foiHistNav { margin-left:10px; user-select:none; white-space:nowrap; }
+        .foi-hist-btn { cursor:pointer; padding:0 6px; font-weight:bold;
+                        color:var(--text-dim,#8a8a8a); }
+        .foi-hist-btn:hover { color:var(--text,#fff); }
+        .foi-hist-btn.foi-hist-off { opacity:.3; cursor:default; pointer-events:none; }
+        /* Batch 28b: numbered slots between < and > -- one-click random
+           access to any stacked run; hover shows that run's settings. */
+        .foi-hist-dot { cursor:pointer; padding:1px 5px; font:11px sans-serif;
+                        color:var(--text-dim,#8a8a8a); border-radius:3px; }
+        .foi-hist-dot:hover { color:var(--text,#fff); }
+        .foi-hist-dot.foi-hist-cur { color:var(--accent,#7a5cff); font-weight:bold;
+                        outline:1px solid var(--accent,#7a5cff); }
         /* FOI enlarge over the player: fill the actual center-area (player
            box), not the viewport — so panels track the real player size live
            in windowed + fullscreen. Two panels split the width; the image
@@ -117,7 +132,10 @@
               <img id="zoomOriginal" src="" alt="Original face 512×512">
             </div>
             <div class="zoom-panel">
-              <div class="zoom-label">Restored</div>
+              <div class="zoom-label"><span id="zoomLabelRight">Restored</span><span
+                  id="foiHistNav" class="hidden"><span class="foi-hist-btn" id="foiHistPrev"
+                  title="Older result">&lt;</span><span id="foiHistDots"></span><span
+                  class="foi-hist-btn" id="foiHistNext" title="Newer result">&gt;</span></span></div>
               <img id="zoomImage" src="" alt="Restored region 512×512">
             </div>
             <button class="zoom-close" id="zoomClose" title="Close preview">✕</button>
@@ -267,6 +285,25 @@
                       title="Use FP16 precision for restoration (selects the fp16 engine set)">FP16</span>
               </div>
               <div class="ctrl-row">
+                <span class="ctrl-label"
+                      title="Sharpens large restored regions. Restoration works on a 256-px crop; regions bigger than that get stretched at paste-back and look soft - worst on VR close-ups. RTX Super-Res (NVIDIA Maxine, the tech behind driver RTX VSR) upscales the restored crop 2x or 4x with real super-resolution first, so paste-back shrinks instead of stretching. Regions smaller than 256 px are untouched. Needs an RTX GPU and a recent driver; uses about 1.5 GB extra VRAM; applies only to real restoration (not Preview/Add Mosaic). If unavailable the run continues without it and says so in the log.">Secondary</span>
+                <select class="ctrl-select" id="ctrlMosaicSecondary">
+                  <option value="none" selected>Off</option>
+                  <option value="rtx-2x">RTX Super-Res 2&times;</option>
+                  <option value="rtx-4x">RTX Super-Res 4&times;</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label"
+                      title="Smooths per-frame restoration/upscale shimmer (fizzle, wiggly fine detail) by averaging each restored frame with its 6 temporal neighbors where the content agrees - real motion and lighting changes pass through untouched. Runs on restored regions only; the rest of the frame is never modified. Uses the vs_temporalfix model (tiny, ~2 MB); needs its .pth weights next to the restoration model or in models/. Higher strength = more aggressive smoothing; too high may soften very small movements. Real restoration only.">Temporal Fix</span>
+                <select class="ctrl-select" id="ctrlMosaicTemporalFix">
+                  <option value="0" selected>Off</option>
+                  <option value="1">Strength 1 (subtle)</option>
+                  <option value="2">Strength 2</option>
+                  <option value="3">Strength 3 (aggressive)</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
                 <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip. With Use Tensor on, any value up to the largest compiled engine size works (a set compiled at N covers clips 1..N); the ceiling is the largest compiled size (see Manage Models). Longer clips give smoother motion but use more VRAM; anything longer is split. Independent of detection.">Max Clip</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
@@ -377,8 +414,11 @@
             <span class="ctrl-label" title="NVENC speed/quality preset. P1 fastest … P7 best quality">Preset</span>
             <select class="ctrl-select" id="ctrlPreset">
               <option value="P1">P1 (fastest)</option>
+              <option value="P2">P2</option>
               <option value="P3">P3</option>
+              <option value="P4">P4</option>
               <option value="P5" selected>P5</option>
+              <option value="P6">P6</option>
               <option value="P7">P7 (best)</option>
             </select>
           </div>
@@ -394,6 +434,18 @@
             <span class="ctrl-label" style="min-width:auto;"
                   title="Encode on a background thread, overlapping NVENC with detection/restoration — up to ~20-25% faster on encode-heavy runs. Needs VRAM headroom (adds a ~500-600 MB frame queue at 4K) and can hit NVENC errors on saturated or low-VRAM cards. Leave OFF unless your card has room to spare.">Async Encode</span>
           </div>
+        </div>
+      </div>
+
+      <!-- Console toggle (Batch 25): lives in-flow under Encoder, styled as
+           a sibling section header, so it is subject to the same layout as
+           everything around it (no more floating-pill alignment). Clicking
+           opens the wide overlay panel (#cdPanel) above the player — the
+           console CONTENT needs more width than this pane can offer. -->
+      <div class="ctrl-section ctrl-section-pinned" id="sectConsole">
+        <div class="ctrl-section-header" id="cdToggle"
+             title="Show/hide the console log — everything ChitraMaya prints (batch plans, skip reasons, recovery banners, watchdog alarms)">
+          <span class="expand-icon" id="cdToggleIcon">▲</span> Console
         </div>
       </div>
 
@@ -453,6 +505,8 @@
     <button class="action-btn primary"   id="restoreSaveBtn"   data-mode="restoration" hidden disabled>Restore &amp; Save</button>
     <button class="action-btn secondary" id="addMosaicBtn"     data-mode="restoration" hidden
             title="Pixelate up to three rectangles (SFW censor) and save — uses the marked segment if one is set, otherwise the whole video">Add Mosaic</button>
+    <button class="action-btn secondary" id="processFolderBtn" data-mode="restoration" hidden
+            title="Process EVERY video in a folder with the current settings. Models load once and are reused across all files. Restore or Add Mosaic mode follows your current settings. ChitraMaya's own outputs (-restored/-censored/etc.) are skipped automatically, and one file failing (even a GPU hang) does not abort the batch.">Process Folder</button>
 
     <button id="fsBtn" class="fs-btn" title="Fullscreen (F)">Fullscreen</button>
   </div>
@@ -470,9 +524,130 @@
     <div class="progress-info">
       <span id="progressPercent">0%</span>
       <span id="progressFps">— fps</span>
+      <span id="progressElapsed">Elapsed 0:00</span>
       <span id="progressEta">ETA: —</span>
     </div>
     <button class="modal-btn" id="progressCancel">Cancel</button>
+  </div>
+</div>
+
+<!-- ── Batch Folder Modal (CM-079 / Batch 23 queue UI) ───── -->
+<style>
+  /* Batch 23b/23d: doubled width (capped to the viewport) -- JAV filenames
+     are long; the two 1fr lists absorb the extra width equally.
+     23d: the base .modal rule in swap.css caps max-width at 500px, and
+     max-width beats width -- override BOTH or the modal only grows taller. */
+  #batchModal .modal { width: min(1720px, 94vw); max-width: min(1720px, 94vw);
+                       text-align: left; max-height: 92vh; overflow-y: auto; }
+  .bm-folder-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 6px; }
+  /* 23d: .modal-btn carries margin-top:16px globally (meant for a modal's
+     bottom button row). Inside the folder row and the move-button column it
+     pushed Browse/Rescan 16px below the input -- zero it there. */
+  .bm-folder-row .modal-btn { margin-top: 0; }
+  .bm-move-btns .modal-btn { margin-top: 0; }
+  /* Batch 23b: .ctrl-input was never defined in any stylesheet, so the folder
+     field rendered as a bare browser-default input (too shallow). Style it
+     here to match .modal-btn's height (same 6px vertical padding + border). */
+  .bm-folder-row .ctrl-input {
+      flex: 1; box-sizing: border-box; padding: 6px 10px;
+      background: var(--bg,#111); color: var(--text,#ddd);
+      border: 1px solid var(--border,#2a2a2a); border-radius: var(--radius-sm,4px);
+      font: 13px sans-serif; min-width: 0; }
+  .bm-folder-row .ctrl-input:focus { outline: 1px solid var(--accent,#7a5cff); }
+  .bm-lists { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px;
+              align-items: stretch; margin: 8px 0 4px; }
+  .bm-list-head { font: 600 11px sans-serif; text-transform: uppercase;
+                  letter-spacing: .04em; color: var(--text-dim,#9a9a9a);
+                  margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .bm-list { width: 100%; height: 320px; background: var(--bg,#111);
+             color: var(--text,#ddd); border: 1px solid var(--border,#2a2a2a);
+             border-radius: 6px; font: 12px ui-monospace, Consolas, monospace;
+             padding: 4px; }
+  .bm-list option { padding: 2px 4px; }
+  .bm-list option.bm-exists { color: var(--text-dim,#8a8a8a); }
+  .bm-move-btns { display: flex; flex-direction: column; gap: 8px;
+                  justify-content: center; }
+  .bm-queue { max-height: 380px; overflow-y: auto; border: 1px solid var(--border,#2a2a2a);
+              border-radius: 6px; background: var(--bg,#111); margin: 8px 0; }
+  .bm-qrow { display: flex; gap: 10px; align-items: baseline; padding: 5px 10px;
+             font: 12px ui-monospace, Consolas, monospace; }
+  .bm-qrow:nth-child(odd) { background: rgba(255,255,255,0.02); }
+  .bm-qname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bm-qstate { flex: 0 0 auto; white-space: nowrap; }
+  .bm-q-pending    .bm-qstate { color: var(--text-dim,#8a8a8a); }
+  .bm-q-processing .bm-qstate { color: #7ab8ff; }
+  .bm-q-done       .bm-qstate { color: #6ee7a0; }
+  .bm-q-skipped    .bm-qstate { color: var(--text-dim,#8a8a8a); }
+  .bm-q-error      .bm-qstate { color: #f0a0a0; }
+  .bm-q-cancelled  .bm-qstate { color: #e0c080; }
+</style>
+<div class="modal-overlay hidden" id="batchModal">
+  <div class="modal">
+    <div class="modal-title">Process Folder</div>
+
+    <!-- Setup view: pick folder, build the queue -->
+    <div id="batchSetup">
+      <div class="modal-message">
+        Process the queued videos with the <b>current settings</b> (Restore, or
+        censor mode if that is on). Models load once and are reused across all
+        files; a file that fails does not stop the batch.
+      </div>
+      <div class="bm-folder-row">
+        <span class="ctrl-label" style="min-width:auto;">Folder</span>
+        <input type="text" class="ctrl-input" id="batchFolder"
+               placeholder="e.g. D:\ToClean\Collection" title="Type a path and press Enter, or use Browse">
+        <button class="modal-btn" id="batchBrowseBtn" title="Pick a folder with the native dialog">Browse...</button>
+        <button class="modal-btn" id="batchRescanBtn" title="Re-scan the folder">Rescan</button>
+      </div>
+      <div class="ctrl-row" style="margin:2px 0 0;">
+        <input type="checkbox" class="ctrl-checkbox" id="batchRecursive">
+        <span class="ctrl-label" style="min-width:auto;"
+              title="Also list videos in subfolders.">Include subfolders</span>
+      </div>
+      <div class="bm-lists">
+        <div>
+          <div class="bm-list-head"><span>In folder</span><span id="bmLeftCount"></span></div>
+          <select id="bmLeftList" class="bm-list" multiple
+                  title="Videos found in the folder (ChitraMaya's own outputs are excluded). Grey [output exists] entries were already processed."></select>
+        </div>
+        <div class="bm-move-btns">
+          <button class="modal-btn" id="bmAddBtn" title="Add selected to the queue">Add &gt;</button>
+          <button class="modal-btn" id="bmAddAllBtn" title="Add everything to the queue">All &gt;&gt;</button>
+          <button class="modal-btn" id="bmRemoveBtn" title="Remove selected from the queue">&lt; Remove</button>
+        </div>
+        <div>
+          <div class="bm-list-head"><span>Queue (processed in order)</span><span id="bmRightCount"></span></div>
+          <select id="bmRightList" class="bm-list" multiple></select>
+        </div>
+      </div>
+      <div class="modal-message" style="opacity:0.8;">
+        Already-processed files (their output exists) start on the left, marked
+        grey — add one anyway to re-process it; the new output gets a
+        <b>-2</b> name instead of overwriting. Output goes to your
+        <b>Output</b> folder (top bar), or the input folder if that's blank.
+      </div>
+      <div class="modal-buttons">
+        <button class="modal-btn modal-btn-cancel" id="batchCancelBtn">Cancel</button>
+        <button class="modal-btn modal-btn-confirm" id="batchStartBtn" disabled>Start Batch</button>
+      </div>
+    </div>
+
+    <!-- Run view: the queue becomes the live status board -->
+    <div id="batchRun" style="display:none;">
+      <div class="bm-queue" id="bmQueueStatus"></div>
+      <div class="progress-bar-container">
+        <div class="progress-bar-fill" id="bmProgressBar"></div>
+      </div>
+      <div class="progress-info">
+        <span id="bmProgressPct">0%</span>
+        <span id="bmProgressFps">&mdash; fps</span>
+        <span id="bmElapsed">Elapsed 0:00</span>
+        <span id="bmSummary"></span>
+      </div>
+      <div class="modal-buttons">
+        <button class="modal-btn" id="batchStopBtn">Stop</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -657,6 +832,44 @@
 </div>
 
 <!-- ── JS Modules ───────────────────────────────────────── -->
+<!-- ── Console Panel (Batch 23/25) ────────────────────────
+     Everything the process prints (batch rosters, skip reasons, recovery
+     banners, watchdog alarms) mirrored from /api/console. Packaged .exe
+     builds have no console window -- this panel is where those messages
+     live. Batch 25: the TOGGLE moved in-flow into the right pane (a
+     "Console" section header under Encoder, #cdToggle); only the wide
+     content panel remains a fixed overlay, since 100-char log lines need
+     more width than the controls pane offers. -->
+<style>
+  #cdPanel { display: none; position: fixed; right: 10px; bottom: 44px;
+             z-index: 950; width: min(760px, 72vw); height: 280px;
+             background: #0b0b0d; border: 1px solid var(--border,#2a2a2a);
+             border-radius: 8px; box-shadow: 0 4px 24px rgba(0,0,0,0.55);
+             overflow: hidden; flex-direction: column; }
+  #cdPanel.cd-open { display: flex; }
+  /* 26b: the open panel used to COVER its own toggle (pinned at the bottom
+     of the right pane, inside the overlay's footprint) -- once open it
+     could not be closed. Three fixes: the panel now has its own close (X),
+     Esc closes it, and the in-pane toggle is raised above the panel. */
+  #cdHeader { flex: 0 0 auto; display: flex; align-items: center;
+              justify-content: space-between; padding: 4px 10px;
+              background: #16161a; border-bottom: 1px solid var(--border,#2a2a2a);
+              font: 600 11px sans-serif; color: var(--text-dim,#9a9a9a);
+              text-transform: uppercase; letter-spacing: .04em; }
+  #cdClose { cursor: pointer; padding: 0 6px; font-size: 13px;
+             color: var(--text-dim,#9a9a9a); user-select: none; }
+  #cdClose:hover { color: var(--text,#fff); }
+  #cdBody { flex: 1; margin: 0; padding: 8px 10px; overflow-y: auto;
+            font: 11px/1.5 ui-monospace, Consolas, monospace; color: #cfcfcf;
+            white-space: pre-wrap; word-break: break-all; }
+  #sectConsole { position: relative; z-index: 960; }
+  #sectConsole .ctrl-section-header { cursor: pointer; user-select: none; }
+</style>
+<div id="cdPanel">
+  <div id="cdHeader"><span>Console</span><span id="cdClose" title="Close (Esc)">&#10005;</span></div>
+  <pre id="cdBody"></pre>
+</div>
+
 <script src="/static/js/state.js?v={{ cachebust }}"></script>
 <script src="/static/js/api.js?v={{ cachebust }}"></script>
 <script src="/static/js/player.js?v={{ cachebust }}"></script>

@@ -1,0 +1,4 @@
+;!@Install@!UTF-8!
+Title="ChitraMaya Installer"
+RunProgram="install.cmd"
+;!@InstallEnd@!

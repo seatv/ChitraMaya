@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import subprocess
+from chitramaya.winproc import NOWINDOW
 
 import torch
 import PyNvVideoCodec as nvc
@@ -427,7 +428,7 @@ class Decoder:
         # non-ASCII filename or metadata. errors='replace' is defensive against
         # any malformed bytes in stderr.
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding='utf-8', errors='replace')
+                           encoding='utf-8', errors='replace', **NOWINDOW)
         if p.returncode != 0:
             raise RuntimeError(f"ffprobe failed:\n{p.stderr}")
 
@@ -525,6 +526,7 @@ class Decoder:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=10**8,
+            **NOWINDOW,
         )
 
     def _ffmpeg_read_frame(self) -> torch.Tensor | None:

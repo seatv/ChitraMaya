@@ -135,6 +135,16 @@ class MosaicConfig:
     mosaic_blend_mask: str = "none"     # compositor blend-mask mode: none | facefusion
     mosaic_use_seg_masks: bool = True   # per-pixel seg masks vs bounding boxes
 
+    # CM-077 secondary restoration: "none" | "rtx-2x" | "rtx-4x". Upscales
+    # restored crops with NVIDIA Maxine RTX Super-Res before paste-back, so
+    # regions larger than the 256 clip size are downscaled into place instead
+    # of stretched. Real restoration mode only; needs an RTX GPU + nvidia-vfx.
+    mosaic_secondary: str = "none"
+
+    # CM-078: temporal stabilization of restored crops (vs_temporalfix).
+    # 0 = off, 1..3 = strength (higher = more aggressive smoothing).
+    mosaic_temporal_stability: int = 0
+
     # Spatial denoising on restored crops. Currently a no-op placeholder
     # (UI control removed; pipeline support added in a tuning session).
     mosaic_denoise: str = "none"        # none | low | medium | high
@@ -192,6 +202,8 @@ class MosaicConfig:
             sbs_layout="lr",
             sbs_det_split=bool(self.mosaic_sbs_split),
             vr_projection=str(self.mosaic_vr_projection or "none").lower(),
+            secondary_restoration=str(self.mosaic_secondary or "none").lower(),
+            temporal_stability=int(self.mosaic_temporal_stability or 0),
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),
