@@ -93,35 +93,139 @@ if (Test-Path $compileSrc) {
  "Then run Compile-All-Engines.ps1 to build engines for THIS machine's GPU.") |
   Set-Content -Encoding ASCII (Join-Path $distDir "models\PUT-MODELS-HERE.txt")
 
-# ── Optional self-extracting installer ──────────────────────────────────
+# ── Self-extracting installer (friendly two-stage SFX) ──────────────────
+# Layout matches the published releases: ChitraMaya-install.7z.001/.002 hold
+# the app; ChitraMaya-install.exe is a SMALL self-contained SFX carrying
+# install.cmd + install.ps1 + 7zr.exe. Running the exe extracts that payload
+# to temp and runs OUR script, which verifies all volumes are present (with
+# a plain-language error naming exactly which files are missing) before
+# extracting -- instead of 7-Zip's bare "Cannot open the file as archive".
+#
+# One-time vendor setup (packaging\windows\vendor\):
+#   BOTH files ship in the LZMA SDK's bin\ folder (the modern "extra"
+#   package no longer carries SFX modules):
+#     https://7-zip.org/sdk.html  -> lzma<ver>.7z  -> bin\7zSD.sfx, bin\7zr.exe
+#   7zSD.sfx  - SFX module for installers (prepended to make the .exe)
+#   7zr.exe   - standalone console 7z extractor (bundled in the payload so
+#               end users do not need 7-Zip installed)
+# Both are official Igor Pavlov binaries and redistributable.
 Write-Host "Creating self-extracting installer..." -ForegroundColor Yellow
 if (Get-Command 7z -ErrorAction SilentlyContinue) {
-  $installerName = "ChitraMaya-install.exe"
-  # Remove stale installer + volume parts from a previous run.
-  Remove-Item -ErrorAction SilentlyContinue "$installerName", "$installerName.0*"
+  $installBase = "ChitraMaya-install"
+  $vendorDir   = ".\packaging\windows\vendor"
+  $sfxModule   = Join-Path $vendorDir "7zSD.sfx"
+  $sevenZr     = Join-Path $vendorDir "7zr.exe"
+  $instSrcDir  = ".\packaging\windows\installer"
 
-  if ($SplitMB -gt 0) {
-    Write-Host "Splitting into ${SplitMB}MB volumes (GitHub 2GB release-asset limit)..." -ForegroundColor Yellow
-    7z a -sfx "-v${SplitMB}m" "$installerName" ".\dist\$Name"
-  } else {
-    7z a -sfx "$installerName" ".\dist\$Name"
-  }
-
-  if ($LASTEXITCODE -eq 0) {
-    $parts = Get-ChildItem -ErrorAction SilentlyContinue "$installerName", "$installerName.0*" |
-             Sort-Object Name
-    if ($parts) {
-      Write-Host "Installer parts:" -ForegroundColor Green
-      foreach ($p in $parts) {
-        $mb = [math]::Round($p.Length / 1MB, 2)
-        Write-Host ("  {0}  ({1} MB)" -f $p.Name, $mb) -ForegroundColor Green
-      }
-      if ($parts.Count -gt 1) {
-        Write-Host "Release ALL parts together. Users download all, then run the .001 (or the .exe) to reassemble." -ForegroundColor Cyan
+  # Remove stale artifacts from a previous run -- LOUDLY. 7-Zip cannot
+  # update a multivolume archive ("Updating for multivolume archives is not
+  # implemented"), so a single leftover .7z.001 fails the whole installer
+  # step. The old SilentlyContinue delete masked exactly that: a volume
+  # still locked (antivirus scan, Explorer preview) survived the delete,
+  # 7z hit it, and the NEXT run "worked without changes" once the lock had
+  # cleared. Now: retry locked files, and refuse to proceed while any
+  # volume remains, naming it.
+  $stale = @(Get-ChildItem -File -ErrorAction SilentlyContinue `
+             "$installBase.exe", "$installBase.7z", "$installBase.7z.0*")
+  foreach ($f in $stale) {
+    for ($try = 1; $try -le 5; $try++) {
+      try {
+        Remove-Item -Force -ErrorAction Stop $f.FullName
+        Write-Host ("  removed stale {0}" -f $f.Name) -ForegroundColor Gray
+        break
+      } catch {
+        if ($try -eq 5) {
+          Write-Warning ("Stale {0} is locked and could not be deleted." -f $f.Name)
+        } else {
+          Write-Host ("  stale {0} is locked (attempt {1}/5); retrying in 2s..." -f $f.Name, $try) -ForegroundColor Yellow
+          Start-Sleep -Seconds 2
+        }
       }
     }
+  }
+  $survivors = @(Get-ChildItem -File -ErrorAction SilentlyContinue "$installBase.7z*")
+
+  if ($survivors.Count -gt 0) {
+    Write-Warning ("Cannot delete stale installer volume(s): {0}." -f (($survivors | ForEach-Object Name) -join ', '))
+    Write-Warning "Something still holds them open (antivirus scan or an Explorer window)."
+    Write-Warning "Close it (or wait a minute) and re-run the packager. Skipping installer creation."
+  } elseif (-not (Test-Path $sfxModule) -or -not (Test-Path $sevenZr)) {
+    Write-Warning ("Vendor files missing ({0} and/or {1})." -f $sfxModule, $sevenZr)
+    Write-Warning "Download the LZMA SDK from 7-zip.org/sdk.html (lzma<ver>.7z), then copy"
+    Write-Warning "bin\7zSD.sfx and bin\7zr.exe into packaging\windows\vendor\ and re-run."
+    Write-Warning "Skipping installer creation."
+  } elseif (($instMissing = @(@("install.cmd", "install.ps1", "sfx_config.txt") |
+             Where-Object { -not (Test-Path (Join-Path $instSrcDir $_)) })).Count -gt 0) {
+    # Preflight BEFORE the multi-minute volume split: the installer scripts
+    # (Batch 20d, packaging\windows\installer\) must exist or staging fails
+    # after the big archive job has already run.
+    Write-Warning ("Installer script(s) missing from {0}: {1}." -f $instSrcDir, ($instMissing -join ', '))
+    Write-Warning "These ship in the repo (Batch 20d). Restore them and re-run."
+    Write-Warning "Skipping installer creation."
   } else {
-    Write-Warning "Failed to create self-extracting installer."
+    # 1) The big application archive, split into GitHub-sized volumes.
+    if ($SplitMB -gt 0) {
+      Write-Host "Splitting into ${SplitMB}MB volumes (GitHub 2GB release-asset limit)..." -ForegroundColor Yellow
+      7z a -t7z "-v${SplitMB}m" "$installBase.7z" ".\dist\$Name"
+    } else {
+      # Keep volume naming (.001) even for a single part so the installer
+      # script's expectations hold.
+      7z a -t7z "-v99999m" "$installBase.7z" ".\dist\$Name"
+    }
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; }
+    else {
+      $parts = @(Get-ChildItem "$installBase.7z.0*" | Sort-Object Name)
+
+      # 2) Stage the installer payload; stamp the real part count into the
+      #    script so it can name any missing volume exactly.
+      $stage = ".\build\installer_payload"
+      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
+      New-Item -ItemType Directory -Force -Path $stage | Out-Null
+      Copy-Item (Join-Path $instSrcDir "install.cmd") $stage
+      (Get-Content (Join-Path $instSrcDir "install.ps1")) `
+        -replace '^\$ExpectedParts = 0.*$', ('$ExpectedParts = {0}   # stamped by packager' -f $parts.Count) |
+        Set-Content (Join-Path $stage "install.ps1")
+      Copy-Item $sevenZr $stage
+
+      # 3) Tiny payload archive + SFX assembly: module + config + payload.
+      $payload7z = ".\build\installer_payload.7z"
+      Remove-Item -ErrorAction SilentlyContinue $payload7z
+      7z a -t7z $payload7z "$stage\*"
+      if ($LASTEXITCODE -eq 0) {
+        # Assemble sfx-module + config + payload by DIRECT byte concatenation.
+        # The previous `cmd /c copy /b ("a + b + c") dest` passed the whole
+        # concat list as ONE quoted argument, so cmd searched for a single
+        # file literally named "a + b + c" -- and its error message went to
+        # Out-Null. (First-ever end-to-end run of this step caught it.)
+        # PowerShell owns the bytes now, and failures say WHY.
+        try {
+          $sfxParts = @($sfxModule,
+                        (Join-Path $instSrcDir "sfx_config.txt"),
+                        $payload7z)
+          $outPath = Join-Path (Get-Location) "$installBase.exe"
+          $outFs = [IO.File]::Create($outPath)
+          try {
+            foreach ($pf in $sfxParts) {
+              $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
+              $outFs.Write($bytes, 0, $bytes.Length)
+            }
+          } finally { $outFs.Close() }
+        } catch {
+          Write-Warning ("SFX assembly failed: {0}" -f $_.Exception.Message)
+        }
+      }
+
+      if (Test-Path "$installBase.exe") {
+        Write-Host "Installer parts:" -ForegroundColor Green
+        foreach ($p in ($parts + (Get-Item "$installBase.exe"))) {
+          $mb = [math]::Round($p.Length / 1MB, 2)
+          Write-Host ("  {0}  ({1} MB)" -f $p.Name, $mb) -ForegroundColor Green
+        }
+        Write-Host "Release ALL of the above together. The .exe verifies the volumes and names any missing file before extracting." -ForegroundColor Cyan
+      } else {
+        Write-Warning "Failed to assemble $installBase.exe."
+      }
+    }
   }
 } else {
   Write-Host "7z not found - skipping SFX installer (zip dist\$Name instead)." -ForegroundColor Gray

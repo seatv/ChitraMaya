@@ -762,3 +762,132 @@ if (stcBtn) {
     }
   });
 }
+
+// ── Console Drawer (Batch 23) ─────────────────────────────
+// Mirrors everything the process prints (batch rosters, skip reasons,
+// recovery banners, watchdog alarms) from /api/console into a collapsible
+// bottom-right drawer. Packaged .exe builds have no console window, so this
+// is the only place those messages are visible there. Polls at 1 Hz while
+// open with an incremental cursor; auto-scrolls unless the user scrolled up.
+(function _wireConsoleDrawer() {
+  // Batch 25: toggle is the in-flow "Console" section header in the right
+  // pane (under Encoder); the wide content panel (#cdPanel) stays a fixed
+  // overlay and carries the cd-open class itself.
+  const drawer = document.getElementById('cdPanel');
+  const toggle = document.getElementById('cdToggle');
+  const toggleIcon = document.getElementById('cdToggleIcon');
+  const body = document.getElementById('cdBody');
+  if (!drawer || !toggle || !body) return;
+
+  const MAX_DOM_LINES = 2000;
+  let cursor = 0;
+  let timer = null;
+
+  function atBottom() {
+    return (body.scrollHeight - body.scrollTop - body.clientHeight) < 30;
+  }
+
+  let lineCount = 0;
+
+  async function pull() {
+    const res = await apiGet('/api/console?since=' + cursor);
+    if (!res || res.error || !Array.isArray(res.lines)) return;
+    cursor = res.next || cursor;
+    if (!res.lines.length) return;
+    const stick = atBottom();
+    body.appendChild(document.createTextNode(res.lines.join('\n') + '\n'));
+    lineCount += res.lines.length;
+    // Trim so an all-night batch can't grow the drawer's DOM unbounded.
+    if (lineCount > MAX_DOM_LINES) {
+      const lines = body.textContent.split('\n');
+      body.textContent = lines.slice(lines.length - MAX_DOM_LINES).join('\n');
+      lineCount = MAX_DOM_LINES;
+    }
+    if (stick) body.scrollTop = body.scrollHeight;
+  }
+
+  function setOpen(open) {
+    drawer.classList.toggle('cd-open', open);
+    if (toggleIcon) toggleIcon.innerHTML = open ? '&#9660;' : '&#9650;';
+    if (open) {
+      pull();
+      if (!timer) timer = setInterval(pull, 1000);
+      body.scrollTop = body.scrollHeight;
+    } else if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  toggle.addEventListener('click', () => setOpen(!drawer.classList.contains('cd-open')));
+
+  // 26b: the open panel covers its own in-pane toggle, so it needs its own
+  // ways out -- the X in the panel header, and Esc.
+  const closeBtn = document.getElementById('cdClose');
+  if (closeBtn) closeBtn.addEventListener('click', () => setOpen(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && drawer.classList.contains('cd-open')) setOpen(false);
+  });
+})();
+
+// ── Elapsed clocks (Batch 25) ─────────────────────────────
+// Pure client-side wall clocks for the progress modal and the batch run
+// view: start when the view appears, tick every 500ms, FREEZE at the value
+// on screen when the flow reaches a terminal state (every terminal path
+// flips its button to 'Close'), reset when the view is dismissed. No
+// server involvement -- exactly the elapsed time the user waited.
+(function _wireElapsedClocks() {
+  function fmt(sec) {
+    sec = Math.floor(sec);
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+             : `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  const clocks = [
+    { // single-file progress modal (restore/censor/segment/swap flows)
+      visible: () => {
+        const m = document.getElementById('progressModal');
+        return m && !m.classList.contains('hidden');
+      },
+      out: () => document.getElementById('progressElapsed'),
+      terminal: () => {
+        const b = document.getElementById('progressCancel');
+        return b && b.textContent === 'Close';
+      },
+      t0: null, frozen: false,
+    },
+    { // batch run view inside the Process Folder modal
+      visible: () => {
+        const m = document.getElementById('batchModal');
+        const rv = document.getElementById('batchRun');
+        return m && !m.classList.contains('hidden') && rv && rv.style.display !== 'none';
+      },
+      out: () => document.getElementById('bmElapsed'),
+      terminal: () => {
+        const b = document.getElementById('batchStopBtn');
+        return b && b.textContent === 'Close';
+      },
+      t0: null, frozen: false,
+    },
+  ];
+
+  setInterval(() => {
+    for (const c of clocks) {
+      if (!c.visible()) { c.t0 = null; c.frozen = false; continue; }
+      if (c.t0 === null) { c.t0 = Date.now(); c.frozen = false; }
+      if (c.frozen) {
+        // 25e (field-caught): a NEW run in the same modal flips the button
+        // back from 'Close' to 'Stop' -- the frozen clock must RESTART,
+        // not keep displaying the previous run's time forever.
+        if (!c.terminal()) { c.t0 = Date.now(); c.frozen = false; }
+        else continue;
+      }
+      const el = c.out();
+      if (el) el.textContent = 'Elapsed ' + fmt((Date.now() - c.t0) / 1000);
+      if (c.terminal()) c.frozen = true;   // hold the final value on screen
+    }
+  }, 500);
+})();

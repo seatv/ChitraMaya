@@ -75,6 +75,8 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicDetBatch', 'ctrlMosaicDetImgsz', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
   'ctrlMosaicSbsSplit', 'ctrlMosaicVrProjection',
   'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
+  'ctrlMosaicSecondary',
+  'ctrlMosaicTemporalFix',
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
   'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
@@ -433,6 +435,9 @@ function gatherMosaicParams() {
       mosaic_blend_mask: document.getElementById('ctrlMosaicBlendMask').value,
       mosaic_use_seg_masks: document.getElementById('ctrlMosaicSegMasks').checked,
       mosaic_restoration_trt: document.getElementById('ctrlMosaicRestTrt').checked,
+      // CM-077: secondary restoration (RTX Super-Res upscale before paste-back)
+      mosaic_secondary: ((document.getElementById('ctrlMosaicSecondary') || {}).value || 'none'),
+      mosaic_temporal_stability: parseInt((document.getElementById('ctrlMosaicTemporalFix') || {}).value || '0', 10) || 0,
     },
     encoder: {
       codec: document.getElementById('ctrlCodec').value,
@@ -887,6 +892,229 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
 });
 
 
+// ── Batch Folder (CM-079 / Batch 23 queue UI) ─────────────
+// Folder picker + dual-list queue builder + live status board. The modal
+// calls /api/mosaic-folder-plan to see exactly what the batch planner sees
+// (own outputs excluded, output-exists annotated), the user builds the queue
+// by moving files, and the run view turns that queue into per-file status
+// rows driven by /api/progress's batch block.
+(function _wireBatchFolder() {
+  const openBtn   = document.getElementById('processFolderBtn');
+  const modal     = document.getElementById('batchModal');
+  if (!openBtn || !modal) return;
+
+  const setupView  = document.getElementById('batchSetup');
+  const runView    = document.getElementById('batchRun');
+  const folderEl   = document.getElementById('batchFolder');
+  const browseBtn  = document.getElementById('batchBrowseBtn');
+  const rescanBtn  = document.getElementById('batchRescanBtn');
+  const recurEl    = document.getElementById('batchRecursive');
+  const leftList   = document.getElementById('bmLeftList');
+  const rightList  = document.getElementById('bmRightList');
+  const leftCount  = document.getElementById('bmLeftCount');
+  const rightCount = document.getElementById('bmRightCount');
+  const addBtn     = document.getElementById('bmAddBtn');
+  const addAllBtn  = document.getElementById('bmAddAllBtn');
+  const removeBtn  = document.getElementById('bmRemoveBtn');
+  const startBtn   = document.getElementById('batchStartBtn');
+  const cancelBtn  = document.getElementById('batchCancelBtn');
+  const stopBtn    = document.getElementById('batchStopBtn');
+  const queueEl    = document.getElementById('bmQueueStatus');
+  const barEl      = document.getElementById('bmProgressBar');
+  const pctEl      = document.getElementById('bmProgressPct');
+  const fpsEl      = document.getElementById('bmProgressFps');
+  const sumEl      = document.getElementById('bmSummary');
+
+  let left = [];    // [{name, path, output_name, output_exists}] still in folder
+  let right = [];   // the queue, in processing order
+  let poll = null;
+
+  function _fmtSecs(s) {
+    s = Math.round(s);
+    const m = Math.floor(s / 60), r = s % 60;
+    return m ? `${m}m ${r}s` : `${r}s`;
+  }
+
+  function renderLists() {
+    leftList.innerHTML = '';
+    left.forEach((f, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = f.output_exists ? `${f.name}   [output exists]` : f.name;
+      if (f.output_exists) o.classList.add('bm-exists');
+      o.title = f.path;
+      leftList.appendChild(o);
+    });
+    rightList.innerHTML = '';
+    right.forEach((f, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = f.output_exists ? `${f.name}   [re-process -> -2]` : f.name;
+      o.title = f.path;
+      rightList.appendChild(o);
+    });
+    leftCount.textContent = String(left.length);
+    rightCount.textContent = String(right.length);
+    startBtn.disabled = right.length === 0;
+  }
+
+  async function rescan() {
+    const folder = (folderEl.value || '').trim();
+    if (!folder) { left = []; right = []; renderLists(); return; }
+    const params = gatherMosaicParams();
+    params.folder = folder;
+    params.recursive = recurEl.checked;
+    const res = await apiPost('/api/mosaic-folder-plan', { params });
+    if (res.error) { alert('Scan failed: ' + res.error); return; }
+    const files = res.files || [];
+    // Already-processed files start on the left (visible, grey); fresh ones
+    // go straight into the queue. This replaces the old invisible
+    // skip-existing checkbox with something you can see and override.
+    left  = files.filter(f => f.output_exists);
+    right = files.filter(f => !f.output_exists);
+    renderLists();
+  }
+
+  function moveSelected(fromList, fromArr, toArr) {
+    const idxs = Array.from(fromList.selectedOptions).map(o => parseInt(o.value, 10));
+    if (!idxs.length) return;
+    const moved = idxs.map(i => fromArr[i]);
+    idxs.sort((a, b) => b - a).forEach(i => fromArr.splice(i, 1));
+    moved.forEach(f => { if (!toArr.some(g => g.path === f.path)) toArr.push(f); });
+    renderLists();
+  }
+
+  openBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    setupView.style.display = '';
+    runView.style.display = 'none';
+    if ((folderEl.value || '').trim()) rescan(); else folderEl.focus();
+  });
+  cancelBtn.addEventListener('click', () => modal.classList.add('hidden'));
+  browseBtn.addEventListener('click', async () => {
+    const folder = await selectFolder();
+    if (folder) { folderEl.value = folder; await rescan(); }
+  });
+  rescanBtn.addEventListener('click', rescan);
+  folderEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') rescan(); });
+  recurEl.addEventListener('change', rescan);
+  addBtn.addEventListener('click', () => moveSelected(leftList, left, right));
+  removeBtn.addEventListener('click', () => moveSelected(rightList, right, left));
+  addAllBtn.addEventListener('click', () => {
+    left.forEach(f => { if (!right.some(g => g.path === f.path)) right.push(f); });
+    left = [];
+    renderLists();
+  });
+  leftList.addEventListener('dblclick', () => moveSelected(leftList, left, right));
+  rightList.addEventListener('dblclick', () => moveSelected(rightList, right, left));
+
+  function buildQueueRows(files) {
+    queueEl.innerHTML = '';
+    files.forEach((f) => {
+      const row = document.createElement('div');
+      row.className = 'bm-qrow bm-q-pending';
+      const nm = document.createElement('span');
+      nm.className = 'bm-qname'; nm.textContent = f.name; nm.title = f.path || f.name;
+      const st = document.createElement('span');
+      st.className = 'bm-qstate'; st.textContent = 'queued';
+      row.appendChild(nm); row.appendChild(st);
+      queueEl.appendChild(row);
+    });
+  }
+
+  function setRow(i, cls, text, titleText) {
+    const row = queueEl.children[i];
+    if (!row) return;
+    row.className = 'bm-qrow bm-q-' + cls;
+    const st = row.querySelector('.bm-qstate');
+    if (st) { st.textContent = text; if (titleText) st.title = titleText; }
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (!right.length) return;
+    const params = gatherMosaicParams();
+    params.folder = (folderEl.value || '').trim();
+    params.files = right.map(f => f.path);   // explicit queue, in order
+
+    // Same TRT-engine gate as the single-file runs.
+    const gate = await checkTensorBeforeRun();
+    if (!gate.proceed) { return; }
+    if (gate.override) {
+      if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
+      if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
+    }
+
+    const result = await apiPost('/api/mosaic-folder', { params });
+    if (result.error) { alert('Failed to start: ' + result.error); return; }
+
+    // Switch the modal to the run view: the queue becomes the status board.
+    setupView.style.display = 'none';
+    runView.style.display = '';
+    stopBtn.textContent = 'Stop';
+    buildQueueRows(right);
+    barEl.style.width = '0%';
+    pctEl.textContent = '0%';
+    fpsEl.textContent = '— fps';
+    sumEl.textContent = '';
+
+    poll = setInterval(async () => {
+      const prog = await apiGet('/api/progress');
+      if (!prog || (prog.error && !prog.status)) return;
+      const b = prog.batch || {};
+      const files = b.files || [];
+      const pct = prog.total > 0 ? Math.round((prog.frame / prog.total) * 100) : 0;
+
+      files.forEach((f, i) => {
+        if (f.status === 'processing') {
+          setRow(i, 'processing', `${pct}% (${prog.frame}/${prog.total}) @ ${prog.fps || '--'} fps`);
+        } else if (f.status === 'done') {
+          const secs = f.seconds ? ` in ${_fmtSecs(f.seconds)}` : '';
+          setRow(i, 'done', `done${secs}`);
+        } else if (f.status === 'skipped') {
+          setRow(i, 'skipped', `skipped (${f.error || 'output exists'})`);
+        } else if (f.status === 'error') {
+          setRow(i, 'error', 'FAILED -- hover for detail', f.error || '');
+        } else if (f.status === 'cancelled') {
+          setRow(i, 'cancelled', 'cancelled');
+        } else {
+          setRow(i, 'pending', 'queued');
+        }
+      });
+
+      barEl.style.width = pct + '%';
+      pctEl.textContent = `File ${b.index || 0}/${b.total || files.length} — ${pct}%`;
+      fpsEl.textContent = `${prog.fps || '—'} fps`;
+      sumEl.textContent =
+        `${b.done || 0} done, ${b.skipped || 0} skipped, ${b.errors || 0} error(s)`;
+
+      if (prog.status === 'complete' || prog.status === 'cancelled' || prog.status === 'error') {
+        clearInterval(poll);
+        poll = null;
+        barEl.style.width = '100%';
+        pctEl.textContent =
+          prog.status === 'complete' ? 'Batch complete' :
+          prog.status === 'cancelled' ? 'Batch cancelled' : 'Batch error';
+        sumEl.textContent = b.summary || prog.error || sumEl.textContent;
+        stopBtn.textContent = 'Close';
+        _updateRestorationButtonStates();
+      }
+    }, 500);
+
+    stopBtn.onclick = async () => {
+      if (!poll) {  // terminal state -- Close resets the modal for next time
+        modal.classList.add('hidden');
+        setupView.style.display = '';
+        runView.style.display = 'none';
+        return;
+      }
+      // Cancel stops the batch between files (the in-flight file finishes).
+      await apiPost('/api/cancel');
+      stopBtn.textContent = 'Stopping after current file...';
+    };
+  });
+})();
+
+
 // Preview (toggle player between /video and /preview-video)
 // Mirrors face-swap previewBtn — server.preview_path was set by
 // /api/mosaic-segment, /preview-video serves whatever's at that path.
@@ -1270,6 +1498,84 @@ if (manageModelsBtn) manageModelsBtn.addEventListener('click', openManageModels)
 let _foiRegions = [];      // latest results
 let _foiOpenIdx = null;    // region index currently enlarged over the player, or null
 
+// Batch 28: Test Frame result history -- the last N successful results for
+// the SAME frame, so consecutive runs with different knobs (scaler on/off,
+// temporal stability, feather...) can be flipped through in the enlarge's
+// right pane via the < > navigator next to its label. The left (mosaic)
+// pane always shows the current run; only the right pane time-travels.
+// The stack clears whenever the tested frame number changes.
+const _FOI_HIST_MAX = 5;
+let _foiHistory = [];      // [{regions, tag}], oldest -> newest
+let _foiHistFrame = null;  // frame number the history belongs to
+let _foiHistPos = 0;       // entry currently shown in the right pane
+
+// Compact per-run tag (tooltip on the counter): capture time + the knobs
+// most likely to differ between consecutive test runs on one frame.
+function _foiRunTag(params) {
+  const m = (params && params.mosaic) || {};
+  const parts = [];
+  parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
+  if (m.mosaic_secondary && m.mosaic_secondary !== 'none') {
+    parts.push('Scaler:' + m.mosaic_secondary);
+  }
+  if (m.mosaic_temporal_stability > 0) parts.push('TS:' + m.mosaic_temporal_stability);
+  if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') {
+    parts.push('Blend:' + m.mosaic_blend_mask);
+    if (m.mosaic_feather_radius > 0) parts.push('Feather:' + m.mosaic_feather_radius);
+  }
+  if (m.mosaic_censor) parts.push('Censor:' + m.mosaic_censor_block);
+  const t = new Date();
+  const pad = (x) => String(x).padStart(2, '0');
+  return `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`
+    + ' · ' + parts.join(' · ');
+}
+
+// Render the enlarge's right pane + navigator from the history stack.
+// Batch 28b: numbered slots (1 = oldest kept, rightmost = newest) between
+// the < > steppers give one-click random access; each slot's tooltip is
+// that run's time + settings tag, readable without leaving the current run.
+function _foiHistRender() {
+  const rest = document.getElementById('zoomImage');
+  const nav = document.getElementById('foiHistNav');
+  const dots = document.getElementById('foiHistDots');
+  const prev = document.getElementById('foiHistPrev');
+  const next = document.getElementById('foiHistNext');
+  if (!rest) return;
+  const n = _foiHistory.length;
+  if (_foiOpenIdx === null || n === 0) {
+    if (nav) nav.classList.add('hidden');
+    return;
+  }
+  if (_foiHistPos < 0) _foiHistPos = 0;
+  if (_foiHistPos >= n) _foiHistPos = n - 1;
+  const entry = _foiHistory[_foiHistPos];
+  const r = entry.regions[_foiOpenIdx];
+  rest.src = (r && r.restored) ? ('data:image/jpeg;base64,' + r.restored) : '';
+  if (nav) {
+    nav.classList.remove('hidden');
+    if (dots) {
+      dots.innerHTML = '';
+      _foiHistory.forEach((en, i) => {
+        const d = document.createElement('span');
+        d.className = 'foi-hist-dot' + (i === _foiHistPos ? ' foi-hist-cur' : '');
+        d.textContent = String(i + 1);
+        const rr = en.regions[_foiOpenIdx];
+        d.title = en.tag
+          + (i === n - 1 ? ' · newest' : '')
+          + ((rr && rr.restored) ? '' : ' · (no such region in this run)');
+        d.addEventListener('click', (e) => {
+          e.stopPropagation();
+          _foiHistPos = i;
+          _foiHistRender();
+        });
+        dots.appendChild(d);
+      });
+    }
+    if (prev) prev.classList.toggle('foi-hist-off', _foiHistPos === 0);
+    if (next) next.classList.toggle('foi-hist-off', _foiHistPos === n - 1);
+  }
+}
+
 // Test Frame pane labels: in Add Mosaic (censor) mode the "before" is the
 // clean original and the "after" is the pixelated result.
 function _foiPaneLabels() {
@@ -1361,6 +1667,17 @@ async function runFoiPreview() {
       _closeFoiEnlarge();
       return;
     }
+
+    // Batch 28: push this result onto the frame's history stack. A new
+    // frame starts a fresh stack; the cap drops the oldest. Position snaps
+    // to the newest so the enlarge always lands on what just ran.
+    if (_foiHistFrame !== res.frame) {
+      _foiHistory = [];
+      _foiHistFrame = res.frame;
+    }
+    _foiHistory.push({ regions: _foiRegions, tag: _foiRunTag(params) });
+    if (_foiHistory.length > _FOI_HIST_MAX) _foiHistory.shift();
+    _foiHistPos = _foiHistory.length - 1;
     const cell = (label, b64) => {
       const img = b64
         ? `<img class="foi-img" src="data:image/jpeg;base64,${b64}" alt="${label}">`
@@ -1409,13 +1726,16 @@ function openFoiEnlarge(idx) {
   if (!overlay || !orig || !rest) return;
 
   // Labels: censor mode = Original|Censored, else Mosaic|Restored.
+  // Batch 28: the right label text lives in its own span (#zoomLabelRight)
+  // so setting it can't clobber the history navigator markup next to it.
   const _lbl = _foiPaneLabels();
   const labels = overlay.querySelectorAll('.zoom-label');
   if (labels[0]) labels[0].textContent = _lbl[0];
-  if (labels[1]) labels[1].textContent = _lbl[1];
+  const rlab = document.getElementById('zoomLabelRight');
+  if (rlab) rlab.textContent = _lbl[1];
 
   orig.src = r.mosaic ? ('data:image/jpeg;base64,' + r.mosaic) : '';
-  rest.src = r.restored ? ('data:image/jpeg;base64,' + r.restored) : '';
+  _foiHistRender();   // right pane + < > navigator from the history stack
   overlay.classList.add('foi-mode');
   overlay.classList.remove('hidden');
   if (typeof state !== 'undefined') state.zoomOpen = true;
@@ -1437,6 +1757,11 @@ function _closeFoiEnlarge() {
   const rest = document.getElementById('zoomImage');
   if (orig) orig.src = '';
   if (rest) rest.src = '';
+  // Batch 28: hide the history navigator so it can't linger if the overlay
+  // is ever reused outside foi-mode. The stack itself survives -- reopening
+  // a pair on the same frame resumes where you were.
+  const _nav = document.getElementById('foiHistNav');
+  if (_nav) _nav.classList.add('hidden');
   if (typeof state !== 'undefined') state.zoomOpen = false;
   document.querySelectorAll('#foiRegions .foi-row').forEach((el) => {
     el.classList.remove('foi-row-active');
@@ -1451,6 +1776,9 @@ if (_foiBtn) _foiBtn.addEventListener('click', runFoiPreview);
 function _foiReset() {
   _foiRegions = [];
   _foiOpenIdx = null;
+  _foiHistory = [];        // Batch 28: new video, new history
+  _foiHistFrame = null;
+  _foiHistPos = 0;
   if (_foiRunning) _foiRunning = false;
   const c = document.getElementById('foiRegions');
   if (c) c.innerHTML = '';
@@ -1460,6 +1788,21 @@ function _foiReset() {
 }
 const _foiZoomClose = document.getElementById('zoomClose');
 if (_foiZoomClose) _foiZoomClose.addEventListener('click', _closeFoiEnlarge);
+
+// Batch 28: history navigator clicks (< older, > newer). Bounds are
+// clamped and the end buttons disabled inside _foiHistRender.
+const _foiHistPrevBtn = document.getElementById('foiHistPrev');
+const _foiHistNextBtn = document.getElementById('foiHistNext');
+if (_foiHistPrevBtn) _foiHistPrevBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  _foiHistPos -= 1;
+  _foiHistRender();
+});
+if (_foiHistNextBtn) _foiHistNextBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  _foiHistPos += 1;
+  _foiHistRender();
+});
 
 // Keep the button label in sync with the playhead.
 if (typeof player !== 'undefined' && player) {

@@ -6,5 +6,9 @@
   {
     "name": "zelefans (VR)",
     "url": "https://huggingface.co/zelefans/vrmr/tree/main"
+  },
+  {
+    "name": "ERAx",
+    "url": "https://huggingface.co/erax-ai/EraX-Anti-NSFW-V1.1/tree/main"
   }
 ]

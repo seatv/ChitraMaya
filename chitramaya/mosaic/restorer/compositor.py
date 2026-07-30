@@ -16,8 +16,49 @@ def _unpad_any(img: torch.Tensor, pad: Pad) -> torch.Tensor:
 
 
 def _resize_img_u8(img_u8: torch.Tensor, shape_hw: Tuple[int, int]) -> torch.Tensor:
-    # HWC uint8 -> resize to (h,w) with INTER_LINEAR
+    # HWC uint8 -> resize to (h,w) with INTER_LINEAR (the CUDA resize path
+    # supports only LINEAR/NEAREST, so this stays LINEAR for both grow and
+    # shrink -- including the post-secondary downscale).
     return image_utils.resize(img_u8, size=shape_hw, interpolation=cv2.INTER_LINEAR)
+
+
+def _scale_pad(pad: Pad, scale: int) -> Pad:
+    # Pad offsets live in clip-crop space; after a secondary upscale the image
+    # is scale x larger, so the unpad offsets scale with it.
+    return tuple(int(p) * int(scale) for p in pad)  # type: ignore[return-value]
+
+
+def _apply_secondary(
+    clip_img_u8: torch.Tensor,
+    orig_shape_hw: Tuple[int, int],
+    secondary,
+    frame_num: int | None = None,
+) -> Tuple[torch.Tensor, int]:
+    """CM-077: optionally upscale a restored (still padded) clip frame.
+
+    Returns (image, scale). scale=1 means untouched (secondary off, gated
+    off for small regions, or frame size unexpected).
+
+    CM-077b: every offered crop is recorded into secondary.stats (seen /
+    upscaled / gated-small / bad-geometry, plus the frame number when the
+    upscale actually ran) so the run summary can report whether -- and
+    exactly WHERE -- the scaler kicked in."""
+    if secondary is None:
+        return clip_img_u8, 1
+    _st = getattr(secondary, "stats", None)
+    if not secondary.should_apply(orig_shape_hw):
+        if _st is not None:
+            _st.note(frame_num, orig_shape_hw, "small")
+        return clip_img_u8, 1
+    if (clip_img_u8.shape[0] != secondary.min_apply_size
+            or clip_img_u8.shape[1] != secondary.min_apply_size):
+        if _st is not None:
+            _st.note(frame_num, orig_shape_hw, "geom")
+        return clip_img_u8, 1  # unexpected geometry -- keep the proven path
+    out = secondary.upscale_frame_bgr_u8(clip_img_u8)
+    if _st is not None:
+        _st.note(frame_num, orig_shape_hw, "applied")
+    return out, int(secondary.scale)
 
 
 def _resize_mask_u8(mask_u8: torch.Tensor, shape_hw: Tuple[int, int]) -> torch.Tensor:
@@ -26,7 +67,8 @@ def _resize_mask_u8(mask_u8: torch.Tensor, shape_hw: Tuple[int, int]) -> torch.T
         if mask_u8.ndim == 2:
             mask_ch = mask_u8.unsqueeze(-1)  # HWC(1)
             out = image_utils.resize(mask_ch, size=shape_hw, interpolation=cv2.INTER_NEAREST)
-            return out[:, :, 0]
+            # CPU path goes through cv2, which drops the singleton channel.
+            return out if out.ndim == 2 else out[:, :, 0]
         return image_utils.resize(mask_u8, size=shape_hw, interpolation=cv2.INTER_NEAREST)
 
     # numpy path (unlikely in gRestorer, but keep parity)
@@ -118,12 +160,18 @@ def composite_clip_into_store(
     border_ratio: float = 0.05,
     blendmask: str = "none",
     feather_radius: int = 0,
+    secondary=None,
 ) -> None:
     """
     Port of LADA FrameRestorer._restore_frame applied over an entire clip.
 
     blendmask / feather_radius select the paste-back alpha (see
     _blend_into_frame_lada). Defaults ("none", 0) preserve the legacy behavior.
+
+    secondary (CM-077): optional RTX Super-Res stage. When set, restored
+    frames whose original region exceeds the clip size are upscaled 2x/4x
+    before paste-back, so the final resize shrinks instead of stretching.
+    Masks stay in clip space (they carry no detail worth upscaling).
     """
     n = min(len(restored_frames_u8), len(clip.frame_nums))
     for i in range(n):
@@ -138,8 +186,12 @@ def composite_clip_into_store(
         orig_shape_hw = clip.crop_shapes[i]
         pad: Pad = clip.pad_after_resizes[i]
 
-        # Unpad back to resized crop dims
-        clip_img = _unpad_any(clip_img, pad)
+        # CM-077: secondary upscale BEFORE unpad (fixed-size model input).
+        clip_img, sec_scale = _apply_secondary(
+            clip_img, orig_shape_hw, secondary, frame_num=frame_num)
+
+        # Unpad back to resized crop dims (image offsets scale with the upscale)
+        clip_img = _unpad_any(clip_img, _scale_pad(pad, sec_scale))
         clip_mask = _unpad_any(clip_mask, pad)
 
         # Resize back to original crop size

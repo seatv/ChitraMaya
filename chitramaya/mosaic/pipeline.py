@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import queue as _queue
 import sys as _sys
 import threading as _threading
@@ -486,6 +487,35 @@ class Pipeline:
         # Built lazily on the first frame (needs frame dims + device).
         self._vrproj = None
 
+        # CM-077 (Batch 20): optional secondary restoration -- RTX Super-Res
+        # upscale of restored crops before paste-back. Validated against the
+        # shared mode list; the effect itself is built in run() (needs device)
+        # with graceful fallback if nvvfx/driver support is missing.
+        self.secondary_restoration: str = str(
+            self.cfg.get("secondary_restoration", default="none") or "none"
+        ).lower()
+        # CM-078 (Batch 26): temporal stabilization strength (0=off, 1..3).
+        self.temporal_stability: int = int(
+            self.cfg.get("temporal_stability", default=0) or 0
+        )
+        from chitramaya.mosaic.restorer.temporal_stabilizer import (
+            TEMPORAL_STABILITY_LEVELS,
+        )
+        if self.temporal_stability not in TEMPORAL_STABILITY_LEVELS:
+            raise ValueError(
+                f"Invalid temporal_stability: {self.temporal_stability!r} "
+                f"(valid: {TEMPORAL_STABILITY_LEVELS})"
+            )
+        self._stabilizer = None
+
+        from chitramaya.mosaic.restorer.rtx_secondary import SECONDARY_MODES
+        if self.secondary_restoration not in SECONDARY_MODES:
+            raise ValueError(
+                f"Invalid secondary_restoration: {self.secondary_restoration!r} "
+                f"(expected one of {SECONDARY_MODES})"
+            )
+        self._secondary = None
+
         self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
         self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
         self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
@@ -760,6 +790,22 @@ class Pipeline:
             max_frames=32,
         )
 
+    def _stabilize_restored(self, restored):
+        """CM-078: apply the temporal stabilizer to a clip's restored crops.
+
+        A stabilization failure must never abort a run: on the first error
+        we warn once, disable the stabilizer for the remainder, and return
+        the frames unmodified."""
+        if self._stabilizer is None:
+            return restored
+        try:
+            return self._stabilizer.stabilize_clip(restored)
+        except Exception as e:
+            print(f"[TemporalFix] WARNING: stabilization failed ({e}); "
+                  f"disabled for the rest of this run.")
+            self._stabilizer = None
+            return restored
+
     def run(
         self,
         *,
@@ -810,6 +856,23 @@ class Pipeline:
         metrics.wall_start = _dt.datetime.now()
         t0_all = time.perf_counter()
 
+        # Batch VRAM hygiene (Batch 23c): in a warm server / folder batch the
+        # PREVIOUS file's FrameStore + activations linger in PyTorch's caching
+        # allocator after their tensors are freed. Torch itself could reuse
+        # that cache, but NVDEC, NVENC, the Maxine secondary, and TRT contexts
+        # allocate OUTSIDE torch and cannot see it -- in the field (5060 Ti
+        # 8 GB, 6-file 4K batch) the hoarded cache read as "free VRAM after
+        # models: ~0 MB" from file 2 onward and starved NVENC mid-run
+        # (nvEncLockBitstream error 8). Hand the cache back to the driver
+        # before building this file's decoder/encoder.
+        if self.device.type == "cuda":
+            import gc as _gc
+            _gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
         decoder = Decoder(
             input_path=str(inp),
             gpu_id=self.dec_gpu_id,
@@ -853,6 +916,84 @@ class Pipeline:
                   f"(FOV 180, eye {w // 2}x{h}, grids ~{self._vrproj.vram_estimate_mb():.0f} MB). "
                   f"Detection/tracking/restoration run in fisheye space; restored "
                   f"regions are inverse-warped onto the original frames.")
+
+        # CM-077: build the secondary restorer BEFORE the FrameStore sizes
+        # itself, so Maxine's allocation is measured into the VRAM budget.
+        # Applies only in real restoration -- pixelation (censor) and flat
+        # fills (preview) must never be "enhanced".
+        if self.secondary_restoration != "none" and self._secondary is None:
+            from chitramaya.mosaic.restorer.rtx_secondary import scale_for_mode
+            _sec_scale = scale_for_mode(self.secondary_restoration)
+            if self.mode != "real":
+                print("[Secondary] Note: secondary restoration applies only to real "
+                      "restoration; ignored in preview/censor mode.")
+            elif self.rest_clip_size != 256:
+                print(f"[Secondary] WARNING: RTX Super-Res requires clip size 256 "
+                      f"(configured: {self.rest_clip_size}); running without secondary.")
+            else:
+                try:
+                    from chitramaya.mosaic.restorer.rtx_secondary import (
+                        RtxSecondaryRestorer,
+                    )
+                    self._secondary = RtxSecondaryRestorer(
+                        device=self.device, scale=_sec_scale,
+                        input_size=self.rest_clip_size,
+                    )
+                    print(f"[Secondary] RTX Super-Res ACTIVE: {_sec_scale}x "
+                          f"(256 -> {256 * _sec_scale}, quality=high). Restored regions "
+                          f"larger than 256 px are upscaled before paste-back; smaller "
+                          f"regions keep the standard path.")
+                except Exception as _sec_err:
+                    print(f"[Secondary] WARNING: RTX Super-Res unavailable "
+                          f"({_sec_err}); running without secondary. It needs an RTX "
+                          f"GPU, a recent NVIDIA driver, and the nvidia-vfx package "
+                          f"(pip install nvidia-vfx).")
+                    self._secondary = None
+        # CM-077b: fresh stats every run. The server keeps this pipeline
+        # (and its warm secondary) alive across runs and across every file
+        # of a folder batch; without a reset the [SecStats] numbers would
+        # accumulate over files and lie about the current one.
+        if self._secondary is not None:
+            from chitramaya.mosaic.restorer.rtx_secondary import SecondaryStats
+            self._secondary.stats = SecondaryStats()
+
+        # CM-078 (Batch 26): temporal stabilizer -- smooths per-frame
+        # restoration/VSR shimmer across each clip's restored crops BEFORE
+        # paste-back (and before the secondary, whose per-frame variance it
+        # removes at the source). Real restoration only; only restored
+        # pixels are ever touched. Weights degrade gracefully to a WARNING.
+        if self.temporal_stability > 0 and self._stabilizer is None:
+            if self.mode != "real":
+                print("[TemporalFix] Note: temporal stabilization applies only "
+                      "to real restoration; ignored in preview/censor mode.")
+            else:
+                from chitramaya.mosaic.restorer.temporal_stabilizer import (
+                    bundled_weights_dir, load_temporal_stabilizer,
+                    model_file_for_strength,
+                )
+                # Batch 29: bundled weights LAST so user-placed copies (next
+                # to the restoration model, or in ./models) still override.
+                _ts_dirs = [
+                    os.path.dirname(self.rest_model) if self.rest_model else "",
+                    "models",
+                    bundled_weights_dir(),
+                ]
+                self._stabilizer, _ts_err = load_temporal_stabilizer(
+                    device=self.device, strength=self.temporal_stability,
+                    search_dirs=_ts_dirs, clip_size=self.rest_clip_size,
+                )
+                if self._stabilizer is not None:
+                    print(f"[TemporalFix] Temporal stabilization ACTIVE: "
+                          f"strength {self.temporal_stability} "
+                          f"({model_file_for_strength(self.temporal_stability)}, "
+                          f"7-frame window over restored regions only).")
+                else:
+                    print(f"[TemporalFix] WARNING: temporal stabilization "
+                          f"unavailable ({_ts_err}); running without it. The "
+                          f"weights normally ship inside ChitraMaya (Batch 29) "
+                          f"-- if the bundled copy is missing, reinstall, or "
+                          f"place the vs_temporalfix .pth files next to the "
+                          f"restoration model or in models/.")
 
         # ChitraMaya's Encoder has a slimmer signature than gRestorer's.
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
@@ -928,6 +1069,15 @@ class Pipeline:
         # up-front if the config is likely to page instead of failing silently.
         final_cap = requested_cap
         if requested_cap > 0:
+            # Batch 23c: measure AFTER releasing torch's cache, so the sizing
+            # sees true availability instead of the previous file's freed-but-
+            # cached frames (which read as "0 MB free" and shrank the store
+            # for no reason in warm batches).
+            if self.device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             _free_b, _total_b = _vram_free_total(self.device)
             if _free_b is not None:
                 # Reserve = base + the async NVENC queue's real BGRA footprint
@@ -1222,6 +1372,7 @@ class Pipeline:
                     for clip in step.new_clips:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
+                        restored = self._stabilize_restored(restored)  # CM-078
                         if self._vrproj is not None:
                             composite_clip_into_store_projected(
                                 clip=clip,
@@ -1231,6 +1382,7 @@ class Pipeline:
                                 model_dtype=restorer.model_dtype,
                                 blendmask=self.rest_blendmask,
                                 feather_radius=self.feather_radius,
+                                secondary=self._secondary,
                             )
                         else:
                             composite_clip_into_store(
@@ -1240,6 +1392,7 @@ class Pipeline:
                                 model_dtype=restorer.model_dtype,
                                 blendmask=self.rest_blendmask,
                                 feather_radius=self.feather_radius,
+                                secondary=self._secondary,
                             )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
@@ -1310,6 +1463,22 @@ class Pipeline:
                 except Exception:
                     # A misbehaving UI callback must never crash the pipeline.
                     pass
+
+        # CM-081 (Batch 23): stall watchdog + PCIe link canary. Armed only
+        # around the main loop -- model builds / TRT compiles (which can
+        # legitimately take minutes) happen before this point, and the EOF
+        # flush of a final long clip happens after stop(). stall_seconds<=0
+        # disables it (config: monitoring.watchdog_stall_seconds).
+        from chitramaya.mosaic.watchdog import StallWatchdog
+        _wd_stall = float(self.cfg.get("monitoring", "watchdog_stall_seconds",
+                                       default=120))
+        _watchdog = StallWatchdog(
+            lambda: int(metrics.processed_frames),
+            stall_seconds=_wd_stall,
+            gpu_index=self.dec_gpu_id,
+            label=str(Path(self.input_path).name),
+        )
+        _watchdog.start()
 
         try:
             if use_thread_prefetch:
@@ -1476,6 +1645,13 @@ class Pipeline:
             # output, reports). On a clean exit, cleanup errors still raise.
             _inflight_exc = _sys.exc_info()[0] is not None
 
+            # Watchdog off first: the EOF flush below can legitimately spend
+            # a long time restoring one final long clip -- not a stall.
+            try:
+                _watchdog.stop()
+            except Exception:
+                pass
+
             # Stop producer safely and avoid deadlock if it is blocked on a full queue.
             stop.set()
             if prod is not None:
@@ -1501,14 +1677,34 @@ class Pipeline:
                 if tracker is not None and restorer is not None:
                     for clip in tracker.flush_eof():
                         restored = restorer.restore_clip(clip)
-                        composite_clip_into_store(
-                            clip=clip,
-                            restored_frames_u8=restored,
-                            store_bgr_u8=store.frames_bgr_u8,
-                            model_dtype=restorer.model_dtype,
-                            blendmask=self.rest_blendmask,
-                            feather_radius=self.feather_radius,
-                        )
+                        restored = self._stabilize_restored(restored)  # CM-078
+                        # Batch 26 fix: the EOF flush previously omitted
+                        # secondary= entirely, so end-of-video clips silently
+                        # skipped the RTX Super-Res upscale (and, when VR
+                        # projection was active, this flat composite is also
+                        # wrong -- but projected runs route their EOF clips
+                        # through the same tracker, so parity matters).
+                        if self._vrproj is not None:
+                            composite_clip_into_store_projected(
+                                clip=clip,
+                                restored_frames_u8=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                vrproj=self._vrproj,
+                                model_dtype=restorer.model_dtype,
+                                blendmask=self.rest_blendmask,
+                                feather_radius=self.feather_radius,
+                                secondary=self._secondary,
+                            )
+                        else:
+                            composite_clip_into_store(
+                                clip=clip,
+                                restored_frames_u8=restored,
+                                store_bgr_u8=store.frames_bgr_u8,
+                                model_dtype=restorer.model_dtype,
+                                blendmask=self.rest_blendmask,
+                                feather_radius=self.feather_radius,
+                                secondary=self._secondary,
+                            )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
                         if (_foi_target is not None
@@ -1679,6 +1875,15 @@ class Pipeline:
             else:
                 clip_min = clip_max = clip_med = 0
                 clip_mean = 0.0
+            # CM-076: how many clips actually HIT the Max Clip Length cap?
+            # Observed lengths run to cap+~3 (TTL grace), so count len>=cap.
+            # This is the quality-vs-VRAM dial's instrument: capped=0 means a
+            # bigger MCL buys nothing on this content; a high percentage
+            # means scenes are being chopped and a larger MCL (or the jumpy-
+            # boundary risk of a smaller one) is worth thinking about.
+            _mcl = int(self.rest_max_clip_length)
+            capped = sum(1 for x in clip_lens if _mcl > 0 and x >= _mcl)
+            capped_pct = round(100.0 * capped / n_clips, 1) if n_clips else 0.0
 
             print(
                 f"[RestStats] restored={fr}/{ft} "
@@ -1690,8 +1895,52 @@ class Pipeline:
             )
             print(
                 f"[ClipStats] clips={n_clips} total_clip_frames={total_clip_frames} "
-                f"len_min={clip_min} len_med={clip_med} len_max={clip_max} len_mean={clip_mean}"
+                f"len_min={clip_min} len_med={clip_med} len_max={clip_max} len_mean={clip_mean} "
+                f"capped={capped} ({capped_pct}% at MCL={_mcl})"
             )
+
+            # CM-077b: did the secondary (RTX Super-Res) actually fire, and
+            # where? The gate opens only for crops whose original region
+            # exceeds the clip size (256px longest side), so on some content
+            # it legitimately never engages -- largest_crop_px tells you
+            # whether that is this content or a bug. Frames with an upscale
+            # are listed in the misses JSON (secondary_upscaled_frames) for
+            # seek-and-inspect A/B at exactly those frames.
+            _sec_stats = getattr(self._secondary, "stats", None) \
+                if self._secondary is not None else None
+            if _sec_stats is not None:
+                _sec_pct = round(
+                    100.0 * _sec_stats.crops_upscaled / _sec_stats.crops_seen, 1
+                ) if _sec_stats.crops_seen else 0.0
+                print(
+                    f"[SecStats] mode={self.secondary_restoration} "
+                    f"crops_seen={_sec_stats.crops_seen} "
+                    f"upscaled={_sec_stats.crops_upscaled} ({_sec_pct}%) "
+                    f"skipped_small={_sec_stats.skipped_small} "
+                    f"skipped_geom={_sec_stats.skipped_geom} "
+                    f"largest_crop_px={_sec_stats.largest_px} "
+                    f"(gate opens above {self._secondary.min_apply_size}px) "
+                    f"frames_with_upscale={len(_sec_stats.applied_frames)}"
+                )
+                # CM-077c: WHERE is that largest crop? Print the top frames
+                # ranked by crop size -- the seek list for inspecting the
+                # scaler where its contribution is biggest. Full top-20 (with
+                # per-frame px) lands in the misses JSON.
+                _sec_top = _sec_stats.top_frames(20)
+                if _sec_top:
+                    _preview = ", ".join(
+                        f"{t['frame']}({t['crop_px']}px)" for t in _sec_top[:5])
+                    print(f"[SecStats] biggest-crop frames: {_preview} "
+                          f"-- top 20 in the misses JSON "
+                          f"(secondary_biggest_frames)")
+                if _sec_stats.crops_upscaled == 0:
+                    print(
+                        f"[SecStats] Secondary never engaged: no crop exceeded "
+                        f"{self._secondary.min_apply_size}px on its longest side "
+                        f"(largest seen: {_sec_stats.largest_px}px). This content "
+                        f"pastes back at or below the restorer's native size, so "
+                        f"there is nothing for the scaler to add."
+                    )
 
             # Write misses JSON next to the output. Lists are sorted for
             # readability + reproducibility. The actionable list is
@@ -1737,6 +1986,29 @@ class Pipeline:
                         "len_max": int(clip_max),
                         "len_mean": float(clip_mean),
                     },
+                    # CM-077b: secondary (RTX Super-Res) engagement. Only
+                    # present when the stage was active this run. The frame
+                    # list is the seek-and-inspect tool: pause on one of
+                    # these frames and Test Frame with the scaler on/off to
+                    # see its contribution on real pixels.
+                    "secondary": None if _sec_stats is None else {
+                        "mode": str(self.secondary_restoration),
+                        "crops_seen": int(_sec_stats.crops_seen),
+                        "crops_upscaled": int(_sec_stats.crops_upscaled),
+                        "skipped_small": int(_sec_stats.skipped_small),
+                        "skipped_geom": int(_sec_stats.skipped_geom),
+                        "largest_crop_px": int(_sec_stats.largest_px),
+                        "gate_threshold_px": int(self._secondary.min_apply_size),
+                        "frames_with_upscale": len(_sec_stats.applied_frames),
+                    },
+                    "secondary_upscaled_frames": sorted(_sec_stats.applied_frames)
+                        if _sec_stats is not None else [],
+                    # CM-077c: frames ranked by biggest crop (largest first,
+                    # px = longest side of the original region). Seek to
+                    # these to see the scaler where it matters most; entry 0
+                    # is the frame behind largest_crop_px.
+                    "secondary_biggest_frames": _sec_stats.top_frames(20)
+                        if _sec_stats is not None else [],
                     "visible_miss_frames": sorted(miss_set),
                     "restoration_miss_frames": sorted(restoration_miss_set),
                     "gap_fill_frames": sorted(gap_fill_set),
@@ -1867,6 +2139,12 @@ class MosaicPipelineConfig:
     # CM-045: "none" | "fisheye" — per-eye hequirect->fisheye analysis warp
     # for studios that apply mosaic in viewing space (requires sbs_enabled).
     vr_projection: str = "none"
+    # CM-077: "none" | "rtx-2x" | "rtx-4x" — RTX Super-Res upscale of restored
+    # crops before paste-back (real restoration mode only; needs nvidia-vfx).
+    secondary_restoration: str = "none"
+    # CM-078: 0 = off, 1..3 = vs_temporalfix strength — temporal stabilization
+    # of restored crops (7-frame window; real restoration mode only).
+    temporal_stability: int = 0
     store_max_frames: int = 0
     det_imgsz: int = 640
     det_iou: float = 0.70
@@ -1894,7 +2172,9 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "mask_opacity", "censor", "censor_block", "detection_fp16", "restoration_fp16", "use_trt",
     "codec", "preset", "qp", "async_encoder", "write_diagnostics",
     "sbs_enabled", "sbs_layout",
-    "sbs_det_split", "vr_projection", "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
+    "sbs_det_split", "vr_projection", "secondary_restoration",
+    "temporal_stability",
+    "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
     "use_seg_masks", "feather_radius", "blendmask",
 })
 _MPC_INERT_FIELDS = frozenset({
@@ -1979,6 +2259,8 @@ class MosaicPipeline:
             "sbs_layout": str(getattr(c, "sbs_layout", "lr")),
             "sbs_det_split": bool(getattr(c, "sbs_det_split", False)),
             "vr_projection": str(getattr(c, "vr_projection", "none") or "none"),
+            "secondary_restoration": str(getattr(c, "secondary_restoration", "none") or "none"),
+            "temporal_stability": int(getattr(c, "temporal_stability", 0) or 0),
             "roi_dilate": int(getattr(c, "roi_dilate", 0)),
             "use_seg_masks": bool(getattr(c, "use_seg_masks", True)),
             "detection": {

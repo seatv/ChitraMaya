@@ -61,11 +61,66 @@ datas.append((str(project_root / "chitramaya" / "static"), "chitramaya/static"))
 datas.append((str(project_root / "chitramaya" / "templates"), "chitramaya/templates"))
 # ultralytics ships yaml/config data files it loads at runtime.
 datas += collect_data_files("ultralytics", include_py_files=False)
+# Batch 29: bundled temporal-stabilizer weights (vs_temporalfix, Apache-2.0;
+# upstream LICENSE ships in the same dir). Placed at the SAME package path
+# as in the source tree so bundled_weights_dir() resolves identically in
+# the frozen build. Without these, Temporal Stability silently degrades to
+# a WARNING on every user machine -- the ledger below fails the build if
+# they are absent.
+datas.append((str(project_root / "chitramaya" / "mosaic" / "restorer" / "weights"),
+              "chitramaya/mosaic/restorer/weights"))
 
 # ── Hidden imports ─────────────────────────────────────────────────────────
 hiddenimports = []
 hiddenimports += collect_submodules("chitramaya")
 hiddenimports += collect_submodules("tools")          # -restore / -compile-* subcommands
+
+# ── New-module existence check (belt & braces) ─────────────────────────────
+# collect_submodules walks the package AS PRESENT ON DISK at build time, so
+# a new module that never landed in this repo (the WinMerge new-file blind
+# spot -- same class as the missing installer-scripts incident) disappears
+# from the build SILENTLY and surfaces as "No module named ..." on an end
+# user's machine. Fail the build loudly instead, naming what to integrate.
+_expected_modules = [
+    ("chitramaya/mosaic/batch.py",    "Batch 22 folder batch"),
+    ("chitramaya/mosaic/watchdog.py", "Batch 23 stall watchdog"),
+    ("chitramaya/console_buffer.py",  "Batch 23/24 console drawer + log"),
+    ("chitramaya/winproc.py",         "Batch 24 no-window subprocesses"),
+    ("chitramaya/mosaic/restorer/temporalfix_arch.py",
+                                      "Batch 26 temporal stabilizer arch"),
+    ("chitramaya/mosaic/restorer/temporal_stabilizer.py",
+                                      "Batch 26 temporal stabilizer"),
+    # Batch 29: data files ride the same ledger -- a missing weights file
+    # would not crash the build OR the app, just silently ship a Temporal
+    # Stability dial that warns-and-disables on every user machine.
+    ("chitramaya/mosaic/restorer/weights/temporalfix_s1_v1.1.pth",
+                                      "Batch 29 bundled stabilizer weights s1"),
+    ("chitramaya/mosaic/restorer/weights/temporalfix_s2_v1.pth",
+                                      "Batch 29 bundled stabilizer weights s2"),
+    ("chitramaya/mosaic/restorer/weights/temporalfix_s3_v1.pth",
+                                      "Batch 29 bundled stabilizer weights s3"),
+    ("chitramaya/mosaic/restorer/weights/LICENSE-vs_temporalfix.txt",
+                                      "Batch 29 upstream Apache-2.0 license"),
+]
+_missing_modules = [(p, why) for (p, why) in _expected_modules
+                    if not (project_root / p).is_file()]
+if _missing_modules:
+    for _p, _why in _missing_modules:
+        print(f"[spec] MISSING: {_p}  ({_why})")
+    raise SystemExit(
+        "[spec] FATAL: the module file(s) above are not in this repo -- the "
+        "build would package WITHOUT them and crash on users' machines with "
+        "'No module named ...'. Integrate the batch zip(s) that add them, "
+        "then re-run the packager."
+    )
+# Explicit entries too, in case a future refactor makes any of these
+# reachable only via function-level or dynamic import.
+hiddenimports += [
+    "chitramaya.mosaic.batch", "chitramaya.mosaic.watchdog",
+    "chitramaya.console_buffer", "chitramaya.winproc",
+    "chitramaya.mosaic.restorer.temporalfix_arch",
+    "chitramaya.mosaic.restorer.temporal_stabilizer",
+]
 hiddenimports += collect_submodules("ultralytics")
 hiddenimports += collect_submodules("cv2")
 hiddenimports += collect_submodules("torch")
@@ -117,6 +172,29 @@ for pkg in ("webview", "pythonnet", "clr_loader"):
     except Exception:
         pass
 
+# ── CM-077 Secondary Restoration: NVIDIA Maxine binding (pip: nvidia-vfx) ──
+# The importable package is `nvvfx`; its wheel carries the Python binding
+# plus Maxine DLLs and model payloads that PyInstaller has no hook for, so
+# collect_all is required. Optional at BUILD time to mirror the runtime
+# graceful fallback: without nvidia-vfx in the release venv the build still
+# succeeds and the packaged app prints its [Secondary] WARNING if the user
+# selects RTX Super-Res. The prints below make the build's capability
+# explicit so a missing wheel never ships silently by accident — check the
+# build log for "BUNDLED" before a release that advertises Secondary.
+# Clean-machine validation: run the packaged exe with Secondary = RTX 2x on
+# a short clip; "[Secondary] RTX Super-Res ACTIVE" = packaging complete.
+try:
+    _nv_d, _nv_b, _nv_h = collect_all("nvvfx")
+    datas += _nv_d
+    binaries += _nv_b
+    hiddenimports += _nv_h
+    print(f"[spec] nvvfx (RTX Super-Res secondary): BUNDLED "
+          f"({len(_nv_d)} data files, {len(_nv_b)} dynamic libs)")
+except Exception as _nv_err:
+    print(f"[spec] nvvfx (RTX Super-Res secondary): NOT bundled ({_nv_err}). "
+          f"Packaged app will run with Secondary unavailable — "
+          f"'pip install nvidia-vfx' in the release venv to include it.")
+
 runtime_hooks = [
     str(project_root / "packaging" / "windows" / "pyinstaller_runtime_hook_chitramaya.py")
 ]
@@ -148,6 +226,17 @@ print(f"[spec] TRT builder filter: {_before} -> {len(a.binaries)} binaries "
 
 pyz = PYZ(a.pure)
 
+# Batch 24: two bootloaders, one shared onedir build.
+#   ChitraMaya.exe      windowed (console=False) -- the UI. All console
+#                       output is mirrored to the in-app Console drawer and
+#                       to ChitraMaya-console.log next to the exe, so no
+#                       terminal window opens or is needed.
+#   ChitraMaya-cli.exe  console -- for the terminal workflows (-restore,
+#                       -compile-rest, -compile-det) which need live stdout/
+#                       tqdm in PowerShell. A windowed exe detaches from the
+#                       calling console and would print NOTHING there.
+# Both EXEs are tiny bootloaders sharing the same COLLECT payload, so the
+# install size is unchanged (+~2 MB for the second bootloader).
 exe = EXE(
     pyz,
     a.scripts,
@@ -158,13 +247,29 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,          # UPX on CUDA DLLs is risky; keep off for reliability
-    console=True,       # ChitraMaya logs heavily to console; keep it visible
+    console=False,      # UI build: no terminal; Console drawer + log file
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+)
+
+exe_cli = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name=f"{NAME}-cli",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,       # CLI build: live stdout/tqdm in the terminal
     disable_windowed_traceback=False,
     argv_emulation=False,
 )
 
 coll = COLLECT(
     exe,
+    exe_cli,
     a.binaries,
     a.datas,
     strip=False,

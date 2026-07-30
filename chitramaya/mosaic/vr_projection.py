@@ -333,12 +333,16 @@ def composite_clip_into_store_projected(
     model_dtype: torch.dtype,
     blendmask: str = "none",
     feather_radius: int = 0,
+    secondary=None,
 ) -> None:
     """Projected variant of compositor.composite_clip_into_store: identical
     unpad/resize/alpha steps, but the paste-back inverse-warps each region
-    from fisheye space onto the original hequirect frame."""
+    from fisheye space onto the original hequirect frame.
+
+    secondary (CM-077): same optional RTX Super-Res stage as the standard
+    compositor -- upscale before unpad, image offsets scale accordingly."""
     from chitramaya.mosaic.restorer.compositor import (
-        _resize_img_u8, _resize_mask_u8, _unpad_any,
+        _apply_secondary, _resize_img_u8, _resize_mask_u8, _scale_pad, _unpad_any,
     )
     from chitramaya.mosaic.utils import mask_utils
 
@@ -355,7 +359,10 @@ def composite_clip_into_store_projected(
         orig_shape_hw = clip.crop_shapes[i]
         pad = clip.pad_after_resizes[i]
 
-        clip_img = _unpad_any(clip_img, pad)
+        clip_img, sec_scale = _apply_secondary(
+            clip_img, orig_shape_hw, secondary, frame_num=frame_num)
+
+        clip_img = _unpad_any(clip_img, _scale_pad(pad, sec_scale))
         clip_mask = _unpad_any(clip_mask, pad)
         clip_img = _resize_img_u8(clip_img, orig_shape_hw)
         clip_mask = _resize_mask_u8(clip_mask, orig_shape_hw)

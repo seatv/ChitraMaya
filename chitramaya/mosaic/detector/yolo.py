@@ -273,7 +273,14 @@ class MosaicDetectionModel:
                 pred_logits = out.get("pred", out.get(0, None))
                 protos = out.get("proto", out.get("protos", out.get(1, None)))
             else:
-                raise RuntimeError("YOLO model output did not include protos (segmentation). Check weights/model type.")
+                # CM-072 field fix (7/21/2026, EraX NSFW): DETECTION-only
+                # models (no segmentation head) return a plain prediction
+                # tensor — no protos. Route to the boxes-only path below
+                # instead of failing. (A detect model may ALSO return a
+                # (pred, feature-maps) tuple depending on version — that
+                # case is caught per-prediction by the nm==0 check below.)
+                pred_logits = out
+                protos = None
 
             # Normalize protos to a tensor or list/tuple of tensors
             if isinstance(protos, dict):
@@ -318,6 +325,33 @@ class MosaicDetectionModel:
         for i, pred in enumerate(preds):
             if pred is None or not len(pred):
                 dets.append(FrameDetections(orig_size=(w, h)))
+                continue
+
+            # CM-072 field fix: a DETECTION-only model (e.g. EraX NSFW) has no
+            # mask coefficients — its NMS output is exactly 6 columns (xyxy,
+            # conf, cls). pred[:, 6:] would be 0-wide and process_mask crashes
+            # with "mat1 and mat2 shapes cannot be multiplied (Nx0 ...)".
+            # Emit boxes-only detections (masks=None); downstream the tracker
+            # builds rectangular box-masks, which errs safe for censoring.
+            _nm = int(pred.shape[1]) - 6
+            if _nm <= 0 or protos is None:
+                if not getattr(self, "_boxes_only_logged", False):
+                    print("[Detector] Detection-only model (no segmentation "
+                          "head): using rectangular box regions. Expected for "
+                          "detection models like EraX; lada models provide "
+                          "segmentation masks.")
+                    self._boxes_only_logged = True
+                boxes_in = pred[:, :4].detach().clone()
+                boxes = ops.scale_boxes(x.shape[2:], boxes_in, (h, w, 3))
+                dets.append(
+                    FrameDetections(
+                        boxes_xyxy=boxes.detach().to(torch.float32).cpu(),
+                        scores=pred[:, 4].detach().to(torch.float32).cpu(),
+                        classes=pred[:, 5].detach().to(torch.int64).cpu(),
+                        masks=None,
+                        orig_size=(w, h),
+                    )
+                )
                 continue
 
             # Defensive clones: some Ultralytics utilities do in-place ops on their inputs
