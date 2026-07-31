@@ -32,7 +32,7 @@ from chitramaya.mosaic.restorer.compositor import composite_clip_into_store
 from chitramaya.mosaic.vr_projection import composite_clip_into_store_projected
 from chitramaya.mosaic.utils.config_util import Config
 from chitramaya.video.decoder import Decoder
-from chitramaya.video.encoder import Encoder
+from chitramaya.video.encoder import Encoder, FfmpegEncoder, nvenc_available
 
 from .pipeline_utils import (
     Box,
@@ -330,6 +330,12 @@ def _vram_free_total(device: torch.device) -> Tuple[Optional[int], Optional[int]
         if device.type == "cuda":
             free, total = torch.cuda.mem_get_info(device)
             return int(free), int(total)
+        if device.type == "xpu":
+            # CM-093: driver-level free where the build offers it, else
+            # (None, total) -- callers already treat free=None as "cannot
+            # measure" and skip the warning rather than guess.
+            from chitramaya.device import mem_get_info as _dev_mgi
+            return _dev_mgi(device)
     except Exception:
         pass
     return None, None
@@ -865,13 +871,11 @@ class Pipeline:
         # models: ~0 MB" from file 2 onward and starved NVENC mid-run
         # (nvEncLockBitstream error 8). Hand the cache back to the driver
         # before building this file's decoder/encoder.
-        if self.device.type == "cuda":
+        if self.device.type in ("cuda", "xpu"):
             import gc as _gc
             _gc.collect()
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            from chitramaya.device import empty_cache as _dev_empty_cache
+            _dev_empty_cache(self.device)   # CM-093: device-generic
 
         decoder = Decoder(
             input_path=str(inp),
@@ -1002,7 +1006,10 @@ class Pipeline:
             # FOI preview: capture-only. Never encode or mux (see _DiscardEncoder).
             encoder = _DiscardEncoder()
         else:
-            encoder = Encoder(
+            # CM-093 X3: NVENC on NVIDIA (unchanged path); ffmpeg backend
+            # (Intel QSV / software) everywhere else.
+            _EncCls = Encoder if nvenc_available() else FfmpegEncoder
+            encoder = _EncCls(
                 output_path=str(out),
                 width=w,
                 height=h,
@@ -1073,11 +1080,9 @@ class Pipeline:
             # sees true availability instead of the previous file's freed-but-
             # cached frames (which read as "0 MB free" and shrank the store
             # for no reason in warm batches).
-            if self.device.type == "cuda":
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
+            if self.device.type in ("cuda", "xpu"):
+                from chitramaya.device import empty_cache as _dev_empty_cache
+                _dev_empty_cache(self.device)   # CM-093: device-generic
             _free_b, _total_b = _vram_free_total(self.device)
             if _free_b is not None:
                 # Reserve = base + the async NVENC queue's real BGRA footprint
@@ -2400,5 +2405,7 @@ class MosaicPipeline:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.empty_cache()      # CM-093 (no xpu ipc_collect)
         except Exception as e:
             print(f"[mosaic] WARNING: GPU cleanup during pipeline close failed: {e}")

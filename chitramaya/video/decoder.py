@@ -19,7 +19,15 @@ import subprocess
 from chitramaya.winproc import NOWINDOW
 
 import torch
-import PyNvVideoCodec as nvc
+
+# CM-093 X1: PyNvVideoCodec is NVIDIA-only and absent on the Intel Arc /
+# XPU build. Guarded import so this module (and everything that imports
+# it) loads anywhere; the backend selection below routes to the existing
+# ffmpeg CPU decode when nvc is unavailable.
+try:
+    import PyNvVideoCodec as nvc
+except Exception:  # ImportError normally; any failure means no NVDEC
+    nvc = None
 
 
 @dataclass
@@ -90,6 +98,14 @@ class Decoder:
         skip_nvdec, skip_reason = self._should_skip_nvdec_preflight()
 
         if self._force_cpu:
+            self.backend = "ffmpeg-cpu"
+            self._init_ffmpeg_cpu_backend()
+        elif nvc is None:
+            # CM-093 X1: non-NVIDIA build (e.g. Intel Arc). The ffmpeg CPU
+            # fallback is a first-class backend here until X2 brings an
+            # accelerated path.
+            print("[Decoder] PyNvVideoCodec not available (non-NVIDIA build); "
+                  "using ffmpeg CPU decode.")
             self.backend = "ffmpeg-cpu"
             self._init_ffmpeg_cpu_backend()
         elif skip_nvdec:

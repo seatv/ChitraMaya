@@ -109,8 +109,18 @@ class TemporalStabilizer:
         )
         model.load_state_dict(state, strict=True)
         model.eval().to(self.device)
-        self._fp16 = (self.device.type == "cuda"
-                      and torch.cuda.get_device_capability(self.device)[0] >= 7)
+        # CM-093 channels_last experiment: default OFF (field-measured
+        # SLOWER in eager on the restorer -- transpose tax around
+        # NCHW-forcing ops; see basicvsrpp_clip_restorer.py). Env-gated
+        # for future graph-compile experiments.
+        import os as _os
+        if (self.device.type == "xpu"
+                and _os.environ.get("CM_XPU_CHANNELS_LAST", "") == "1"):
+            from chitramaya.device import enable_channels_last_convs
+            enable_channels_last_convs(model)
+        # CM-093: device-aware fp16 (CUDA Volta+; XPU validated in phase 0).
+        from chitramaya.device import fp16_supported
+        self._fp16 = fp16_supported(self.device)
         if self._fp16:
             model.half()
         self._model = model

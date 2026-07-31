@@ -177,7 +177,9 @@ class VRProjection:
         self._grid_inv: Optional[torch.Tensor] = None   # (1, eh, ew, 2)
         self._canvas_img: Optional[torch.Tensor] = None    # (1, 3, eh, ew) float
         self._canvas_alpha: Optional[torch.Tensor] = None  # (1, 1, eh, ew) float
-        self._float_dtype = torch.float16 if device.type == "cuda" else torch.float32
+        self._float_dtype = (torch.float16
+                             if device.type in ("cuda", "xpu")  # CM-093
+                             else torch.float32)
 
     # -- grid construction ---------------------------------------------------
 

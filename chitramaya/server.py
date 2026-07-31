@@ -368,9 +368,10 @@ class SwapServer:
                                time_sec, len(result.stdout), w * h * 3)
                 return ""
 
-            # Load to GPU as CHW uint8 tensor
+            # Load to GPU as CHW uint8 tensor (CM-093: device-portable)
+            from chitramaya.device import pick_device
             frame_np = np.frombuffer(result.stdout, dtype=np.uint8).reshape(h, w, 3)
-            frame = torch.from_numpy(frame_np.copy()).to(f'cuda:{self.gpu_id}').permute(2, 0, 1)
+            frame = torch.from_numpy(frame_np.copy()).to(pick_device(self.gpu_id)).permute(2, 0, 1)
 
             # Cache for detection/swap
             self._current_frame_num = int(time_sec * info.get("fps", 30.0))
@@ -467,6 +468,15 @@ class SwapServer:
         model reload.
         """
         from chitramaya.mosaic.pipeline import MosaicPipeline
+
+        # CM-093 debug tap: what did the server actually RECEIVE? Field
+        # event on Arc: UI checkbox said Restoration FP16 on, restorer ran
+        # fp32 -- this line pins which side of the POST dropped it.
+        print(f"[mosaic] request: det_trt={bool(mosaic_cfg.mosaic_detection_trt)} "
+              f"det_fp16={bool(mosaic_cfg.mosaic_detection_fp16)} "
+              f"rest_trt={bool(mosaic_cfg.mosaic_restoration_trt)} "
+              f"rest_fp16={bool(mosaic_cfg.mosaic_restoration_fp16)} "
+              f"mcl={int(mosaic_cfg.mosaic_max_clip_size)}")
 
         # If TRT restoration is requested but the requested clip size has no
         # exact compiled sub-engine set: the compiled sets are DYNAMIC-batch
@@ -1364,8 +1374,15 @@ class SwapServer:
                 "-an",
                 seg_input,
             ]
-            proc = subprocess.run(extract_cmd, capture_output=True, text=True,
-                                  timeout=180, encoding="utf-8", errors="replace", **NOWINDOW)
+            try:
+                proc = subprocess.run(extract_cmd, capture_output=True, text=True,
+                                      timeout=180, encoding="utf-8", errors="replace", **NOWINDOW)
+            except FileNotFoundError:
+                # X1b: ffmpeg itself is missing -- return a clear, actionable
+                # error to the UI instead of a raw 500 traceback.
+                return {"error": "ffmpeg not found on PATH. Install the ffmpeg "
+                                 "'full' build (gyan.dev) and restart ChitraMaya "
+                                 "from a fresh shell."}
             if proc.returncode != 0:
                 return {"error": f"FOI extract failed: {proc.stderr[-200:]}"}
 
@@ -2572,6 +2589,20 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
     time.sleep(0.5)
 
     print(f"[ChitraMaya] Server running at {url}")
+
+    # X1b: ffmpeg/ffprobe preflight. They are required for video load
+    # metadata, Test Frame extraction, CPU decode, and remux -- but a
+    # missing binary used to surface as cryptic "[WinError 2]" errors deep
+    # inside Test Frame (field event on the first Arc bring-up). Say it
+    # once, loudly, at startup instead. (The packaged build ships them in
+    # bin/ on PATH; this mainly protects source-checkout runs.)
+    import shutil as _shutil
+    _ff_missing = [x for x in ("ffmpeg", "ffprobe") if _shutil.which(x) is None]
+    if _ff_missing:
+        print(f"[ChitraMaya] WARNING: {' and '.join(_ff_missing)} NOT FOUND "
+              f"on PATH. Loading videos, Test Frame, CPU decode, and saving "
+              f"outputs will fail until installed. Install the ffmpeg 'full' "
+              f"build (gyan.dev) and restart ChitraMaya from a fresh shell.")
 
     # Try PyWebView
     try:

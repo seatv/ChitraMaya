@@ -117,7 +117,7 @@ def _blend_into_frame_lada(
         # Legacy LADA rectangular blend mask.
         blend_mask = mask_utils.create_blend_mask(clip_mask_u8.float())
 
-    if frame_bgr_u8.device.type != "cuda":
+    if frame_bgr_u8.device.type not in ("cuda", "xpu"):  # CM-093: xpu takes the GPU path
         # CPU/numpy path (matches LADA CPU semantics: astype(uint8) truncation)
         frame_roi_np = frame_roi.detach().cpu().numpy()  # view if contiguous
         roi_np = frame_roi_np.astype(np.float32, copy=False)

@@ -24,7 +24,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-import PyNvVideoCodec as nvc
+
+# CM-093 X1: PyNvVideoCodec is NVIDIA-only and absent on the Intel Arc /
+# XPU build. Guarded import so the module loads anywhere; the Encoder
+# constructor raises a clear message instead (QSV encode is CM-093 X3).
+try:
+    import PyNvVideoCodec as nvc
+except Exception:
+    nvc = None
 
 
 def _raw_ext(codec: str) -> str:
@@ -319,6 +326,15 @@ class Encoder:
         multipass: str = "disabled",
         temporal_aq: bool = False,
     ) -> None:
+        # CM-093 X1: encoding is NVENC-only until X3 (ffmpeg/QSV backend).
+        # Fail at construction with a clear story, not deep in NVENC setup.
+        if nvc is None:
+            raise RuntimeError(
+                "Encoding requires NVENC (PyNvVideoCodec), which is not "
+                "available on this system (non-NVIDIA GPU?). Analysis, "
+                "detection and Test Frame previews work; encoding on Intel "
+                "Arc (QSV) arrives with CM-093 X3."
+            )
         self.output_path = str(output_path)
         self.input_path = str(input_path) if input_path else None
         self.width = int(width)
@@ -864,3 +880,287 @@ def rgbp_to_packed(
     out_hwc4[..., 3] = 255           # A
 
     return out_hwc4
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CM-093 X3: ffmpeg-subprocess encoder backend for non-NVIDIA machines
+# ═══════════════════════════════════════════════════════════════════════════
+
+def nvenc_available() -> bool:
+    """True when PyNvVideoCodec imported (NVIDIA build). The pipeline uses
+    this to choose Encoder (NVENC) vs FfmpegEncoder (QSV/software)."""
+    return nvc is not None
+
+
+class FfmpegEncoder:
+    """CM-093 X3: encoding for machines without NVENC (Intel Arc, CPU-only).
+
+    Same construction signature and encode_frame/flush/close contract as
+    Encoder, so the pipeline swaps classes and nothing else changes. Video
+    goes to an ffmpeg subprocess over stdin as raw BGRA frames; the encoder
+    is chosen by a runtime probe:
+
+      1. Intel QSV (hevc_qsv / h264_qsv / av1_qsv) -- Arc's hardware media
+         engine via libvpl (the gyan.dev 'full' ffmpeg builds include it).
+      2. Software fallback (libx265 / libx264 / libsvtav1) with a loud
+         banner when QSV is unavailable (no Intel GPU / driver / libvpl).
+
+    The video-only stream is written to <output>.venc.mp4 as a FRAGMENTED
+    mp4 (crash-tolerant: a killed run still leaves decodable video), then
+    close() remuxes audio from the source with the same A/V start-offset
+    handling as the NVENC path, faststart, and the right fourcc tag.
+    ffmpeg-managed AV1 carries in-band sequence headers natively, so there
+    is no CM-091 seek-fix analog here.
+
+    QP semantics match the UI's HEVC 0-51 scale: QSV gets it as
+    -global_quality (ICQ), x264/x265 as -crf, SVT-AV1 as -crf (0-63 scale,
+    same value = same intent). Preset P1-P7 maps to the speed ladders.
+    """
+
+    _QSV = {"hevc": "hevc_qsv", "h265": "hevc_qsv",
+            "h264": "h264_qsv", "avc": "h264_qsv", "av1": "av1_qsv"}
+    _SW = {"hevc": "libx265", "h265": "libx265",
+           "h264": "libx264", "avc": "libx264", "av1": "libsvtav1"}
+    _P2SPEED = {"P1": "veryfast", "P2": "faster", "P3": "fast", "P4": "medium",
+                "P5": "slow", "P6": "slower", "P7": "veryslow"}
+    _P2SVT = {"P1": "10", "P2": "9", "P3": "8", "P4": "7",
+              "P5": "6", "P6": "4", "P7": "2"}
+
+    def __init__(
+        self,
+        output_path: str | Path,
+        width: int,
+        height: int,
+        fps: float,
+        codec: str = "hevc",
+        preset: str = "P7",
+        qp: int = 15,
+        gpu_id: int = 0,
+        input_path: str | Path | None = None,
+        mux_audio: bool = True,
+        mp4_faststart: bool = True,
+        mux_extra_args: str = "",
+        ffmpeg_path: str = "ffmpeg",
+        **_ignored,   # NVENC-only quality kwargs arrive here harmlessly
+    ) -> None:
+        self.output_path = str(output_path)
+        self.input_path = str(input_path) if input_path else None
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(fps)
+        self.fps_str = _fps_to_rational(fps)
+        self.codec = str(codec).lower()
+        self.preset = str(preset).upper() if str(preset).upper() in self._P2SPEED else "P5"
+        self.qp = int(qp)
+        self.mux_audio = bool(mux_audio)
+        self.mp4_faststart = bool(mp4_faststart)
+        self.ffmpeg_path = str(ffmpeg_path)
+        self._frames_encoded = 0
+        self._closed = False
+        self._proc = None
+
+        if self.codec not in self._QSV:
+            raise ValueError(f"FfmpegEncoder: unsupported codec {self.codec!r}")
+
+        self._venc_path = self.output_path + ".venc.mp4"
+        self._stderr_path = self.output_path + ".venc.stderr.log"
+
+        # Pick the encoder: QSV probe first, software fallback second.
+        qsv_name = self._QSV[self.codec]
+        sw_name = self._SW[self.codec]
+        if self._probe_encoder(qsv_name):
+            self._enc_name = qsv_name
+            self._enc_args = ["-global_quality", str(self.qp),
+                              "-preset", self._P2SPEED[self.preset]]
+            hw = "Intel QSV hardware"
+        elif self._probe_encoder(sw_name):
+            self._enc_name = sw_name
+            if sw_name == "libsvtav1":
+                self._enc_args = ["-crf", str(min(63, self.qp)),
+                                  "-preset", self._P2SVT[self.preset]]
+            else:
+                self._enc_args = ["-crf", str(self.qp),
+                                  "-preset", self._P2SPEED[self.preset]]
+            hw = "SOFTWARE (CPU)"
+            print(f"[Encoder] WARNING: Intel QSV ({qsv_name}) unavailable -- "
+                  f"falling back to {sw_name} on the CPU. Expect slow encodes; "
+                  f"check the Intel GPU driver and that ffmpeg has libvpl.")
+        else:
+            raise RuntimeError(
+                f"No usable encoder for {self.codec}: neither {qsv_name} nor "
+                f"{sw_name} works in this ffmpeg build. Install the ffmpeg "
+                f"'full' build (gyan.dev)."
+            )
+
+        cmd = [
+            self.ffmpeg_path, "-hide_banner", "-y", "-loglevel", "warning",
+            "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-s", f"{self.width}x{self.height}", "-r", self.fps_str,
+            "-i", "-",
+            "-an",
+            "-c:v", self._enc_name, *self._enc_args,
+            "-pix_fmt", "nv12" if self._enc_name.endswith("_qsv") else "yuv420p",
+            # Crash-tolerant temp container: fragmented mp4 stays decodable
+            # if the run dies; close() rewrites it properly with faststart.
+            # -flush_packets 1 forces the header+fragments out of ffmpeg's
+            # I/O buffer promptly, so even an early kill leaves a readable
+            # file (container-tested: without it, moov can sit unflushed).
+            "-movflags", "+frag_keyframe+empty_moov",
+            "-flush_packets", "1",
+            self._venc_path,
+        ]
+        print(f"[Encoder] ffmpeg backend: {self._enc_name} ({hw}) "
+              f"{self.width}x{self.height} @ {self.fps:.2f}fps "
+              f"{self.codec}/{self.preset}/QP{self.qp}")
+        self._stderr_f = open(self._stderr_path, "w", encoding="utf-8")
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=self._stderr_f, **NOWINDOW,
+        )
+
+    # -- probe --------------------------------------------------------------
+
+    def _probe_encoder(self, enc_name: str) -> bool:
+        """2-frame null encode: proves the encoder initializes on THIS
+        machine (presence in -encoders does not imply a working driver)."""
+        try:
+            r = subprocess.run(
+                [self.ffmpeg_path, "-hide_banner", "-v", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x128:r=30:d=0.1",
+                 "-c:v", enc_name, "-f", "null", "-"],
+                capture_output=True, timeout=30, **NOWINDOW,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # -- streaming ----------------------------------------------------------
+
+    def encode_frame(self, frame: "torch.Tensor") -> None:
+        """BGRA HWC4 uint8 tensor, any device (cuda/xpu/cpu)."""
+        if self._closed or self._proc is None:
+            return
+        if frame.device.type != "cpu":
+            from chitramaya.device import sync as _dev_sync
+            _dev_sync(frame.device)
+            frame = frame.to("cpu")
+        try:
+            self._proc.stdin.write(frame.contiguous().numpy().tobytes())
+        except (BrokenPipeError, OSError):
+            raise RuntimeError(
+                f"ffmpeg encoder died mid-run ({self._enc_name}). "
+                f"Last stderr: {self._stderr_tail()}"
+            ) from None
+        self._frames_encoded += 1
+
+    def flush(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            rc = self._proc.wait(timeout=900)
+            if rc != 0:
+                print(f"[Encoder] WARNING: ffmpeg exited rc={rc}: "
+                      f"{self._stderr_tail()}")
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            print("[Encoder] WARNING: ffmpeg flush timed out; killed.")
+        finally:
+            try:
+                self._stderr_f.close()
+            except Exception:
+                pass
+        print(f"[Encoder] Flushed ({self._frames_encoded} frames)")
+
+    def _stderr_tail(self, n: int = 400) -> str:
+        try:
+            with open(self._stderr_path, "r", encoding="utf-8",
+                      errors="replace") as f:
+                return f.read()[-n:].strip() or "(empty)"
+        except Exception:
+            return "(stderr unavailable)"
+
+    # -- finalize -----------------------------------------------------------
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.flush()
+
+        venc = Path(self._venc_path)
+        if not venc.exists() or self._frames_encoded == 0:
+            print(f"[Encoder] Nothing to finalize ({self._frames_encoded} frames).")
+            return
+
+        tag = {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
+               "avc": "avc1", "av1": "av01"}.get(self.codec, "hvc1")
+
+        # A/V start-offset handling: identical intent to the NVENC path.
+        video_delay = 0.0
+        audio_delay = 0.0
+        has_audio = bool(self.mux_audio and self.input_path
+                         and Path(self.input_path).exists())
+        if has_audio:
+            ffprobe = _derive_ffprobe(self.ffmpeg_path)
+            v_start = _probe_stream_start_seconds(ffprobe, self.input_path, "v:0")
+            a_start = _probe_stream_start_seconds(ffprobe, self.input_path, "a:0")
+            if v_start is not None and a_start is not None:
+                rel = v_start - a_start
+                if rel > 1e-4:
+                    video_delay = rel
+                elif rel < -1e-4:
+                    audio_delay = -rel
+        duration = video_delay + (self._frames_encoded / self.fps
+                                  if self.fps > 0 else 0)
+
+        cmd = [self.ffmpeg_path, "-hide_banner", "-y", "-loglevel", "warning"]
+        if has_audio:
+            if audio_delay:
+                cmd += ["-itsoffset", f"{audio_delay:.6f}"]
+            cmd += ["-i", self.input_path]
+            if video_delay:
+                cmd += ["-itsoffset", f"{video_delay:.6f}"]
+            cmd += ["-i", str(venc),
+                    "-map", "1:v:0", "-c:v", "copy", "-tag:v", tag,
+                    "-map", "0:a?", "-c:a", "copy"]
+        else:
+            cmd += ["-i", str(venc),
+                    "-map", "0:v:0", "-c:v", "copy", "-tag:v", tag]
+        if self.mp4_faststart:
+            cmd += ["-movflags", "+faststart"]
+        cmd += ["-video_track_timescale", "90000"]
+        if duration > 0:
+            cmd += ["-t", f"{duration:.3f}"]
+        cmd += [self.output_path]
+
+        print(f"[Encoder] remux: {' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=900, **NOWINDOW)
+            ok = (r.returncode == 0)
+            if not ok:
+                for line in (r.stderr or "").strip().split("\n")[-5:]:
+                    print(f"  {line}")
+        except Exception as e:
+            ok = False
+            print(f"[Encoder] remux error: {e}")
+
+        if ok:
+            print("[Encoder] remux OK")
+            try:
+                venc.unlink()
+                Path(self._stderr_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            print(f"[Encoder] Done: {self.output_path}")
+        else:
+            print(f"[Encoder] *** REMUX FAILED -- {self.output_path} is NOT "
+                  f"complete. Video-only stream preserved at: {venc} "
+                  f"(fragmented mp4; playable). Re-wrap manually with: "
+                  f'ffmpeg -i "{venc}" -c copy -movflags +faststart out.mp4')
+
+
+# (Encoder, FfmpegEncoder, nvenc_available are imported explicitly by the
+# pipeline; no __all__ needed.)

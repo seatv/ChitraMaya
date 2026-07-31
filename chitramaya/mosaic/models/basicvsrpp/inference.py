@@ -152,8 +152,8 @@ def load_model(
 
     model = _BasicVSRPPWrapper(generator=generator).to(device).eval()
 
-    # fp16 only makes sense on CUDA; keep it safe
-    use_fp16 = bool(fp16) and device.type == "cuda"
+    # fp16 on CUDA and XPU (CM-093 phase-0 validated); CPU stays fp32.
+    use_fp16 = bool(fp16) and device.type in ("cuda", "xpu")
     if use_fp16:
         model = model.half()
 

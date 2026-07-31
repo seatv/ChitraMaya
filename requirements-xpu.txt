@@ -1,4 +1,4 @@
-# ChitraMaya requirements — Intel Arc / XPU TESTBED variant (CM-093)
+# ChitraMaya requirements — Intel Arc / XPU TESTBED variant (CM-093) - validated
 #
 # Derived from requirements.txt (the authoritative CUDA list). This is the
 # BRING-UP environment for the XPU port: PyTorch-only inference on an Intel

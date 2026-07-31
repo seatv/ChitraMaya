@@ -555,7 +555,9 @@ class AsyncEncoder:
         # guaranteed complete before NVENC reads via DMA on the worker.
         # Per-stream sync, not cudaDeviceSynchronize — blocks main only
         # for its own stream, not other threads' GPU work.
-        if self._device is not None:
+        if self._device is not None and self._device.type == "cuda":
+            # CM-093: AsyncEncoder is NVENC-only, so this stays a CUDA
+            # stream sync; the guard just makes the path device-safe.
             import torch
             torch.cuda.current_stream(self._device).synchronize()
         # Bounded put + error re-check loop (queue full → natural
