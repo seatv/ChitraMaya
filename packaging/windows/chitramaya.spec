@@ -36,6 +36,42 @@ args = parse_args()
 NAME = args.name
 project_root = get_project_root()
 
+# ── Version guardrail (Batch 31) ───────────────────────────────────────────
+# v1.20 AND v1.30 both shipped with a stale __version__ (title bar said
+# 1.20.00 for two releases) because the bump relied on release-day memory.
+# Enforce it here instead: read the single-source constant, announce it
+# loudly, and refuse to build a version that is already on the released
+# list. Workflow: bump chitramaya/__init__.py -> build -> publish -> append
+# the version to packaging/windows/released-versions.txt.
+import re as _re
+
+_init_text = (project_root / "chitramaya" / "__init__.py").read_text(encoding="utf-8")
+_vm = _re.search(r'^__version__\s*=\s*"([^"]+)"', _init_text, _re.MULTILINE)
+if not _vm:
+    raise SystemExit("[spec] FATAL: __version__ not found in chitramaya/__init__.py")
+APP_VERSION = _vm.group(1)
+
+print("=" * 62)
+print(f"[spec]   BUILDING  ChitraMaya  v{APP_VERSION}")
+print("=" * 62)
+
+_released_file = project_root / "packaging" / "windows" / "released-versions.txt"
+if _released_file.is_file():
+    _released = {ln.strip() for ln in
+                 _released_file.read_text(encoding="utf-8").splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")}
+    if APP_VERSION in _released:
+        raise SystemExit(
+            f"[spec] FATAL: version {APP_VERSION} is already RELEASED (listed in "
+            f"packaging/windows/released-versions.txt). Bump __version__ in "
+            f"chitramaya/__init__.py before building -- the title bar, log "
+            f"header, and HF User-Agent all read it."
+        )
+else:
+    print("[spec] NOTE: packaging/windows/released-versions.txt not found -- "
+          "version-reuse check skipped. Create it (one version per line) to "
+          "arm the guardrail.")
+
 # ── Bundled binaries: ffmpeg / ffprobe → bin/ ──────────────────────────────
 binaries = []
 
