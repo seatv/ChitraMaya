@@ -1,0 +1,67 @@
+# ChitraMaya requirements — Intel Arc / XPU TESTBED variant (CM-093)
+#
+# Derived from requirements.txt (the authoritative CUDA list). This is the
+# BRING-UP environment for the XPU port: PyTorch-only inference on an Intel
+# Arc card, CPU/ffmpeg for all video I/O. It deliberately EXCLUDES every
+# NVIDIA-only package; the app's graceful-degradation paths (PyTorch
+# restorer fallback, ffmpeg CPU decode, canary-off-without-NVML) are what
+# make a subset environment viable at all.
+#
+# Tested baseline (Gman's Arc A580 testbed, 2026-07-31, Python 3.12):
+#   torch 2.13.0+xpu / torchvision 0.28.0+xpu -- fp16 matmul on xpu:0 OK.
+#
+# Install:
+#   pip install -r requirements-xpu.txt && pip install -e . --no-deps
+#
+# Also needed on the machine (NOT pip): ffmpeg/ffprobe on PATH. Use the
+# gyan.dev "full" build -- it includes libvpl (Intel QSV), which covers
+# both the CPU-decode fallback today and Arc-accelerated encode later.
+
+--extra-index-url https://download.pytorch.org/whl/xpu
+
+# ── PyTorch (XPU build) ───────────────────────────────────────────────
+# Pinned to the exact versions validated on the testbed. The xpu wheels
+# bring the entire oneAPI runtime (dpcpp-rt, oneMKL, sycl, triton-xpu)
+# as pip dependencies -- no separate Intel toolkit install is required.
+torch==2.13.0+xpu
+torchvision==0.28.0+xpu
+
+# ── EXCLUDED vs requirements.txt (NVIDIA-only) ────────────────────────
+# tensorrt / torch_tensorrt  -- TRT engines are CUDA-only; XPU restoration
+#                               runs the PyTorch BasicVSR++ fallback.
+# cuda-python                -- CUDA engine smoke tests; no CUDA here.
+# PyNvVideoCodec             -- NVDEC/NVENC; XPU testbed decodes via the
+#                               ffmpeg CPU fallback (QSV backend is the
+#                               port's encode work item).
+# onnxruntime-gpu            -- CUDA EP; plain onnxruntime below keeps any
+#                               module-level imports satisfied.
+# nvidia-ml-py               -- NVML PCIe canary; optional by design, the
+#                               watchdog runs with the canary silently off.
+# nvidia-vfx                 -- Maxine RTX Super-Res secondary; already
+#                               degrades gracefully when absent.
+
+# ── YOLO mosaic detector ──────────────────────────────────────────────
+# First unknown of the port: whether ultralytics accepts device="xpu"
+# directly. If not, detection runs via raw torch (model.to("xpu")) --
+# phase-0 test scripts cover both.
+ultralytics>=8.4
+
+# ── ONNX Runtime (CPU) ────────────────────────────────────────────────
+onnxruntime>=1.26
+
+# ── Model conversion / sanitisation ───────────────────────────────────
+onnx>=1.21
+protobuf>=4.23
+
+# ── Image processing ──────────────────────────────────────────────────
+opencv-python>=4.13
+scikit-image>=0.26
+numpy>=2.4
+pillow>=11.0
+
+# ── UI / server ───────────────────────────────────────────────────────
+Flask>=3.1
+pywebview>=6.2
+
+# ── CLI progress bars ─────────────────────────────────────────────────
+tqdm>=4.67
