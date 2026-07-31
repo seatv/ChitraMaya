@@ -828,6 +828,34 @@ if (stcBtn) {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && drawer.classList.contains('cd-open')) setOpen(false);
   });
+
+  // X1b: Copy-all (field request 2026-07-31 -- "make the console text
+  // selectable and copy-able"). The body is drag-selectable via CSS; this
+  // button grabs the whole buffer in one click. clipboard API first,
+  // execCommand fallback for older webview hosts.
+  const copyBtn = document.getElementById('cdCopy');
+  if (copyBtn) copyBtn.addEventListener('click', () => {
+    const text = body ? body.textContent : '';
+    const done = (ok) => {
+      copyBtn.textContent = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+    } else {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        done(ok);
+      } catch (e) {
+        done(false);
+      }
+    }
+  });
 })();
 
 // ── Elapsed clocks (Batch 25) ─────────────────────────────

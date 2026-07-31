@@ -859,14 +859,23 @@
   #cdClose { cursor: pointer; padding: 0 6px; font-size: 13px;
              color: var(--text-dim,#9a9a9a); user-select: none; }
   #cdClose:hover { color: var(--text,#fff); }
+  /* X1b: Copy-all button; and the body is explicitly selectable so log
+     lines can be dragged/Ctrl+C'd out (field request 2026-07-31). */
+  #cdCopy { cursor: pointer; padding: 0 8px; font: 600 11px sans-serif;
+            color: var(--text-dim,#9a9a9a); user-select: none;
+            text-transform: none; letter-spacing: 0; }
+  #cdCopy:hover { color: var(--text,#fff); }
   #cdBody { flex: 1; margin: 0; padding: 8px 10px; overflow-y: auto;
             font: 11px/1.5 ui-monospace, Consolas, monospace; color: #cfcfcf;
-            white-space: pre-wrap; word-break: break-all; }
+            white-space: pre-wrap; word-break: break-all;
+            user-select: text; -webkit-user-select: text; cursor: text; }
   #sectConsole { position: relative; z-index: 960; }
   #sectConsole .ctrl-section-header { cursor: pointer; user-select: none; }
 </style>
 <div id="cdPanel">
-  <div id="cdHeader"><span>Console</span><span id="cdClose" title="Close (Esc)">&#10005;</span></div>
+  <div id="cdHeader"><span>Console</span><span><span id="cdCopy"
+      title="Copy entire console to clipboard">Copy</span><span id="cdClose"
+      title="Close (Esc)">&#10005;</span></span></div>
   <pre id="cdBody"></pre>
 </div>
 

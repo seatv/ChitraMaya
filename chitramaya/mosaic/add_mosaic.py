@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from chitramaya.video.decoder import Decoder
-from chitramaya.video.encoder import Encoder
+from chitramaya.video.encoder import Encoder, FfmpegEncoder, nvenc_available
 from chitramaya.mosaic.pipeline_utils import (
     bgr_u8_to_bgra_u8,
     nv12_to_rgb_hwc_u8,
@@ -133,13 +133,16 @@ def run_add_mosaic(
     fps = float(decoder.metadata.fps or 0.0) or 30.0
     total = int(decoder.metadata.num_frames or 0)
 
-    device = torch.device(f"cuda:{gpu_id}") if torch.cuda.is_available() else torch.device("cpu")
+    from chitramaya.device import pick_device
+    device = pick_device(gpu_id)   # CM-093: cuda -> xpu -> cpu
 
     applied: List[Box] = expand_rois_sbs(rois, w) if sbs else [tuple(map(int, r)) for r in rois]
     print(f"[AddMosaic] {w}x{h} @ {fps:.2f}fps  rects={len(rois)}"
           f"{' (SBS -> ' + str(len(applied)) + ' applied)' if sbs else ''}  block={block}")
 
-    encoder = Encoder(
+    # CM-093 X3: NVENC on NVIDIA (unchanged); ffmpeg (QSV/software) elsewhere.
+    _EncCls = Encoder if nvenc_available() else FfmpegEncoder
+    encoder = _EncCls(
         output_path=str(output_path),
         width=w, height=h, fps=fps,
         codec=str(codec), preset=str(preset), qp=int(qp),
