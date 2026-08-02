@@ -154,6 +154,11 @@ def run_add_mosaic(
 
     frames = 0
     t_start = time.perf_counter()
+    # Batch 32: censor runs can be hours long too -- same keep-awake
+    # contract as the restore pipeline (system stays up, display may sleep).
+    from chitramaya.keep_awake import acquire as _ka_acquire, \
+        release as _ka_release
+    _ka_acquire(label="AddMosaic")
     try:
         while True:
             if cancel_flag is not None and cancel_flag.is_set():
@@ -190,6 +195,10 @@ def run_add_mosaic(
                 elapsed = max(1e-6, time.perf_counter() - t_start)
                 progress_cb(frames, total, frames / elapsed)
     finally:
+        try:
+            _ka_release()
+        except Exception:
+            pass
         encoder.close()
         decoder.close()
 

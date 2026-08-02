@@ -182,8 +182,12 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
       Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
       New-Item -ItemType Directory -Force -Path $stage | Out-Null
       Copy-Item (Join-Path $instSrcDir "install.cmd") $stage
+      # Stamp part count AND base name (regexes match any prior stamped
+      # value; basename stamping keeps this identical to the xpu packager
+      # and immune to a committed pre-stamped install.ps1).
       (Get-Content (Join-Path $instSrcDir "install.ps1")) `
-        -replace '^\$ExpectedParts = 0.*$', ('$ExpectedParts = {0}   # stamped by packager' -f $parts.Count) |
+        -replace '^\$ExpectedParts = \d+.*$', ('$ExpectedParts = {0}   # stamped by packager' -f $parts.Count) `
+        -replace '^\$BaseName\s*=.*$', ('$BaseName      = "{0}"   # stamped by packager' -f $installBase) |
         Set-Content (Join-Path $stage "install.ps1")
       Copy-Item $sevenZr $stage
 

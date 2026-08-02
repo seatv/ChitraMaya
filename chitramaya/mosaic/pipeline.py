@@ -842,6 +842,16 @@ class Pipeline:
         so this is non-breaking; the UI bridge reads frame/detection counts
         off it).
         """
+        # Batch 32: hold the system awake for the whole run (model builds /
+        # TRT compiles included). Long unattended runs otherwise die to the
+        # idle-sleep timer -- field: two Arc soak deaths at ~21:30 on
+        # consecutive nights, minutes after the user's RDP disconnect
+        # stopped resetting the idle timer. Thread-scoped claim; released
+        # in the finally below on this same thread.
+        from chitramaya.keep_awake import acquire as _ka_acquire, \
+            release as _ka_release
+        _ka_acquire(label=Path(self.input_path).name)
+
         inp = Path(self.input_path)
         out = Path(self.output_path)
 
@@ -1687,6 +1697,15 @@ class Pipeline:
             # a long time restoring one final long clip -- not a stall.
             try:
                 _watchdog.stop()
+            except Exception:
+                pass
+
+            # Batch 32: drop the keep-awake claim (same thread as acquire).
+            # Deliberately BEFORE the EOF flush/remux: those finish within
+            # minutes, well inside any idle-sleep timeout, and releasing
+            # here guarantees the claim can never outlive a failed cleanup.
+            try:
+                _ka_release()
             except Exception:
                 pass
 

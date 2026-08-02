@@ -119,6 +119,7 @@ hiddenimports += collect_submodules("tools")          # -restore / -compile-* su
 # user's machine. Fail the build loudly instead, naming what to integrate.
 _expected_modules = [
     ("chitramaya/device.py",          "CM-093 X1 accelerator abstraction"),
+    ("chitramaya/keep_awake.py",      "Batch 32 sleep inhibit"),
     ("chitramaya/mosaic/batch.py",    "Batch 22 folder batch"),
     ("chitramaya/mosaic/watchdog.py", "Batch 23 stall watchdog"),
     ("chitramaya/console_buffer.py",  "Batch 23/24 console drawer + log"),
@@ -153,7 +154,7 @@ if _missing_modules:
 # Explicit entries too, in case a future refactor makes any of these
 # reachable only via function-level or dynamic import.
 hiddenimports += [
-    "chitramaya.device",
+    "chitramaya.device", "chitramaya.keep_awake",
     "chitramaya.mosaic.batch", "chitramaya.mosaic.watchdog",
     "chitramaya.console_buffer", "chitramaya.winproc",
     "chitramaya.mosaic.restorer.temporalfix_arch",
