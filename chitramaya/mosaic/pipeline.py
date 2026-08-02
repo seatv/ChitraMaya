@@ -1143,8 +1143,41 @@ class Pipeline:
         # [CHANGE 4] batch-level PTS storage: populated by read_batch_with_pts
         batch_pts_cache: List[Optional[int]] = []
 
+        # CM-093 X5: periodic VRAM telemetry on non-NVIDIA accelerators.
+        # nvGPUMonitor is NVML-based and cannot see an Intel Arc, so a
+        # multi-day xpu soak would otherwise run blind -- and the one Arc
+        # crash so far (UR_RESULT_ERROR_UNKNOWN, day-two-class endurance
+        # question) needs a memory trace to be diagnosable. Every ~5 min:
+        # "[Pipeline] xpu VRAM: free N MB / total M MB". Memory pressure
+        # shows as free walking down for hours before death; a driver
+        # reset shows healthy free right up to the end. Silent on CUDA
+        # (nvGPUMonitor owns that) and on backends with no free-memory API.
+        _mem_beat_last = [0.0]
+
+        def _mem_beat(period_s: float = 300.0) -> None:
+            if self.device.type != "xpu":
+                return
+            now = time.perf_counter()
+            if now - _mem_beat_last[0] < period_s:
+                return
+            _mem_beat_last[0] = now
+            try:
+                from chitramaya.device import mem_get_info as _mgi
+                free_b, total_b = _mgi(self.device)
+                if free_b is not None and total_b:
+                    print(f"[Pipeline] xpu VRAM: free {free_b // (1 << 20)} MB "
+                          f"/ total {total_b // (1 << 20)} MB "
+                          f"(frame {frame_num})", flush=True)
+                elif total_b:
+                    print(f"[Pipeline] xpu VRAM: free n/a / total "
+                          f"{total_b // (1 << 20)} MB (this torch build has "
+                          f"no mem_get_info)", flush=True)
+            except Exception:
+                pass
+
         def consume_batch(batch: List[object], batch_pts: Optional[List[Optional[int]]] = None) -> None:
             nonlocal frame_num
+            _mem_beat()
 
             # If we're stopping early, trim batch to remaining frames.
             if self.max_frames is not None:
@@ -1951,6 +1984,30 @@ class Pipeline:
             # readability + reproducibility. The actionable list is
             # `visible_miss_frames` — feed those into a viewer or rerun
             # under `--mode pseudo` to inspect them visually.
+            # X5b: capture the console tail for embedding in the report.
+            # Makes the misses file a SELF-CONTAINED run record -- settings,
+            # stats, and the console context (warnings, [SecStats], watchdog
+            # dumps, xpu VRAM beats) in one artifact that outlives the
+            # terminal scrollback. Caps keep the JSON sane; None when no
+            # buffer is installed (headless -restore runs).
+            def _console_tail(max_lines: int = 400, max_chars: int = 65536):
+                try:
+                    from chitramaya.console_buffer import get_buffer
+                    buf = get_buffer()
+                    if buf is None:
+                        return None
+                    lines = [str(x) for x in
+                             (buf.snapshot().get("lines") or [])[-max_lines:]]
+                    out, total = [], 0
+                    for ln in reversed(lines):     # keep the NEWEST lines
+                        total += len(ln) + 1
+                        if total > max_chars:
+                            break
+                        out.append(ln)
+                    return list(reversed(out))
+                except Exception:
+                    return None
+
             try:
                 import json
                 miss_path = Path(self.output_path).with_suffix(".misses.json")
@@ -2018,6 +2075,10 @@ class Pipeline:
                     "restoration_miss_frames": sorted(restoration_miss_set),
                     "gap_fill_frames": sorted(gap_fill_set),
                     "legit_passthrough_frames": sorted(legit_set),
+                    # X5b: last console lines (<=400 lines / 64KB) as of
+                    # report time. The full log is still the terminal /
+                    # ChitraMaya-console.log; this is the durable tail.
+                    "console_tail": _console_tail(),
                     # NOTE: detected_frames and restored_frames lists were
                     # intentionally dropped — they're huge on long videos
                     # (~270k entries each for a 2.5hr clip) and redundant
@@ -2293,6 +2354,30 @@ class MosaicPipeline:
             },
             "decoder": {"gpu_id": self.gpu_id},
         }
+        # CM-093 X5c: monitoring section. The GUI path never populated one,
+        # so run()'s read of monitoring.watchdog_stall_seconds ALWAYS fell
+        # back to its 120s default -- only the headless CLI flag
+        # (--watchdog-stall-seconds) ever tuned the watchdog. Read the flat
+        # ChitraMaya-config.json (the UI-state file) for an optional
+        # "watchdogStallSeconds" number so a one-line config entry works for
+        # GUI runs too. Anchored the same way the server anchors that file:
+        # the exe's own dir when frozen, cwd when running from source.
+        # <=0 disables the watchdog (existing StallWatchdog contract).
+        _wd_stall = 120.0
+        try:
+            import json as _json
+            _base = (Path(_sys.executable).parent
+                     if getattr(_sys, "frozen", False) else Path.cwd())
+            _cfg_file = _base / "ChitraMaya-config.json"
+            if _cfg_file.exists():
+                _flat = _json.loads(_cfg_file.read_text(encoding="utf-8"))
+                if "watchdogStallSeconds" in _flat:
+                    _wd_stall = float(_flat["watchdogStallSeconds"])
+                    print(f"[Pipeline] watchdog stall threshold: "
+                          f"{_wd_stall:.0f}s (from ChitraMaya-config.json)")
+        except Exception:
+            _wd_stall = 120.0
+        data["monitoring"] = {"watchdog_stall_seconds": _wd_stall}
         # Mask Preview maps to mode="pseudo": the host builds the detector +
         # PseudoClipRestorer (flat fill), so detection + compositing run but
         # BasicVSR++ does not. mode="real" restores normally.
