@@ -47,11 +47,18 @@ class Decoder:
     GPU-first video decoder.
 
     - Primary backend: PyNvVideoCodec ThreadedDecoder (NVDEC) outputting RGBP (planar) or RGB (packed) in device memory.
-    - Fallback backend: ffmpeg CPU decode to raw NV12 (default) or RGB24 (env override).
+    - Fallback backend: ffmpeg decode to raw NV12 (default) or RGB24 (env override).
+      CM-093 X2: the ffmpeg path probes hardware decode first (QSV, then
+      D3D11VA) and falls back to CPU decode -- see _probe_hwaccel. Control
+      with CM_HW_DECODE = auto (default) | qsv | d3d11va | off.
 
     Extra:
-    - ffmpeg_input_args can be provided to tune CPU fallback (must not include -i).
+    - ffmpeg_input_args can be provided to tune the ffmpeg fallback (must not include -i).
     """
+
+    # CM-093 X2: per-file hwaccel probe results, so interactive paths
+    # (Test Frame / FOI previews) don't re-pay the probe on every open.
+    _HWACCEL_CACHE: dict = {}
 
     def __init__(
         self,
@@ -105,11 +112,11 @@ class Decoder:
             # fallback is a first-class backend here until X2 brings an
             # accelerated path.
             print("[Decoder] PyNvVideoCodec not available (non-NVIDIA build); "
-                  "using ffmpeg CPU decode.")
+                  "using ffmpeg decode (hw decode probed at open).")
             self.backend = "ffmpeg-cpu"
             self._init_ffmpeg_cpu_backend()
         elif skip_nvdec:
-            print(f"[Decoder] Preflight: {skip_reason}; using ffmpeg CPU decode.")
+            print(f"[Decoder] Preflight: {skip_reason}; using ffmpeg decode (hw decode probed at open).")
             self.backend = "ffmpeg-cpu"
             self._init_ffmpeg_cpu_backend()
         else:
@@ -510,11 +517,11 @@ class Decoder:
         if force_rgb24:
             self._ffmpeg_frame_size = w * h * 3
             self.ffmpeg_pix_fmt = "rgb24"
-            print(f"[Decoder] Backend: ffmpeg-cpu  output=RGB24(HWC,u8)  {w}x{h}  (GR_CPU_DECODE_RGB24=1)")
+            _out_desc = f"RGB24(HWC,u8)  {w}x{h}  (GR_CPU_DECODE_RGB24=1)"
         else:
             self._ffmpeg_frame_size = w * h * 3 // 2
             self.ffmpeg_pix_fmt = "nv12"
-            print(f"[Decoder] Backend: ffmpeg-cpu  output=NV12(Y+UV,u8)  {w}x{h}")
+            _out_desc = f"NV12(Y+UV,u8)  {w}x{h}"
 
         self.output_pix_fmt = self.ffmpeg_pix_fmt
 
@@ -526,8 +533,25 @@ class Decoder:
                 if t == "-i" or t.startswith("-i"):
                     raise ValueError("dec-ffmpeg-input-args must not include -i")
 
+        # CM-093 X2: hardware-accelerated decode on the ffmpeg path. The
+        # probe picks QSV (Intel fixed-function decode) or D3D11VA (any
+        # WDDM GPU), else plain CPU decode. Decoded frames are downloaded
+        # to system memory by ffmpeg either way, so the stdout byte stream
+        # (NV12/RGB24 rawvideo) and everything downstream are IDENTICAL --
+        # this changes who does the decoding, not what arrives. The win is
+        # CPU relief: 4K AV1/HEVC software decode saturates older CPUs.
+        # (X2b: the Backend line prints AFTER the probe so it can tell the
+        # truth about who decodes; self.backend stays "ffmpeg-cpu" -- that
+        # string is an internal id the pipeline keys prefetch behavior on.)
+        hw_tokens = self._probe_hwaccel()
+        _hw_desc = ("CPU software" if not hw_tokens
+                    else f"{hw_tokens[1]} hardware")
+        print(f"[Decoder] Backend: ffmpeg ({_hw_desc} decode)  "
+              f"output={_out_desc}")
+
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
+            *hw_tokens,
             "-fflags", "+genpts",
             *extra_tokens,
             "-i", self.input_path,
@@ -544,6 +568,94 @@ class Decoder:
             bufsize=10**8,
             **NOWINDOW,
         )
+
+    def _probe_hwaccel(self) -> List[str]:
+        """CM-093 X2: pick ffmpeg -hwaccel tokens for THIS input file.
+
+        Order: qsv -> d3d11va -> none. Each candidate is proven by actually
+        decoding 2 frames of the real file (codec/profile support varies per
+        file, so a global capability check is not enough).
+
+        CRITICAL probe detail: when -hwaccel init fails, ffmpeg logs
+        "Failed setup ..." and SILENTLY continues with software decode,
+        exiting 0 -- so a return-code check alone would report hardware
+        decode while the CPU quietly does the work. The probe therefore
+        runs at -v warning and treats any setup-failure/fallback message in
+        stderr as a probe failure.
+
+        CM_HW_DECODE env: auto (default) | qsv | d3d11va (force one
+        candidate) | off/0/cpu/none (skip probing, plain CPU decode --
+        also the A/B switch for benchmarking).
+
+        Results are cached per input path for the process lifetime.
+        """
+        env = os.getenv("CM_HW_DECODE", "auto").strip().lower()
+        if env in {"0", "off", "cpu", "none", "false"}:
+            print("[Decoder] hw decode: disabled (CM_HW_DECODE)")
+            return []
+
+        cached = Decoder._HWACCEL_CACHE.get(self.input_path)
+        if cached is not None:
+            return list(cached)
+
+        # X2b: qsv needs an explicit system-memory output format. ffmpeg 8
+        # defaults "-hwaccel qsv" to GPU-RESIDENT frames ("defaulting
+        # hwaccel_output_format to qsv"), which collide with the rawvideo
+        # download chain -- field result on Arc A580: qsv probe exited -40
+        # while d3d11va (which defaults to downloading) passed. Requesting
+        # nv12 output forces the decode-then-download path we want.
+        candidates = [
+            ("qsv", ["-hwaccel", "qsv", "-hwaccel_output_format", "nv12"]),
+            ("d3d11va", ["-hwaccel", "d3d11va"]),
+        ]
+        if env in {"qsv", "d3d11va"}:
+            candidates = [c for c in candidates if c[0] == env]
+
+        _FALLBACK_MARKERS = ("failed setup", "falling back", "fall back",
+                             "device creation failed", "no device available")
+        chosen: List[str] = []
+        for name, tokens in candidates:
+            # The probe mirrors the PRODUCTION output chain (rawvideo in the
+            # same pix_fmt), not a null sink: ffmpeg 8 defaults qsv to
+            # GPU-resident frames, which a null sink happily accepts but a
+            # rawvideo download path may not. Decoding 2 frames through the
+            # real chain proves the whole path, not just decoder init.
+            probe_cmd = [
+                "ffmpeg", "-hide_banner", "-v", "warning",
+                *tokens,
+                "-i", self.input_path,
+                "-an", "-sn", "-dn",
+                "-vsync", "0",
+                "-frames:v", "2",
+                "-f", "rawvideo",
+                "-pix_fmt", self.ffmpeg_pix_fmt,
+                "-y", os.devnull,
+            ]
+            try:
+                r = subprocess.run(
+                    probe_cmd, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE, text=True,
+                    timeout=60, **NOWINDOW,
+                )
+                err = (r.stderr or "").lower()
+                soft_fallback = any(m in err for m in _FALLBACK_MARKERS)
+                if r.returncode == 0 and not soft_fallback:
+                    chosen = list(tokens)
+                    print(f"[Decoder] hw decode: {name} "
+                          f"(GPU fixed-function decode; frames downloaded "
+                          f"to system memory)")
+                    break
+                reason = ("software-fallback detected" if soft_fallback
+                          else f"exit code {r.returncode}")
+                print(f"[Decoder] hw decode probe: {name} not usable "
+                      f"({reason})")
+            except Exception as e:
+                print(f"[Decoder] hw decode probe: {name} failed ({e})")
+
+        if not chosen:
+            print("[Decoder] hw decode: none usable; CPU decode")
+        Decoder._HWACCEL_CACHE[self.input_path] = list(chosen)
+        return chosen
 
     def _ffmpeg_read_frame(self) -> torch.Tensor | None:
         if self._ffmpeg_proc is None or self._ffmpeg_proc.stdout is None:

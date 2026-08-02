@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$BaseName      = "ChitraMaya-install"
+$BaseName      = "ChitraMaya-install"   # stamped by the packager (xpu edition uses ChitraMaya-xpu-install)
 $ExpectedParts = 0   # 0 = unknown; the packager stamps the real count at build time.
 $ReleasesUrl   = "https://github.com/seatv/ChitraMaya/releases"
 
@@ -67,16 +67,25 @@ $haveFirst = Test-Path (Join-Path $srcDir "$BaseName.7z.001")
 if (-not $haveFirst) {
     Write-Host "  *** THE INSTALL ARCHIVES WERE NOT FOUND ***" -ForegroundColor Red
     Write-Host ""
+    # File count is stamped per release: N archive parts + this exe. When
+    # the count is unknown (unstamped build), say "at least 2" rather than
+    # inventing a number.
+    $totalFiles = if ($ExpectedParts -gt 0) { $ExpectedParts + 1 } else { 0 }
+    $countText  = if ($totalFiles -gt 0) { "$totalFiles files" } else { "at least 2 files" }
     Write-Host "  This .exe BY ITSELF is not the program - it is only the" -ForegroundColor Yellow
-    Write-Host "  unpacker. The release is THREE files, and all of them must" -ForegroundColor Yellow
+    Write-Host "  unpacker. The release is $countText, and all of them must" -ForegroundColor Yellow
     Write-Host "  be downloaded into the SAME folder:" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "      $BaseName.7z.001   <- MISSING" -ForegroundColor Red
-    if ($ExpectedParts -ge 2 -or $ExpectedParts -eq 0) {
-        $missing002 = -not (Test-Path (Join-Path $srcDir "$BaseName.7z.002"))
-        $tag = if ($missing002) { "<- MISSING" } else { "<- found" }
-        $col = if ($missing002) { "Red" } else { "Green" }
-        Write-Host "      $BaseName.7z.002   $tag" -ForegroundColor $col
+    $maxParts = if ($ExpectedParts -gt 0) { $ExpectedParts } else { 1 }
+    for ($n = 1; $n -le $maxParts; $n++) {
+        $pn = "{0}.7z.{1:d3}" -f $BaseName, $n
+        $missingPart = -not (Test-Path (Join-Path $srcDir $pn))
+        $tag = if ($missingPart) { "<- MISSING" } else { "<- found" }
+        $col = if ($missingPart) { "Red" } else { "Green" }
+        Write-Host "      $pn   $tag" -ForegroundColor $col
+    }
+    if ($ExpectedParts -eq 0) {
+        Write-Host "      (plus any further $BaseName.7z.0NN parts in the release)" -ForegroundColor Yellow
     }
     Write-Host "      $BaseName.exe       <- found (this file)" -ForegroundColor Green
     Write-Host ""

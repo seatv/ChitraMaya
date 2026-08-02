@@ -2334,12 +2334,32 @@ def api_ui_config():
 
 @app.route("/api/save-config", methods=["POST"])
 def api_save_config():
-    """Save UI config. Writes ONLY known UI keys — no legacy data."""
+    """Save UI config, MERGED over the existing file.
+
+    X2b fix: this used to rewrite the file wholesale from the posted UI
+    keys, which silently deleted hand-added knobs -- field case: the
+    user's watchdogStallSeconds=300 vanished on the first UI save and
+    the watchdog quietly reverted to its 120s default. Now: read the
+    existing JSON, overlay the posted keys, write back -- unknown keys
+    survive. api_load_config's filter still hides unknown keys from the
+    UI itself, and the legacy snake_case dir keys stay dropped.
+    """
     data = request.get_json(force=True)
     try:
         config_path = _config_file_path()
+        merged: dict = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    merged = existing
+            except Exception:
+                merged = {}
+        merged.update(data)
+        for old_key in ("faces_dir", "output_dir", "temp_dir"):
+            merged.pop(old_key, None)
         config_path.write_text(
-            json.dumps(data, indent=2, default=str) + "\n",
+            json.dumps(merged, indent=2, default=str) + "\n",
             encoding="utf-8",
         )
         # Update server state for folders

@@ -42,3 +42,5 @@ gswapper-config.json
 *.exe
 *.7z.*
 ChitraMaya-ReleaseNotes*
+!packaging/windows/vendor/7zr.exe
+!packaging/windows/vendor/7zSD.sfx

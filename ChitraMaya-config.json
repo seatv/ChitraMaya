@@ -33,5 +33,6 @@
   "ctrlAsyncEncoder": false,
   "debug": false,
   "perf_test": false,
+  "watchdogStallSeconds": 300,
   "facesDir": ""
 }
