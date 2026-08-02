@@ -19,4 +19,4 @@ Ported from Rope's schemes with:
 # already listed in packaging/windows/released-versions.txt (append to that
 # file right after each publish). v1.20 and v1.30 both shipped showing a
 # stale number because this line relied on memory; no longer.
-__version__ = "1.40.00"
+__version__ = "1.40.10"
