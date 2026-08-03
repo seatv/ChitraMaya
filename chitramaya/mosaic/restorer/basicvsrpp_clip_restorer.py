@@ -54,6 +54,49 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
                   f"conv layers (field-measured SLOWER in eager; see "
                   f"basicvsrpp_clip_restorer.py note)")
 
+        # CM-093 torch.compile experiment (DEV-MACHINE ONLY, default OFF).
+        # This is the graph-level layout planning the channels_last note
+        # above points at: Inductor can plan NHWC across the whole graph
+        # instead of paying per-op transpose tax -- the only known route
+        # to Arc's XMX units for this model.
+        #
+        # WHY THIS IS NOT A USER-FACING FEATURE: Inductor is a runtime
+        # JIT that generates C++ host code and invokes a SYSTEM compiler
+        # (MSVC cl.exe on Windows) on whatever machine runs it -- unlike
+        # TensorRT, whose builder ships as a library inside the distro.
+        # Users cannot be asked to install Build Tools, and Dynamo's
+        # source introspection is unreliable inside a frozen PyInstaller
+        # app anyway. This flag exists for SOURCE-INSTALL experiments on
+        # a dev box with MSVC (run from an "x64 Native Tools" prompt).
+        # If the experiment wins, the shippable path is ahead-of-time
+        # export (torch.export / AOTInductor artifacts, TRT-engine
+        # style), which is a separate work item.
+        #
+        # Safety: suppress_errors=True makes ANY downstream Dynamo/
+        # Inductor failure (which surfaces lazily at first forward, not
+        # here) fall back to eager per-graph instead of crashing the
+        # run -- so even a mistakenly-set flag on a machine without MSVC
+        # degrades to a warning + eager, never a dead run. First chunk
+        # of each distinct clip length compiles for minutes (the X1c
+        # heartbeat makes that visible); steady state is the number that
+        # matters. CM_XPU_COMPILE=1 -> default mode; any other value is
+        # passed through as the Inductor mode (e.g. max-autotune).
+        _cmp = _os.environ.get("CM_XPU_COMPILE", "").strip()
+        if self.device.type == "xpu" and _cmp:
+            try:
+                import torch._dynamo as _dynamo
+                _dynamo.config.suppress_errors = True
+                _mode = None if _cmp == "1" else _cmp
+                self.model = torch.compile(self.model, mode=_mode)
+                print(f"[Restorer] XPU: torch.compile EXPERIMENT enabled "
+                      f"(mode={_mode or 'default'}, dev-machine flag). "
+                      f"First chunk per clip length will be SLOW (kernel "
+                      f"compilation); steady state is the number that "
+                      f"matters. Compile failures fall back to eager.")
+            except Exception as _ce:
+                print(f"[Restorer] WARNING: torch.compile unavailable "
+                      f"({_ce}); continuing in eager mode.")
+
     @torch.inference_mode()
     def restore_clip(self, clip) -> List[torch.Tensor]:
         frames = clip.frames  # uint8 HWC
