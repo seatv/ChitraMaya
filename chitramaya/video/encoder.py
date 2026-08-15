@@ -226,6 +226,14 @@ def _ffmpeg_input_fmt(codec: str) -> str:
     raise ValueError(f"Unsupported codec: {codec}")
 
 
+def _ps_quote(s: str) -> str:
+    """Quote a path as a PowerShell single-quoted literal. Single quotes
+    are the only escape needed ('' inside '...'); $, backtick, and double
+    quotes are all inert inside single quotes, so arbitrary Windows / UNC
+    paths survive verbatim."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
 def _av1_encode_supported(gpu_id: int) -> bool | None:
     """NVENC AV1 encode exists on Ada (sm_89) and Blackwell (sm_120+) only —
     Ampere/Turing can DECODE AV1 but cannot encode it. Returns None if the
@@ -538,11 +546,17 @@ class Encoder:
             print(f"[Encoder] Flush error: {e}")
         print(f"[Encoder] Flushed ({self._frames_encoded} frames)")
 
+    def _mp4_tag(self) -> str:
+        """Per-codec MP4 fourcc tag (hvc1/avc1/av01) — a wrong tag makes
+        some players reject the file."""
+        return {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
+                "avc": "avc1", "av1": "av01"}.get(self.codec, "hvc1")
+
     def _recovery_command_str(self) -> str:
         """The exact PowerShell ffmpeg command that wraps the raw bitstream
-        into a playable file (video only — the always-works fallback).
-        Shared by the sidecar script and the REMUX FAILED banner so both
-        show the SAME command."""
+        into a playable file (video only — the always-works paste-in
+        fallback shown by the REMUX FAILED banner). The sidecar script goes
+        further and re-adds audio automatically."""
         fixed = str(Path(self.output_path).with_suffix("")) + "-FIXED" + \
             Path(self.output_path).suffix
         fmt = _ffmpeg_input_fmt(self.codec)
@@ -550,40 +564,144 @@ class Encoder:
         # works for that, while HEVC/H.264 want the explicit demuxer. Use the
         # demuxer for non-av1 and let av1 auto-probe.
         fmt_arg = "" if self.codec == "av1" else f'-f {fmt} '
-        # Per-codec MP4 fourcc tag (hvc1/avc1/av01) — a wrong tag makes some
-        # players reject the file.
-        _tag = {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
-                "avc": "avc1", "av1": "av01"}.get(self.codec, "hvc1")
+        # Tag / timescale / faststart are mp4-container concerns, matching
+        # the gating _remux() applies (an mkv output gets none of them).
+        mp4_args = ""
+        if self._container == "mp4":
+            mp4_args = f'-tag:v {self._mp4_tag()} -video_track_timescale 90000 '
+            if self.mp4_faststart:
+                mp4_args += "-movflags +faststart "
         return (
             f'ffmpeg -hide_banner -fflags +genpts -r {self.fps_str} '
-            f'{fmt_arg}-i "{self._raw_path}" -c:v copy -tag:v {_tag} '
-            f'-video_track_timescale 90000 -movflags +faststart "{fixed}"'
+            f'{fmt_arg}-i "{self._raw_path}" -c:v copy {mp4_args}"{fixed}"'
         )
 
     def _write_recovery_script(self) -> None:
         """Write a self-contained PowerShell recovery script next to the raw
         bitstream, so a hard kill (OOM/wedge) before close() still leaves the
-        user a one-double-click fix. Deleted on successful remux."""
+        user a one-double-click fix. Deleted on successful remux.
+
+        The script does the COMPLETE job -- it wraps the raw bitstream into a
+        container AND re-adds audio from the source file (the source path is
+        known right here at generation time; making the user hand-edit an
+        ffmpeg command was our failure landing on their desk). Two steps,
+        mirroring the production remux:
+
+          1. raw bitstream -> temp video container (gives the stream real
+             timestamps; -shortest is unreliable directly on a raw
+             elementary-stream input, which is why the audio mux happens on
+             the containerized copy).
+          2. temp container + source audio -> *-FIXED file, with -shortest
+             trimming the full-length audio to the partial video.
+
+        A Test-Path guard falls back to a video-only *-FIXED file when the
+        source has moved, with instructions to edit $source and re-run.
+        Written as UTF-8 with BOM: Windows PowerShell 5.1 assumes ANSI for
+        BOM-less scripts and would mangle non-ASCII paths."""
         script_path = str(Path(self.output_path).with_suffix("")) + \
             "-RECOVER.ps1"
-        source_hint = ""
-        if self.mux_audio and self.input_path:
-            source_hint = (
-                f'# To also re-add audio, use the source file:\n'
-                f'#   {self.input_path}\n'
-                f'# (add:  -i "<source>" -map 0:v:0 -map 1:a? -c:a copy)\n'
+        out = Path(self.output_path)
+        fixed = str(out.with_suffix("")) + "-FIXED" + out.suffix
+        vtmp = fixed + ".vtmp" + out.suffix
+        fmt_args = "" if self.codec == "av1" else \
+            f"-f {_ffmpeg_input_fmt(self.codec)} "
+
+        is_mp4 = self._container == "mp4"
+        tag_args = f"-tag:v {self._mp4_tag()} " if is_mp4 else ""
+        ts_args = "-video_track_timescale 90000 " if is_mp4 else ""
+        fs_args = "-movflags +faststart " if (is_mp4 and self.mp4_faststart) \
+            else ""
+
+        has_source = bool(self.mux_audio and self.input_path)
+        src_line = (
+            f"$source = {_ps_quote(self.input_path)}\n" if has_source else ""
+        )
+
+        av1_note = ""
+        if self.codec == "av1":
+            av1_note = (
+                "# NOTE (AV1 only): the recovered file plays linearly, but\n"
+                "# SEEKING may fail in ffmpeg/VLC/mpv-class players because\n"
+                "# the in-band sequence-header repair (CM-091) runs only in\n"
+                "# the normal finalize step. Repair later with\n"
+                "# Fix-AV1-SeekHeaders.py if seeking matters.\n"
             )
-        body = (
+
+        header = (
             "# ChitraMaya encode-recovery script (auto-generated).\n"
             "# If this file still exists, the run did NOT finalize the output\n"
             "# (crash, out-of-memory, or forced close). Every encoded frame is\n"
-            f"# preserved in the raw bitstream below. Run this script in\n"
-            "# PowerShell to produce a playable *-FIXED file. Verify it plays\n"
-            "# at the right SPEED — if not, change -r to the source frame rate.\n"
-            f"# ffmpeg must be on PATH.\n{source_hint}\n"
-            f"& {self._recovery_command_str().replace('ffmpeg', 'ffmpeg', 1)}\n"
+            "# preserved in the raw bitstream next to this script. Just RUN\n"
+            "# THIS SCRIPT in PowerShell: it wraps the video AND re-adds the\n"
+            "# audio from the source file automatically.\n"
+            "# ffmpeg must be on PATH.\n"
+            "# Verify the *-FIXED file plays at the right SPEED -- if not,\n"
+            "# edit the -r value below to the source frame rate and re-run.\n"
+            f"{av1_note}\n"
+            f"$raw    = {_ps_quote(self._raw_path)}\n"
+            f"{src_line}"
+            f"$fixed  = {_ps_quote(fixed)}\n"
+            f"$vtmp   = {_ps_quote(vtmp)}\n"
+            "\n"
+            "# Step 1: wrap the raw bitstream into a real video container.\n"
+            f"& ffmpeg -hide_banner -y -fflags +genpts "
+            f"-analyzeduration 10M -probesize 50M -r {self.fps_str} "
+            f"{fmt_args}-i $raw -map 0:v:0 -c:v copy {tag_args}{ts_args}"
+            f"$vtmp\n"
+            "if ($LASTEXITCODE -ne 0) {\n"
+            "    Write-Host 'RECOVERY FAILED: could not wrap the raw "
+            "bitstream (see ffmpeg output above).'\n"
+            "    exit 1\n"
+            "}\n"
+            "\n"
         )
-        with open(script_path, "w", encoding="utf-8") as f:
+
+        if has_source:
+            body = header + (
+                "# Step 2: re-add audio from the source. The video is partial\n"
+                "# (the run died mid-encode), so -shortest trims the audio to\n"
+                "# match. The tiny source A/V start offset (usually < 50 ms)\n"
+                "# is not restored here; a normal completed run does that.\n"
+                "$done = $false\n"
+                "if (Test-Path -LiteralPath $source) {\n"
+                f"    & ffmpeg -hide_banner -y -i $source -i $vtmp "
+                f"-map 1:v:0 -c:v copy {tag_args}-map 0:a? -c:a copy "
+                f"-shortest {fs_args}{ts_args}$fixed\n"
+                "    if ($LASTEXITCODE -eq 0) {\n"
+                "        Remove-Item -LiteralPath $vtmp -ErrorAction "
+                "SilentlyContinue\n"
+                "        $done = $true\n"
+                "        Write-Host \"Recovered WITH audio: $fixed\"\n"
+                "    } else {\n"
+                "        Write-Host 'Audio mux failed; keeping the "
+                "video-only recovery instead.'\n"
+                "    }\n"
+                "} else {\n"
+                "    Write-Host 'Source file not found -- producing a "
+                "VIDEO-ONLY recovery.'\n"
+                "    Write-Host 'If the source moved, edit the $source "
+                "line at the top of this script and re-run.'\n"
+                "}\n"
+                "if (-not $done) {\n"
+                "    Move-Item -LiteralPath $vtmp -Destination $fixed -Force\n"
+                "    Write-Host \"Recovered (video only): $fixed\"\n"
+                "}\n"
+                "Write-Host 'Once the *-FIXED file plays correctly, the raw "
+                "bitstream and this script can be deleted.'\n"
+            )
+        else:
+            # No audio was requested (or no source path known): single step,
+            # straight to the *-FIXED file.
+            body = header + (
+                "Move-Item -LiteralPath $vtmp -Destination $fixed -Force\n"
+                "Write-Host \"Recovered: $fixed\"\n"
+                "Write-Host 'Once the *-FIXED file plays correctly, the raw "
+                "bitstream and this script can be deleted.'\n"
+            )
+        # utf-8-sig: the BOM is what makes Windows PowerShell 5.1 parse the
+        # file as UTF-8 (BOM-less .ps1 is read as ANSI and non-ASCII paths
+        # in $raw/$source would be corrupted).
+        with open(script_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
             f.write(body)
         self._recovery_script_path = script_path
 
@@ -630,14 +748,18 @@ class Encoder:
             print(f"[Encoder] *** REMUX FAILED -- {self.output_path} is NOT a "
                   f"playable file. ***")
             print(f"[Encoder] All encoded frames are preserved in: {self._raw_path}")
-            print(f"[Encoder] Recover now -- paste this into PowerShell:")
-            print(f"    {self._recovery_command_str()}")
             if self._recovery_script_path:
-                print(f"[Encoder] (Or run the ready-made script: "
-                      f"{self._recovery_script_path})")
+                print(f"[Encoder] Recover now -- run the ready-made script "
+                      f"(it re-adds the audio automatically):")
+                print(f"    {self._recovery_script_path}")
+                print(f"[Encoder] Or, for a video-only wrap, paste this into "
+                      f"PowerShell:")
+            else:
+                print(f"[Encoder] Recover now -- paste this into PowerShell "
+                      f"(video only):")
+            print(f"    {self._recovery_command_str()}")
             print(f"[Encoder] If playback speed is wrong, change -r "
-                  f"{self.fps_str} to the source frame rate. Re-add audio with "
-                  f"a second -i \"<source>\" -map 0:v:0 -map 1:a? -c:a copy.")
+                  f"{self.fps_str} to the source frame rate.")
         else:
             print(f"[Encoder] Done: {self.output_path}")
 
@@ -901,8 +1023,10 @@ class FfmpegEncoder:
 
       1. Intel QSV (hevc_qsv / h264_qsv / av1_qsv) -- Arc's hardware media
          engine via libvpl (the gyan.dev 'full' ffmpeg builds include it).
-      2. Software fallback (libx265 / libx264 / libsvtav1) with a loud
-         banner when QSV is unavailable (no Intel GPU / driver / libvpl).
+      2. AMD AMF (hevc_amf / h264_amf / av1_amf) -- Radeon's hardware
+         encoder (Batch 34, ROCm edition; av1_amf is RDNA4+).
+      3. Software fallback (libx265 / libx264 / libsvtav1) with a loud
+         banner when no hardware encoder initializes.
 
     The video-only stream is written to <output>.venc.mp4 as a FRAGMENTED
     mp4 (crash-tolerant: a killed run still leaves decodable video), then
@@ -918,12 +1042,23 @@ class FfmpegEncoder:
 
     _QSV = {"hevc": "hevc_qsv", "h265": "hevc_qsv",
             "h264": "h264_qsv", "avc": "h264_qsv", "av1": "av1_qsv"}
+    # Batch 34 (ROCm edition): AMD's hardware encoder. Probed between QSV
+    # and software -- on Radeon the QSV probe fails and, pre-Batch-34, the
+    # ladder silently landed on CPU x265, making the GPU look slow through
+    # no fault of its own. av1_amf exists on RDNA4 only; the probe decides.
+    _AMF = {"hevc": "hevc_amf", "h265": "hevc_amf",
+            "h264": "h264_amf", "avc": "h264_amf", "av1": "av1_amf"}
     _SW = {"hevc": "libx265", "h265": "libx265",
            "h264": "libx264", "avc": "libx264", "av1": "libsvtav1"}
     _P2SPEED = {"P1": "veryfast", "P2": "faster", "P3": "fast", "P4": "medium",
                 "P5": "slow", "P6": "slower", "P7": "veryslow"}
     _P2SVT = {"P1": "10", "P2": "9", "P3": "8", "P4": "7",
               "P5": "6", "P6": "4", "P7": "2"}
+    # AMF exposes three quality tiers, not a 7-step ladder; map the UI's
+    # P1-P7 onto them (P1-P3 speed, P4-P5 balanced, P6-P7 quality).
+    _P2AMF = {"P1": "speed", "P2": "speed", "P3": "speed",
+              "P4": "balanced", "P5": "balanced",
+              "P6": "quality", "P7": "quality"}
 
     def __init__(
         self,
@@ -964,14 +1099,31 @@ class FfmpegEncoder:
         self._venc_path = self.output_path + ".venc.mp4"
         self._stderr_path = self.output_path + ".venc.stderr.log"
 
-        # Pick the encoder: QSV probe first, software fallback second.
+        # Pick the encoder: QSV -> AMF -> software (Batch 34 ladder). Each
+        # rung is a real 2-frame init probe on THIS machine, so a missing
+        # driver/GPU falls through cleanly rather than dying mid-run.
         qsv_name = self._QSV[self.codec]
+        amf_name = self._AMF[self.codec]
         sw_name = self._SW[self.codec]
         if self._probe_encoder(qsv_name):
             self._enc_name = qsv_name
             self._enc_args = ["-global_quality", str(self.qp),
                               "-preset", self._P2SPEED[self.preset]]
             hw = "Intel QSV hardware"
+        elif self._probe_encoder(amf_name):
+            self._enc_name = amf_name
+            # CQP to match the UI's constant-QP semantics. AV1's qindex
+            # scale is 0-255; map the HEVC-style slider by the same rough
+            # 4x equivalence the NVENC path uses (QP18 -> qindex 72).
+            _q = self.qp
+            if self.codec == "av1":
+                _q = min(255, self.qp * 4)
+                print(f"[Encoder] AV1 rate control: QP{self.qp} (HEVC scale)"
+                      f" -> qindex {_q} (AV1 scale)")
+            self._enc_args = ["-rc", "cqp",
+                              "-qp_i", str(_q), "-qp_p", str(_q),
+                              "-quality", self._P2AMF[self.preset]]
+            hw = "AMD AMF hardware"
         elif self._probe_encoder(sw_name):
             self._enc_name = sw_name
             if sw_name == "libsvtav1":
@@ -981,14 +1133,16 @@ class FfmpegEncoder:
                 self._enc_args = ["-crf", str(self.qp),
                                   "-preset", self._P2SPEED[self.preset]]
             hw = "SOFTWARE (CPU)"
-            print(f"[Encoder] WARNING: Intel QSV ({qsv_name}) unavailable -- "
-                  f"falling back to {sw_name} on the CPU. Expect slow encodes; "
-                  f"check the Intel GPU driver and that ffmpeg has libvpl.")
+            print(f"[Encoder] WARNING: no hardware encoder available "
+                  f"({qsv_name} and {amf_name} both failed to initialize) -- "
+                  f"falling back to {sw_name} on the CPU. Expect slow "
+                  f"encodes. Intel: check the GPU driver and that ffmpeg has "
+                  f"libvpl. AMD: check the Adrenalin driver (AMF).")
         else:
             raise RuntimeError(
-                f"No usable encoder for {self.codec}: neither {qsv_name} nor "
-                f"{sw_name} works in this ffmpeg build. Install the ffmpeg "
-                f"'full' build (gyan.dev)."
+                f"No usable encoder for {self.codec}: none of {qsv_name}, "
+                f"{amf_name}, {sw_name} works in this ffmpeg build. Install "
+                f"the ffmpeg 'full' build (gyan.dev)."
             )
 
         cmd = [
@@ -998,7 +1152,10 @@ class FfmpegEncoder:
             "-i", "-",
             "-an",
             "-c:v", self._enc_name, *self._enc_args,
-            "-pix_fmt", "nv12" if self._enc_name.endswith("_qsv") else "yuv420p",
+            # Hardware encoders (QSV and AMF) both prefer NV12 input;
+            # software x264/x265/svt take planar yuv420p.
+            "-pix_fmt", ("nv12" if self._enc_name.endswith(("_qsv", "_amf"))
+                         else "yuv420p"),
             # Crash-tolerant temp container: fragmented mp4 stays decodable
             # if the run dies; close() rewrites it properly with faststart.
             # -flush_packets 1 forces the header+fragments out of ffmpeg's
@@ -1016,6 +1173,112 @@ class FfmpegEncoder:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=self._stderr_f, **NOWINDOW,
         )
+
+        # Recovery sidecar (same rationale as the NVENC path): a hard kill
+        # leaves <output>.venc.mp4 -- fragmented, so every flushed frame IS
+        # decodable -- but audio-less and without faststart. Write the
+        # finish-the-job script now; deleted on a successful remux.
+        self._recovery_script_path: Optional[str] = None
+        try:
+            self._write_recovery_script()
+        except Exception:
+            pass  # recovery aid must never break the encode
+
+    def _mp4_tag(self) -> str:
+        return {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
+                "avc": "avc1", "av1": "av01"}.get(self.codec, "hvc1")
+
+    def _write_recovery_script(self) -> None:
+        """Write a complete PowerShell recovery script next to the .venc
+        temp file. Unlike the NVENC path there is no raw elementary stream
+        to wrap -- the fragmented mp4 already carries timestamps -- so this
+        is a single remux: video from the .venc, audio from the source,
+        -shortest trimming the audio to the partial video. Test-Path guard
+        falls back to a video-only rewrap if the source moved. UTF-8 BOM
+        for Windows PowerShell 5.1 (see the NVENC twin)."""
+        script_path = str(Path(self.output_path).with_suffix("")) + \
+            "-RECOVER.ps1"
+        out = Path(self.output_path)
+        fixed = str(out.with_suffix("")) + "-FIXED" + out.suffix
+        tag_args = f"-tag:v {self._mp4_tag()} "
+        ts_args = "-video_track_timescale 90000 "
+        fs_args = "-movflags +faststart " if self.mp4_faststart else ""
+
+        has_source = bool(self.mux_audio and self.input_path)
+        src_line = (
+            f"$source = {_ps_quote(self.input_path)}\n" if has_source else ""
+        )
+        vid_only_cmd = (
+            f"& ffmpeg -hide_banner -y -i $venc -map 0:v:0 -c:v copy "
+            f"{tag_args}{fs_args}{ts_args}$fixed"
+        )
+
+        header = (
+            "# ChitraMaya encode-recovery script (auto-generated).\n"
+            "# If this file still exists, the run did NOT finalize the output\n"
+            "# (crash, out-of-memory, or forced close). Every encoded frame is\n"
+            "# preserved in the .venc temp file next to this script. Just RUN\n"
+            "# THIS SCRIPT in PowerShell: it finalizes the video AND re-adds\n"
+            "# the audio from the source file automatically.\n"
+            "# ffmpeg must be on PATH.\n"
+            "\n"
+            f"$venc   = {_ps_quote(self._venc_path)}\n"
+            f"{src_line}"
+            f"$fixed  = {_ps_quote(fixed)}\n"
+            "\n"
+        )
+        if has_source:
+            body = header + (
+                "# The video is partial (the run died mid-encode), so\n"
+                "# -shortest trims the full-length audio to match. The tiny\n"
+                "# source A/V start offset (usually < 50 ms) is not restored\n"
+                "# here; a normal completed run does that.\n"
+                "$done = $false\n"
+                "if (Test-Path -LiteralPath $source) {\n"
+                f"    & ffmpeg -hide_banner -y -i $source -i $venc "
+                f"-map 1:v:0 -c:v copy {tag_args}-map 0:a? -c:a copy "
+                f"-shortest {fs_args}{ts_args}$fixed\n"
+                "    if ($LASTEXITCODE -eq 0) {\n"
+                "        $done = $true\n"
+                "        Write-Host \"Recovered WITH audio: $fixed\"\n"
+                "    } else {\n"
+                "        Write-Host 'Audio mux failed; producing a "
+                "video-only recovery instead.'\n"
+                "    }\n"
+                "} else {\n"
+                "    Write-Host 'Source file not found -- producing a "
+                "VIDEO-ONLY recovery.'\n"
+                "    Write-Host 'If the source moved, edit the $source "
+                "line at the top of this script and re-run.'\n"
+                "}\n"
+                "if (-not $done) {\n"
+                f"    {vid_only_cmd}\n"
+                "    if ($LASTEXITCODE -eq 0) { Write-Host \"Recovered "
+                "(video only): $fixed\" }\n"
+                "}\n"
+                "Write-Host 'Once the *-FIXED file plays correctly, the "
+                ".venc file and this script can be deleted.'\n"
+            )
+        else:
+            body = header + (
+                f"{vid_only_cmd}\n"
+                "if ($LASTEXITCODE -eq 0) { Write-Host \"Recovered: "
+                "$fixed\" }\n"
+                "Write-Host 'Once the *-FIXED file plays correctly, the "
+                ".venc file and this script can be deleted.'\n"
+            )
+        with open(script_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write(body)
+        self._recovery_script_path = script_path
+
+    def _remove_recovery_script(self) -> None:
+        if self._recovery_script_path:
+            try:
+                p = Path(self._recovery_script_path)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
 
     # -- probe --------------------------------------------------------------
 
@@ -1091,6 +1354,7 @@ class FfmpegEncoder:
         venc = Path(self._venc_path)
         if not venc.exists() or self._frames_encoded == 0:
             print(f"[Encoder] Nothing to finalize ({self._frames_encoded} frames).")
+            self._remove_recovery_script()   # nothing recoverable either
             return
 
         tag = {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
@@ -1154,12 +1418,19 @@ class FfmpegEncoder:
                 Path(self._stderr_path).unlink(missing_ok=True)
             except Exception:
                 pass
+            self._remove_recovery_script()
             print(f"[Encoder] Done: {self.output_path}")
         else:
             print(f"[Encoder] *** REMUX FAILED -- {self.output_path} is NOT "
                   f"complete. Video-only stream preserved at: {venc} "
-                  f"(fragmented mp4; playable). Re-wrap manually with: "
-                  f'ffmpeg -i "{venc}" -c copy -movflags +faststart out.mp4')
+                  f"(fragmented mp4; playable).")
+            if self._recovery_script_path:
+                print(f"[Encoder] Recover now -- run the ready-made script "
+                      f"(it re-adds the audio automatically): "
+                      f"{self._recovery_script_path}")
+            else:
+                print(f"[Encoder] Re-wrap manually with: "
+                      f'ffmpeg -i "{venc}" -c copy -movflags +faststart out.mp4')
 
 
 # (Encoder, FfmpegEncoder, nvenc_available are imported explicitly by the
