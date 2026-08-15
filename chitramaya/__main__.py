@@ -29,6 +29,7 @@ Usage:
   ChitraMaya -restore     [opts]   Run the mosaic-restoration CLI
   ChitraMaya -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
   ChitraMaya -compile-det  [opts]  Build/rebuild the YOLO detection engine
+  ChitraMaya -self-check           Verify this install (imports, GPU, ffmpeg)
   ChitraMaya -h | --help           Show this help
 
 Forward all remaining arguments to the chosen CLI. For example:
@@ -69,6 +70,21 @@ def main() -> int:
         sys.argv = ["ChitraMaya -compile-det"] + args[1:]
         from tools.compile_yolo import main as compile_det_main
         return int(compile_det_main() or 0)
+
+    if args and args[0] == "-self-check-devprobe":
+        # Internal (Batch 34 r2): child-process half of the self-check's
+        # GPU probe. Not documented in USAGE on purpose -- the self-check
+        # spawns it so a native abort in the GPU runtime (ROCm without a
+        # driver, field event 2026-08-15) cannot kill the whole check.
+        from chitramaya.self_check import devprobe_main
+        return int(devprobe_main() or 0)
+
+    if args and args[0] in ("-self-check", "--self-check", "self-check"):
+        # Batch 34: install verifier. Exit 0 = sound (warnings allowed),
+        # 1 = broken. Consumed by humans, remote testers, and the CM-097
+        # patch applier.
+        from chitramaya.self_check import main as self_check_main
+        return int(self_check_main() or 0)
 
     # Default: launch UI server. Forward UI-only flags (mirrors the
     # argparse that used to live in ChitraMaya/server.py's __main__).

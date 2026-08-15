@@ -1,0 +1,86 @@
+# ChitraMaya requirements — AMD ROCm (Radeon) EDITION - field-test bring-up
+#
+# Derived from requirements-xpu.txt (which derives from requirements.txt,
+# the authoritative CUDA list). Same shape as the XPU edition: PyTorch-only
+# inference (no TensorRT), ffmpeg for all video I/O. ROCm's HIP layer
+# masquerades as torch.cuda, so the app's CUDA code paths run unchanged --
+# what makes this a subset environment viable is the same graceful
+# degradation the XPU port proved out (PyTorch restorer fallback, ffmpeg
+# decode ladder, canary-off-without-NVML, nvenc_available() -> False).
+#
+# Supported GPUs (AMD official, PyTorch on Windows via ROCm 7.2.1):
+#   discrete RDNA4 (RX 9070/XT, 9060 XT) and RDNA3 (7900 XTX, 7700 etc.)
+#   plus Ryzen AI Max "Strix Halo" -- ordinary desktop APUs are NOT
+#   supported. Field target: volunteer tester's RX 9060 XT (gfx1200).
+#
+# Machine prerequisites (NOT pip):
+#   * AMD graphics driver 26.2.2 (AMD's stated requirement for the
+#     ROCm 7.2.1 PyTorch-on-Windows release)
+#   * Python 3.12 (the wheels are cp312-only)
+#   * ffmpeg/ffprobe on PATH -- gyan.dev "full" build. It includes the
+#     AMF encoders (hevc_amf/h264_amf/av1_amf) that are the hardware
+#     encode path on Radeon (Batch 34 encoder ladder: qsv -> amf -> sw).
+#
+# Install (fresh venv, python 3.12):
+#   pip install -r requirements-rocm.txt && pip install -e . --no-deps
+#
+# NOTE ON PINS: AMD ships these as DIRECT wheel URLs on repo.radeon.com
+# (no pip index), so the stack below is pinned to exact files by design.
+# When AMD publishes a newer rocm-rel, update ALL seven URLs together --
+# the rocm_sdk_* wheels and the torch wheels are built as a matched set.
+
+# ── ROCm SDK runtime (step 1: must install BEFORE torch) ──────────────
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz
+
+# ── PyTorch (+rocm build, matched to the SDK above) ───────────────────
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl
+
+# ── EXCLUDED vs requirements.txt (NVIDIA-only; same list as XPU) ──────
+# tensorrt / torch_tensorrt  -- TRT engines are CUDA-only; ROCm runs the
+#                               PyTorch BasicVSR++ fallback restorer.
+# cuda-python                -- CUDA engine smoke tests; no real CUDA here
+#                               (torch.cuda is HIP on this stack).
+# PyNvVideoCodec             -- NVDEC/NVENC; decode rides the ffmpeg
+#                               ladder (d3d11va on Radeon), encode rides
+#                               AMF via FfmpegEncoder.
+# onnxruntime-gpu            -- CUDA EP; plain onnxruntime below keeps
+#                               module-level imports satisfied.
+# nvidia-ml-py               -- NVML PCIe canary; optional by design.
+# nvidia-vfx                 -- Maxine RTX Super-Res; degrades when absent.
+
+# ── YOLO mosaic detector ──────────────────────────────────────────────
+# ultralytics sees torch.cuda (HIP) and should accept device=0 directly.
+# If detection misbehaves on the tester's machine, -self-check output
+# (torch.version.hip + device name + matmul probe) is the first thing
+# to collect.
+ultralytics>=8.4
+# lap: ultralytics tracker dependency it otherwise AutoUpdate-installs
+# AT RUNTIME (field event r3: it pip-installed itself in the MIDDLE of
+# a PyInstaller build when the spec first imported ultralytics). Pin it
+# up front so the venv is complete before anything imports ultralytics.
+lap>=0.5.12
+
+# ── ONNX Runtime (CPU) ────────────────────────────────────────────────
+onnxruntime>=1.26
+
+# ── Model conversion / sanitisation ───────────────────────────────────
+onnx>=1.21
+protobuf>=4.23
+
+# ── Image processing ──────────────────────────────────────────────────
+opencv-python>=4.13
+scikit-image>=0.26
+numpy>=2.4
+pillow>=11.0
+
+# ── UI / server ───────────────────────────────────────────────────────
+Flask>=3.1
+pywebview>=6.2
+
+# ── CLI progress bars ─────────────────────────────────────────────────
+tqdm>=4.67
