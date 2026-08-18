@@ -199,9 +199,18 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
     Write-Warning "Close it (or wait a minute) and re-run the packager. Skipping artifact creation."
   } else {
     # ── Pass 1: single plain archive (no volume suffix) ──────────────────
+    # r7 AUTO short-circuit (parity with the NVIDIA/XPU packagers): a raw
+    # dist bigger than 6000 MB cannot land under the 2GB asset limit (that
+    # would need >3:1 on binaries that are already mostly compressed), so
+    # skip the wasted single-archive pass and go straight to split volumes.
     $needSplit = $false
+    $distMB = [math]::Round((Get-ChildItem -Recurse -File ".\dist\$Name" |
+               Measure-Object Length -Sum).Sum / 1MB)
     if ($SplitMB -gt 0) {
       $needSplit = $true   # forced by parameter
+    } elseif ($SplitMB -lt 0 -and $distMB -gt 6000) {
+      Write-Host ("Dist is {0} MB raw -- cannot fit one 2GB asset; going straight to split volumes." -f $distMB) -ForegroundColor Yellow
+      $needSplit = $true
     } else {
       7z a -t7z "$installBase.7z" ".\dist\$Name"
       if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; $needSplit = $null }

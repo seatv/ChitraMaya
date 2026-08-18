@@ -16,6 +16,12 @@ in Python after the upsample engine call.
 Faithful port of Jasna's basicvsrpp_sub_engines.py — wrappers, compile
 flow, and runtime orchestration are byte-equivalent. Only the module
 imports are adapted to ChitraMaya's package paths.
+
+Copyright (c) the Jasna authors (Kruk2). This file is a derivative work
+of Jasna's implementation. Jasna and ChitraMaya are both licensed under
+AGPL-3.0 (see LICENSE); the port and subsequent ChitraMaya modifications
+are distributed under the same license. Credit also appears in the
+README Acknowledgements.
 """
 from __future__ import annotations
 

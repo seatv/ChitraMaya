@@ -146,12 +146,25 @@ def create_parser() -> argparse.ArgumentParser:
                         "but can reduce detection quality on Lada-family models trained at 640.")
     p.add_argument("--det-fp16", action=argparse.BooleanOptionalAction, default=None,
                    help="Run detector in fp16 (default: on). Negligible accuracy impact, ~2x faster.")
+    p.add_argument("--det-dump-rois", action=argparse.BooleanOptionalAction, default=None,
+                   help="Write every frame's FINAL detection boxes (post "
+                        "dilate/clip/seam-split) into the misses JSON as "
+                        "detection_rois. Off by default (adds bulk on long "
+                        "videos). Consumed by tools/ab_eval.py for "
+                        "region-masked quality metrics.")
 
     # --- Restoration ---
     p.add_argument("--rest-model", default=None)
     p.add_argument("--rest-fp16", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--rest-max-clip-length", type=int, default=None,
                    help="Max frames per restoration clip (default: 30, higher=smoother but more VRAM)")
+    p.add_argument("--restore-chunk-frames", type=int, default=None,
+                   help="PyTorch path only: cap the temporal window fed to "
+                        "BasicVSR++ per forward. 0 (default) = whole clip, "
+                        "matching lada's semantics -- the clip length IS the "
+                        "temporal window. A positive value trades temporal "
+                        "stability for VRAM (32 = pre-Batch-42 behavior). "
+                        "Tensor engines are unaffected.")
     p.add_argument("--rest-backend", choices=["auto", "trt", "pytorch"], default=None,
                    help="BasicVSR++ inference backend: 'auto' uses TRT sub-engines if present, "
                         "else PyTorch (default). 'trt' requires engines and fails if absent. "
@@ -172,6 +185,13 @@ def create_parser() -> argparse.ArgumentParser:
     # [CHANGE 2] FrameStore backpressure
     p.add_argument("--store-max-frames", type=int, default=None,
                    help="Max frames in FrameStore (0=auto, -1=unlimited; controls VRAM backpressure)")
+    # CM-084 (Batch 36): FrameStore backend
+    p.add_argument("--store-backend", choices=["auto", "device", "host"],
+                   default=None,
+                   help="Where FrameStore holds decoded frames. auto (default): "
+                        "device VRAM when the store fits, system RAM when it "
+                        "would not (enables long --rest-max-clip-length runs); "
+                        "device/host force the choice.")
 
     # CM-081 (Batch 23): stall watchdog + PCIe canary
     p.add_argument("--watchdog-stall-seconds", type=int, default=None,
@@ -329,6 +349,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "rest_model_path"), args.rest_model)
     _set_if_not_none(cfg, ("restoration", "fp16"), args.rest_fp16)
     _set_if_not_none(cfg, ("restoration", "max_clip_length"), args.rest_max_clip_length)
+    _set_if_not_none(cfg, ("restoration", "chunk_frames"),
+                     getattr(args, "restore_chunk_frames", None))
+    _set_if_not_none(cfg, ("detection", "dump_rois"),
+                     getattr(args, "det_dump_rois", None))
     _set_if_not_none(cfg, ("restoration", "backend"), args.rest_backend)
     _set_if_not_none(cfg, ("restoration", "clip_size"), args.rest_clip_size)
     _set_if_not_none(cfg, ("restoration", "border_ratio"), args.rest_border_ratio)
@@ -339,6 +363,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     # [CHANGE 2] FrameStore backpressure
     _set_if_not_none(cfg, ("store_max_frames",), args.store_max_frames)
+    # CM-084 (Batch 36): FrameStore backend (auto | device | host)
+    _set_if_not_none(cfg, ("store_backend",), getattr(args, "store_backend", None))
 
     # Scene tracking
     _set_if_not_none(cfg, ("scene_tracking", "ttl_after_end"), args.trk_ttl_after_end)

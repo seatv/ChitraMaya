@@ -82,6 +82,7 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
   'ctrlMosaicCensor', 'ctrlMosaicCensorBlock',
   'ctrlAsyncEncoder',
+  'ctrlStoreBackend',   // CM-084 (Batch 38): FrameStore backend
 ];
 
 if (typeof CONFIG_CONTROLS !== 'undefined') {
@@ -167,8 +168,12 @@ let _mosaicRestEngines = {};
 // Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
 let _mosaicDetEngines = {};
 
-// Max Clip range when TRT is NOT constraining it (PyTorch chunks arbitrarily).
-const MAX_CLIP_FREE = { min: 30, max: 180, step: 10 };
+// Max Clip range when TRT is NOT constraining it. Batch 42: on the
+// PyTorch path the clip now feeds BasicVSR++ whole (lada semantics --
+// clip length IS the temporal window), so the only ceiling is memory:
+// VRAM during the forward scales with clip length. Dial unlocked to 600;
+// a too-long clip fails with a catchable torch OOM, not a native crash.
+const MAX_CLIP_FREE = { min: 30, max: 600, step: 10 };
 
 // Default / constrain the Max Clip slider to what is actually compiled for the
 // selected restoration model + precision. Mirrors the server-side snap, so the
@@ -345,6 +350,15 @@ async function populateMosaicModelDropdowns() {
   function fill(select, items, savedValue) {
     if (!select) return;
     const prev = savedValue || select.value;
+    // CM-102 (v1.50.00): a fresh install has NO models yet, and a bare
+    // "— select model —" over an empty list reads as a broken app (two
+    // field users stalled here). When the list is empty, the placeholder
+    // itself says what to do; Manage Models is the button top-right.
+    if (!items || items.length === 0) {
+      select.innerHTML =
+        '<option value="">No models installed — use Manage Models (top right) to download</option>';
+      return;
+    }
     select.innerHTML = '<option value="">— select model —</option>';
     for (const item of items || []) {
       const opt = document.createElement('option');
@@ -438,6 +452,8 @@ function gatherMosaicParams() {
       // CM-077: secondary restoration (RTX Super-Res upscale before paste-back)
       mosaic_secondary: ((document.getElementById('ctrlMosaicSecondary') || {}).value || 'none'),
       mosaic_temporal_stability: parseInt((document.getElementById('ctrlMosaicTemporalFix') || {}).value || '0', 10) || 0,
+      // CM-084 (Batch 38): FrameStore backend (auto | device | host)
+      mosaic_store_backend: ((document.getElementById('ctrlStoreBackend') || {}).value || 'auto'),
     },
     encoder: {
       codec: document.getElementById('ctrlCodec').value,
@@ -1606,6 +1622,27 @@ function _foiCurrentFrame() {
   return state.currentFrame || 0;
 }
 
+// CM-085 (Batch 38): collapsible Test Frame strip. The toggle hides the
+// image rows (the bar stays, one line tall); a fresh Test Frame result
+// always re-expands so the run the user just asked for is never hidden.
+function _setFoiCollapsed(collapsed) {
+  const panel = document.getElementById('faceStrip');
+  const btn = document.getElementById('foiToggle');
+  if (!panel || !btn) return;
+  panel.classList.toggle('foi-collapsed', collapsed);
+  btn.innerHTML = collapsed ? '&#9656;' : '&#9662;';
+  btn.title = collapsed ? 'Expand the comparison strip'
+                        : 'Collapse the comparison strip';
+}
+(function _wireFoiToggle() {
+  const btn = document.getElementById('foiToggle');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const panel = document.getElementById('faceStrip');
+    _setFoiCollapsed(panel && !panel.classList.contains('foi-collapsed'));
+  });
+})();
+
 async function runFoiPreview() {
   const btn = document.getElementById('restoreDetectBtn');
   const status = document.getElementById('foiStatus');
@@ -1657,6 +1694,7 @@ async function runFoiPreview() {
       return;
     }
     _foiRegions = res.regions || [];
+    _setFoiCollapsed(false);   // CM-085: fresh result -> always visible
     const win = res.window || [];
     status.textContent =
       `Frame ${res.frame} · ${_foiRegions.length} region${_foiRegions.length === 1 ? '' : 's'}`

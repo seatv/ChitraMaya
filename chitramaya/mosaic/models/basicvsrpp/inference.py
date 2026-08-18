@@ -33,18 +33,46 @@ def get_default_gan_inference_config() -> dict:
 
 
 def _load_checkpoint_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    # CM-095 (v1.50.00): a wrong or corrupt file here used to surface as a
+    # cryptic torch/pickle traceback deep inside compile or load. Catch the
+    # common cases and say, in one message, WHICH file failed, WHY it is not
+    # usable, and WHAT to do (Manage Models downloads known-good weights).
+    import os as _os
+    if not _os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"Restoration checkpoint not found: {checkpoint_path}. "
+            f"Download a restoration model in Manage Models, or point "
+            f"--rest-model at an existing .pth file."
+        )
     # torch.load(weights_only=...) exists on newer torch; fall back if needed.
     try:
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        try:
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+    except Exception as e:
+        _sz = _os.path.getsize(checkpoint_path)
+        raise RuntimeError(
+            f"Could not read {checkpoint_path} as a PyTorch checkpoint "
+            f"({type(e).__name__}: {e}). The file is {_sz} bytes -- if that "
+            f"is much smaller than expected, the download was likely "
+            f"interrupted: delete it and re-download in Manage Models. If it "
+            f"is a TensorRT .engine or an ONNX file, select the matching "
+            f".pth checkpoint instead."
+        ) from e
 
     if isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
         return ckpt["state_dict"]
     if isinstance(ckpt, dict):
         # sometimes checkpoints are already a state_dict
         return ckpt
-    raise TypeError(f"Unsupported checkpoint format: {type(ckpt)}")
+    raise TypeError(
+        f"{checkpoint_path} loaded, but it is not a usable checkpoint "
+        f"(got {type(ckpt).__name__}, expected a state_dict). This usually "
+        f"means the file is a full training checkpoint or a different "
+        f"model family -- download a BasicVSR++ restoration model in "
+        f"Manage Models."
+    )
 
 
 def _strip_known_prefixes(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

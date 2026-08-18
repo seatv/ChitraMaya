@@ -1,9 +1,26 @@
+# packaging/windows/chitramaya-packager.ps1
+#
+# NVIDIA (CUDA / TensorRT) edition -- the original of the three packagers.
+# v1.50.00: -FfmpegDir and the AUTO single-file installer exe ported back
+# from the ROCm packager (r6, production-proven), so all three editions
+# share the same invocation and the same release-artifact shapes.
+
 param(
   [string]$Name = "ChitraMaya",
   [switch]$SkipFfmpeg = $false,
   [switch]$SwapPolarsLtsCpu = $true,
-  [int]$SplitMB = 1900   # SFX volume size (MB). 0 = single file. Default splits
-                         # into <2GB parts for GitHub's 2GB release-asset limit.
+  [string]$FfmpegDir = "",   # folder containing the ffmpeg.exe/ffprobe.exe to
+                             # bundle. Prepended to PATH for this run so the
+                             # spec bundles EXACTLY this build instead of
+                             # whatever another tool put first on PATH (field
+                             # event on the ROCm edition: a stray
+                             # C:\MyPrograms\<other-tool>\ffmpeg.exe was
+                             # winning the PATH race).
+  [int]$SplitMB = -1   # -1 = AUTO: single-file installer exe when the dist
+                       # fits under GitHub's 2GB asset limit, else 1900MB
+                       # parts + shepherd SFX (the CUDA/TRT stack usually
+                       # splits). 0 = force single volume; >0 = force that
+                       # part size.
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +37,33 @@ if (-not (Test-Path ".\packaging\windows\chitramaya_entrypoint.py")) { throw "Mi
 
 if (-not $env:VIRTUAL_ENV) {
   Write-Warning "No active virtualenv detected. Build from the SAME venv you run ChitraMaya in (it must have your CUDA torch / TensorRT / PyNvVideoCodec wheels)."
+}
+
+# ── ffmpeg preflight ─────────────────────────────────────────────────────
+# The NVIDIA edition decodes/encodes via PyNvVideoCodec, but ffmpeg does
+# the finalize remux and the fallback paths -- and the spec SILENTLY skips
+# bundling when nothing is on PATH, shipping a degraded dist. Fail fast
+# here instead, and pin the exact build with -FfmpegDir.
+if ($FfmpegDir) {
+  if (-not (Test-Path (Join-Path $FfmpegDir "ffmpeg.exe"))) {
+    throw "-FfmpegDir '$FfmpegDir' does not contain ffmpeg.exe."
+  }
+  if (-not (Test-Path (Join-Path $FfmpegDir "ffprobe.exe"))) {
+    throw "-FfmpegDir '$FfmpegDir' does not contain ffprobe.exe."
+  }
+  $env:Path = "$FfmpegDir;$env:Path"
+  Write-Host "Using -FfmpegDir: $FfmpegDir (prepended to PATH for this run)" -ForegroundColor Cyan
+}
+if (-not $SkipFfmpeg) {
+  $ff = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+  $fp = Get-Command ffprobe.exe -ErrorAction SilentlyContinue
+  if (-not ($ff -and $fp)) {
+    throw "ffmpeg.exe/ffprobe.exe not on PATH. ffmpeg performs the finalize remux on this edition; without it the bundle ships degraded. Pass -FfmpegDir <folder with the gyan.dev 'full' build>, put one first on PATH, or -SkipFfmpeg (target machines then need ffmpeg on PATH themselves)."
+  }
+  Write-Host ("Bundling ffmpeg from: {0}" -f $ff.Source) -ForegroundColor Cyan
+  # Provenance in the build log: exact version line of the chosen binary.
+  $ffVer = (& $ff.Source -version 2>$null | Select-Object -First 1)
+  if ($ffVer) { Write-Host ("  {0}" -f $ffVer) -ForegroundColor Gray }
 }
 
 # ── PyInstaller ──────────────────────────────────────────────────────────
@@ -93,15 +137,21 @@ if (Test-Path $compileSrc) {
  "Then run Compile-All-Engines.ps1 to build engines for THIS machine's GPU.") |
   Set-Content -Encoding ASCII (Join-Path $distDir "models\PUT-MODELS-HERE.txt")
 
-# ── Self-extracting installer (friendly two-stage SFX) ──────────────────
-# Layout matches the published releases: ChitraMaya-install.7z.001/.002 hold
-# the app; ChitraMaya-install.exe is a SMALL self-contained SFX carrying
-# install.cmd + install.ps1 + 7zr.exe. Running the exe extracts that payload
-# to temp and runs OUR script, which verifies all volumes are present (with
-# a plain-language error naming exactly which files are missing) before
-# extracting -- instead of 7-Zip's bare "Cannot open the file as archive".
+# ── Release artifact ─────────────────────────────────────────────────────
+# Two shapes, chosen by what actually fits -- both are ONE double-click
+# installer exe (r6, ported from the ROCm packager: consistent install
+# experience across editions):
+#   FITS under GitHub's 2GB asset limit  -> ONE file:
+#       ChitraMaya-install.exe = 7z.sfx extract-dialog stub + the archive.
+#       Double-click, pick a folder, extracts. (Falls back to a plain .7z
+#       only if 7z.sfx is not installed.)
+#   DOES NOT FIT (the usual case for the CUDA/TRT stack) -> split volumes
+#       + ChitraMaya-install.exe shepherd SFX that verifies the volumes
+#       are all present (naming exactly which file is missing) before
+#       extracting -- instead of 7-Zip's bare "Cannot open the file as
+#       archive".
 #
-# One-time vendor setup (packaging\windows\vendor\):
+# One-time vendor setup for the multi-part shape (packaging\windows\vendor\):
 #   BOTH files ship in the LZMA SDK's bin\ folder (the modern "extra"
 #   package no longer carries SFX modules):
 #     https://7-zip.org/sdk.html  -> lzma<ver>.7z  -> bin\7zSD.sfx, bin\7zr.exe
@@ -109,13 +159,14 @@ if (Test-Path $compileSrc) {
 #   7zr.exe   - standalone console 7z extractor (bundled in the payload so
 #               end users do not need 7-Zip installed)
 # Both are official Igor Pavlov binaries and redistributable.
-Write-Host "Creating self-extracting installer..." -ForegroundColor Yellow
+Write-Host "Creating release artifact..." -ForegroundColor Yellow
 if (Get-Command 7z -ErrorAction SilentlyContinue) {
   $installBase = "ChitraMaya-install"
   $vendorDir   = ".\packaging\windows\vendor"
   $sfxModule   = Join-Path $vendorDir "7zSD.sfx"
   $sevenZr     = Join-Path $vendorDir "7zr.exe"
   $instSrcDir  = ".\packaging\windows\installer"
+  $limitMB     = 1990   # margin under GitHub's 2 GiB asset limit
 
   # Remove stale artifacts from a previous run -- LOUDLY. 7-Zip cannot
   # update a multivolume archive ("Updating for multivolume archives is not
@@ -143,96 +194,162 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
       }
     }
   }
-  $survivors = @(Get-ChildItem -File -ErrorAction SilentlyContinue "$installBase.7z*")
+  $survivors = @(Get-ChildItem -File -ErrorAction SilentlyContinue "$installBase.7z*", "$installBase.exe")
 
   if ($survivors.Count -gt 0) {
-    Write-Warning ("Cannot delete stale installer volume(s): {0}." -f (($survivors | ForEach-Object Name) -join ', '))
+    Write-Warning ("Cannot delete stale artifact(s): {0}." -f (($survivors | ForEach-Object Name) -join ', '))
     Write-Warning "Something still holds them open (antivirus scan or an Explorer window)."
-    Write-Warning "Close it (or wait a minute) and re-run the packager. Skipping installer creation."
-  } elseif (-not (Test-Path $sfxModule) -or -not (Test-Path $sevenZr)) {
-    Write-Warning ("Vendor files missing ({0} and/or {1})." -f $sfxModule, $sevenZr)
-    Write-Warning "Download the LZMA SDK from 7-zip.org/sdk.html (lzma<ver>.7z), then copy"
-    Write-Warning "bin\7zSD.sfx and bin\7zr.exe into packaging\windows\vendor\ and re-run."
-    Write-Warning "Skipping installer creation."
-  } elseif (($instMissing = @(@("install.cmd", "install.ps1", "sfx_config.txt") |
-             Where-Object { -not (Test-Path (Join-Path $instSrcDir $_)) })).Count -gt 0) {
-    # Preflight BEFORE the multi-minute volume split: the installer scripts
-    # (Batch 20d, packaging\windows\installer\) must exist or staging fails
-    # after the big archive job has already run.
-    Write-Warning ("Installer script(s) missing from {0}: {1}." -f $instSrcDir, ($instMissing -join ', '))
-    Write-Warning "These ship in the repo (Batch 20d). Restore them and re-run."
-    Write-Warning "Skipping installer creation."
+    Write-Warning "Close it (or wait a minute) and re-run the packager. Skipping artifact creation."
   } else {
-    # 1) The big application archive, split into GitHub-sized volumes.
+    # ── Pass 1: single plain archive (no volume suffix) ──────────────────
+    # AUTO short-circuit: a raw dist bigger than 6000 MB cannot land under
+    # the 2GB asset limit (that would need >3:1 on binaries that are
+    # already mostly compressed), so skip the wasted single-archive pass
+    # and go straight to split volumes. The CUDA/TRT dist usually takes
+    # this path.
+    $needSplit = $false
+    $distMB = [math]::Round((Get-ChildItem -Recurse -File ".\dist\$Name" |
+               Measure-Object Length -Sum).Sum / 1MB)
     if ($SplitMB -gt 0) {
-      Write-Host "Splitting into ${SplitMB}MB volumes (GitHub 2GB release-asset limit)..." -ForegroundColor Yellow
-      7z a -t7z "-v${SplitMB}m" "$installBase.7z" ".\dist\$Name"
+      $needSplit = $true   # forced by parameter
+    } elseif ($SplitMB -lt 0 -and $distMB -gt 6000) {
+      Write-Host ("Dist is {0} MB raw -- cannot fit one 2GB asset; going straight to split volumes." -f $distMB) -ForegroundColor Yellow
+      $needSplit = $true
     } else {
-      # Keep volume naming (.001) even for a single part so the installer
-      # script's expectations hold.
-      7z a -t7z "-v99999m" "$installBase.7z" ".\dist\$Name"
-    }
-    if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; }
-    else {
-      $parts = @(Get-ChildItem "$installBase.7z.0*" | Sort-Object Name)
-
-      # 2) Stage the installer payload; stamp the real part count into the
-      #    script so it can name any missing volume exactly.
-      $stage = ".\build\installer_payload"
-      Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
-      New-Item -ItemType Directory -Force -Path $stage | Out-Null
-      Copy-Item (Join-Path $instSrcDir "install.cmd") $stage
-      # Stamp part count AND base name (regexes match any prior stamped
-      # value; basename stamping keeps this identical to the xpu packager
-      # and immune to a committed pre-stamped install.ps1).
-      (Get-Content (Join-Path $instSrcDir "install.ps1")) `
-        -replace '^\$ExpectedParts = \d+.*$', ('$ExpectedParts = {0}   # stamped by packager' -f $parts.Count) `
-        -replace '^\$BaseName\s*=.*$', ('$BaseName      = "{0}"   # stamped by packager' -f $installBase) |
-        Set-Content (Join-Path $stage "install.ps1")
-      Copy-Item $sevenZr $stage
-
-      # 3) Tiny payload archive + SFX assembly: module + config + payload.
-      $payload7z = ".\build\installer_payload.7z"
-      Remove-Item -ErrorAction SilentlyContinue $payload7z
-      7z a -t7z $payload7z "$stage\*"
-      if ($LASTEXITCODE -eq 0) {
-        # Assemble sfx-module + config + payload by DIRECT byte concatenation.
-        # The previous `cmd /c copy /b ("a + b + c") dest` passed the whole
-        # concat list as ONE quoted argument, so cmd searched for a single
-        # file literally named "a + b + c" -- and its error message went to
-        # Out-Null. (First-ever end-to-end run of this step caught it.)
-        # PowerShell owns the bytes now, and failures say WHY.
-        try {
-          $sfxParts = @($sfxModule,
-                        (Join-Path $instSrcDir "sfx_config.txt"),
-                        $payload7z)
-          $outPath = Join-Path (Get-Location) "$installBase.exe"
-          $outFs = [IO.File]::Create($outPath)
-          try {
-            foreach ($pf in $sfxParts) {
-              $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
-              $outFs.Write($bytes, 0, $bytes.Length)
+      7z a -t7z "$installBase.7z" ".\dist\$Name"
+      if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; $needSplit = $null }
+      else {
+        $single = Get-Item "$installBase.7z"
+        $mb = [math]::Round($single.Length / 1MB)
+        if ($mb -le $limitMB) {
+          # r6 (Gman, 2026-08-15: "We produce an install executable - why
+          # skip that??"): make the single-file release an INSTALL EXE,
+          # consistent with the multi-part shape -- still exactly ONE
+          # release asset, but double-clickable. 7z.sfx is 7-Zip's
+          # extract-dialog module (ships next to 7z.exe): stub + archive
+          # concatenated = an exe that asks for a folder and extracts.
+          $sfxGui = $null
+          $sevenZCmd = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($sevenZCmd) {
+            $cand = Join-Path (Split-Path $sevenZCmd.Source) "7z.sfx"
+            if (Test-Path $cand) { $sfxGui = $cand }
+          }
+          if ($sfxGui) {
+            $outPath = Join-Path (Get-Location) "$installBase.exe"
+            try {
+              $outFs = [IO.File]::Create($outPath)
+              try {
+                foreach ($pf in @($sfxGui, $single.FullName)) {
+                  $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
+                  $outFs.Write($bytes, 0, $bytes.Length)
+                }
+              } finally { $outFs.Close() }
+              Remove-Item -Force $single.FullName
+              $exeMb = [math]::Round((Get-Item $outPath).Length / 1MB)
+              Write-Host ""
+              Write-Host ("SINGLE-FILE INSTALLER: {0}  ({1} MB)" -f "$installBase.exe", $exeMb) -ForegroundColor Green
+              Write-Host "Release this ONE file. Users double-click it, pick a folder," -ForegroundColor Cyan
+              Write-Host "and it extracts there -- same experience as the other editions." -ForegroundColor Cyan
+            } catch {
+              Write-Warning ("SFX assembly failed: {0}. Falling back to the plain archive." -f $_.Exception.Message)
+              Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
             }
-          } finally { $outFs.Close() }
-        } catch {
-          Write-Warning ("SFX assembly failed: {0}" -f $_.Exception.Message)
+          } else {
+            Write-Warning "7z.sfx not found next to 7z.exe (it ships with the full 7-Zip install). Releasing the plain archive instead."
+            Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
+            Write-Host "Users extract it anywhere they like (Windows 11 Explorer, 7-Zip, or WinRAR)." -ForegroundColor Cyan
+          }
+        } else {
+          Write-Host ("Archive is {0} MB (> {1} MB limit) -- switching to split volumes + SFX installer." -f $mb, $limitMB) -ForegroundColor Yellow
+          Remove-Item -Force "$installBase.7z"
+          $needSplit = $true
         }
       }
+    }
 
-      if (Test-Path "$installBase.exe") {
-        Write-Host "Installer parts:" -ForegroundColor Green
-        foreach ($p in ($parts + (Get-Item "$installBase.exe"))) {
-          $mb = [math]::Round($p.Length / 1MB, 2)
-          Write-Host ("  {0}  ({1} MB)" -f $p.Name, $mb) -ForegroundColor Green
-        }
-        Write-Host "Release ALL of the above together. The .exe verifies the volumes and names any missing file before extracting." -ForegroundColor Cyan
+    # ── Multi-volume + SFX installer (only when it does not fit) ─────────
+    if ($needSplit -eq $true) {
+      if (-not (Test-Path $sfxModule) -or -not (Test-Path $sevenZr)) {
+        Write-Warning ("Vendor files missing ({0} and/or {1})." -f $sfxModule, $sevenZr)
+        Write-Warning "Download the LZMA SDK from 7-zip.org/sdk.html (lzma<ver>.7z), then copy"
+        Write-Warning "bin\7zSD.sfx and bin\7zr.exe into packaging\windows\vendor\ and re-run."
+        Write-Warning "Skipping installer creation."
+      } elseif (($instMissing = @(@("install.cmd", "install.ps1", "sfx_config.txt") |
+                 Where-Object { -not (Test-Path (Join-Path $instSrcDir $_)) })).Count -gt 0) {
+        # Preflight BEFORE the multi-minute volume split: the installer
+        # scripts (Batch 20d, packaging\windows\installer\) must exist or
+        # staging fails after the big archive job has already run.
+        Write-Warning ("Installer script(s) missing from {0}: {1}." -f $instSrcDir, ($instMissing -join ', '))
+        Write-Warning "These ship in the repo (Batch 20d). Restore them and re-run."
+        Write-Warning "Skipping installer creation."
       } else {
-        Write-Warning "Failed to assemble $installBase.exe."
+        $vol = if ($SplitMB -gt 0) { $SplitMB } else { 1900 }
+        Write-Host "Splitting into ${vol}MB volumes (GitHub 2GB release-asset limit)..." -ForegroundColor Yellow
+        7z a -t7z "-v${vol}m" "$installBase.7z" ".\dist\$Name"
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; }
+        else {
+          $parts = @(Get-ChildItem "$installBase.7z.0*" | Sort-Object Name)
+
+          # Stage the installer payload; stamp the real part count into the
+          # script so it can name any missing volume exactly.
+          $stage = ".\build\installer_payload"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item (Join-Path $instSrcDir "install.cmd") $stage
+          # Stamp part count AND base name (regexes match any prior stamped
+          # value; basename stamping keeps this identical to the xpu/rocm
+          # packagers and immune to a committed pre-stamped install.ps1).
+          (Get-Content (Join-Path $instSrcDir "install.ps1")) `
+            -replace '^\$ExpectedParts = \d+.*$', ('$ExpectedParts = {0}   # stamped by packager' -f $parts.Count) `
+            -replace '^\$BaseName\s*=.*$', ('$BaseName      = "{0}"   # stamped by packager' -f $installBase) |
+            Set-Content (Join-Path $stage "install.ps1")
+          Copy-Item $sevenZr $stage
+
+          # Tiny payload archive + SFX assembly: module + config + payload.
+          $payload7z = ".\build\installer_payload.7z"
+          Remove-Item -ErrorAction SilentlyContinue $payload7z
+          7z a -t7z $payload7z "$stage\*"
+          if ($LASTEXITCODE -eq 0) {
+            # Assemble sfx-module + config + payload by DIRECT byte
+            # concatenation. The previous `cmd /c copy /b ("a + b + c")
+            # dest` passed the whole concat list as ONE quoted argument, so
+            # cmd searched for a single file literally named "a + b + c" --
+            # and its error message went to Out-Null. (First-ever end-to-end
+            # run of this step caught it.) PowerShell owns the bytes now,
+            # and failures say WHY.
+            try {
+              $sfxParts = @($sfxModule,
+                            (Join-Path $instSrcDir "sfx_config.txt"),
+                            $payload7z)
+              $outPath = Join-Path (Get-Location) "$installBase.exe"
+              $outFs = [IO.File]::Create($outPath)
+              try {
+                foreach ($pf in $sfxParts) {
+                  $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
+                  $outFs.Write($bytes, 0, $bytes.Length)
+                }
+              } finally { $outFs.Close() }
+            } catch {
+              Write-Warning ("SFX assembly failed: {0}" -f $_.Exception.Message)
+            }
+          }
+
+          if (Test-Path "$installBase.exe") {
+            Write-Host "Installer parts:" -ForegroundColor Green
+            foreach ($p in ($parts + (Get-Item "$installBase.exe"))) {
+              $mb = [math]::Round($p.Length / 1MB, 2)
+              Write-Host ("  {0}  ({1} MB)" -f $p.Name, $mb) -ForegroundColor Green
+            }
+            Write-Host "Release ALL of the above together. The .exe verifies the volumes and names any missing file before extracting." -ForegroundColor Cyan
+          } else {
+            Write-Warning "Failed to assemble $installBase.exe."
+          }
+        }
       }
     }
   }
 } else {
-  Write-Host "7z not found - skipping SFX installer (zip dist\$Name instead)." -ForegroundColor Gray
+  Write-Host "7z not found - skipping release artifact (zip dist\$Name by hand instead)." -ForegroundColor Gray
 }
 
 Write-Host "Done." -ForegroundColor Green

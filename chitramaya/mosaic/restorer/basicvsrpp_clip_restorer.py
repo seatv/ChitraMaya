@@ -15,6 +15,19 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
       - model input: float (0..1) via /255
       - output: uint8 HWC with round+clamp
       - optional chunking via max_frames
+
+    Batch 42 (standing on lada's shoulders, ladaapp/lada -- semantics
+    studied from their AGPL source, no code copied): lada's pipeline
+    feeds each clip to BasicVSR++ WHOLE -- clip length IS the temporal
+    window, and their --max-clip-length help text warns that short
+    windows can cause flickering. Our port originally hard-capped the
+    forward at 32 frames (an 8GB-safety choice), which silently
+    disconnected Max Clip from the model's temporal context on the
+    PyTorch path. max_frames therefore now defaults to 0 = whole clip
+    (lada semantics); a positive value remains available as the
+    low-VRAM safety valve (restoreChunkFrames config key / CLI
+    --restore-chunk-frames; 32 restores the old behavior exactly).
+    VRAM during the forward scales with the window length.
     """
 
     def __init__(
@@ -23,7 +36,7 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
             device: torch.device,
             *,
             fp16: bool,
-            max_frames: int = 32,
+            max_frames: int = 0,
     ) -> None:
         super().__init__(device=device)
 
@@ -116,8 +129,12 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
         _hb = self.device.type != "cuda"
         import time as _time
 
-        for start in range(0, n, self.max_frames):
-            chunk = frames[start : start + self.max_frames]
+        # Batch 42: window = whole clip unless a positive max_frames caps
+        # it (the low-VRAM safety valve). See class docstring.
+        window = self.max_frames if self.max_frames > 0 else n
+
+        for start in range(0, n, window):
+            chunk = frames[start : start + window]
 
             # TCHW uint8
             tchw_u8 = torch.stack([f.permute(2, 0, 1).contiguous() for f in chunk], dim=0)

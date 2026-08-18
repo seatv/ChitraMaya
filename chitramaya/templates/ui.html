@@ -55,6 +55,17 @@
                      background:var(--panel-bg,#161616); border-bottom:1px solid var(--border,#2a2a2a); }
         .foi-bar { display:flex; align-items:center; gap:10px; }
         .foi-status { font:12px sans-serif; color:var(--text-dim,#8a8a8a); }
+        /* CM-085: collapsible strip -- the toggle hides the image rows and
+           leaves the one-line bar, so the strip stops eating player height
+           once you have seen the result. A new Test Frame re-expands it. */
+        .foi-toggle { margin-left:auto; background:none;
+                      border:1px solid var(--border,#2a2a2a);
+                      color:var(--text-dim,#8a8a8a); border-radius:4px;
+                      cursor:pointer; font:12px sans-serif; padding:1px 8px;
+                      line-height:1.4; flex:0 0 auto; }
+        .foi-toggle:hover { color:var(--accent,#7a5cff);
+                            border-color:var(--accent,#7a5cff); }
+        .foi-panel.foi-collapsed .foi-regions { display:none; }
         .foi-regions { display:flex; flex-direction:column; gap:8px;
                        max-height:130px; overflow-y:auto; }
         .foi-row { display:flex; gap:8px; cursor:pointer; border-radius:4px; }
@@ -98,6 +109,8 @@
       <div class="foi-panel" id="faceStrip">
         <div class="foi-bar">
           <span class="foi-status" id="foiStatus">Pause on a frame, then press Test Frame (below)</span>
+          <button class="foi-toggle" id="foiToggle"
+                  title="Collapse the comparison strip">&#9662;</button>
         </div>
         <div class="foi-regions" id="foiRegions"></div>
         <!-- hidden stubs: keep dormant detect/zoom refs in state.js/init.js alive -->
@@ -304,12 +317,21 @@
                 </select>
               </div>
               <div class="ctrl-row">
-                <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip. With Use Tensor on, any value up to the largest compiled engine size works (a set compiled at N covers clips 1..N); the ceiling is the largest compiled size (see Manage Models). Longer clips give smoother motion but use more VRAM; anything longer is split. Independent of detection.">Max Clip</span>
+                <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip - this IS the model's temporal window, so longer clips give smoother, more stable motion but use more VRAM. With Use Tensor on, the ceiling is the largest compiled engine size (see Manage Models). With Use Tensor off (PyTorch), the dial is free up to 600 and the only ceiling is GPU memory - if a clip is too long for your card the run stops with a clean out-of-memory error; dial down and retry (the restoreChunkFrames config entry can also cap the window without shortening clips). Independent of detection.">Max Clip</span>
                 <div class="ctrl-dial-container">
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
                          min="30" max="180" step="10" value="90">
                   <span class="ctrl-value" id="valMosaicMaxClip">90</span>
                 </div>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label"
+                      title="Where decoded frames wait for restoration. Auto keeps them in GPU VRAM when they fit and moves them to system RAM only when the run would need more than free VRAM (long Max Clip values). Device forces VRAM (the classic behavior); Host forces system RAM. Host adds a small per-frame transfer cost but makes Max Clip 180 possible on 8GB cards.">Frame Store</span>
+                <select class="ctrl-select" id="ctrlStoreBackend">
+                  <option value="auto" selected>Auto (recommended)</option>
+                  <option value="device">Device (VRAM)</option>
+                  <option value="host">Host (system RAM)</option>
+                </select>
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"

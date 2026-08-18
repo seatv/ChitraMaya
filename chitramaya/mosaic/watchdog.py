@@ -145,6 +145,30 @@ class _PcieCanary:
                         f"bitstream rebuilds the partial output.")
         return None
 
+    def recovery_note(self) -> Optional[str]:
+        """Return a one-time note when a previously alarmed link has
+        re-trained back to its best generation.
+
+        v1.50.00 (field, MCL-300 run 2026-08-16): the link dipped
+        Gen3->Gen2 mid-run, ALARMed, then re-trained to Gen3 within
+        seconds -- power-state churn, not the 5060 pre-failure signature
+        (whose tell is a down-train WITHOUT recovery). Without this note
+        a clean run ends with an unresolved alarm in the log, and the
+        user is left worried about a link that healed itself. Resets the
+        alarm latch so a later genuine down-train alarms again."""
+        if not self.active or self._alarmed_gen is None:
+            return None
+        try:
+            gen = int(self._nvml.nvmlDeviceGetCurrPcieLinkGeneration(self._handle))
+        except Exception:
+            return None
+        if self._best_gen is not None and gen >= self._best_gen:
+            self._alarmed_gen = None
+            return (f"PCIe link RECOVERED: back at Gen{gen}. The earlier "
+                    f"down-train was transient (power management), not the "
+                    f"pre-failure signature -- that one does not recover.")
+        return None
+
     def close(self) -> None:
         if self._nvml is not None:
             try:
@@ -234,6 +258,15 @@ class StallWatchdog:
                     pass
                 if alarm:
                     print(f"[Watchdog] ALARM: {alarm}")
+                # v1.50.00: close the loop on transient down-trains -- a
+                # recovered link gets an explicit all-clear so a completed
+                # run never ends on an unresolved alarm.
+                try:
+                    _rec = self._canary.recovery_note()
+                except Exception:
+                    _rec = None
+                if _rec:
+                    print(f"[Watchdog] {_rec}")
                 # 25d: judge link speed UNDER LOAD, not at arm time (idle
                 # links legitimately sit at Gen1 via ASPM). By the 3rd poll
                 # (~15s into the main loop) the GPU is demonstrably working;

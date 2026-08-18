@@ -145,6 +145,11 @@ class MosaicConfig:
     # 0 = off, 1..3 = strength (higher = more aggressive smoothing).
     mosaic_temporal_stability: int = 0
 
+    # CM-084 (Batch 38): FrameStore backend -- "auto" | "device" | "host".
+    # auto keeps frames in VRAM when they fit, offloads to system RAM when
+    # the projected store would not (the long-Max-Clip enabler).
+    mosaic_store_backend: str = "auto"
+
     # Spatial denoising on restored crops. Currently a no-op placeholder
     # (UI control removed; pipeline support added in a tuning session).
     mosaic_denoise: str = "none"        # none | low | medium | high
@@ -204,6 +209,7 @@ class MosaicConfig:
             vr_projection=str(self.mosaic_vr_projection or "none").lower(),
             secondary_restoration=str(self.mosaic_secondary or "none").lower(),
             temporal_stability=int(self.mosaic_temporal_stability or 0),
+            store_backend=str(self.mosaic_store_backend or "auto").lower(),
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),
