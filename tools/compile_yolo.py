@@ -73,11 +73,33 @@ def compile_one(model_path: Path, args) -> int:
     print(f"[compile-yolo] opt imgsz:     {args.det_imgsz}")
     print(f"[compile-yolo] max batch:     {args.max_batch}")
     print(f"[compile-yolo] precision:     {'fp16' if args.fp16 else 'fp32'}")
-    print(f"[compile-yolo] workspace:     {args.workspace} GB")
+    ws = int(args.workspace)
+    if ws > 0:
+        print(f"[compile-yolo] workspace:     {ws} GB")
+    else:
+        print(f"[compile-yolo] workspace:     no cap (TensorRT default: "
+              f"full device VRAM)")
     if args.dynamic:
-        max_dim = args.workspace * args.det_imgsz
+        # Shape ceiling mirrors ultralytics' hard-coded formula
+        # (ultralytics/utils/export/engine.py, onnx2engine):
+        #     max H,W = max(2, workspace or 2) * imgsz
+        # i.e. the SAME --workspace number is both the tactic memory pool
+        # AND the shape-ceiling multiplier. There is no export() kwarg to
+        # decouple them. workspace<=0 leaves the pool uncapped while the
+        # ceiling falls back to 2*imgsz -- the only way to give the builder
+        # more tactic memory WITHOUT inflating worst-case shapes.
+        max_dim = max(2, ws if ws > 0 else 2) * args.det_imgsz
         print(f"[compile-yolo] dynamic shape range: batch 1..{args.max_batch}, "
               f"H,W 32..{max_dim} (opt at {args.det_imgsz})")
+        if ws > 2:
+            print(f"[compile-yolo] CAUTION: workspace {ws} raises the max "
+                  f"accepted imgsz to {max_dim} (ultralytics couples the two). "
+                  f"Worst-case activations at {max_dim}x{max_dim} can exceed "
+                  f"VRAM and fail the build with 'could not find any "
+                  f"implementation'. Field event 2026-08-16: workspace 4 at "
+                  f"imgsz 800 -> 3200^2 -> 10GB tactic requests on an 8GB "
+                  f"card. Use --workspace 0 to enlarge the memory pool "
+                  f"without raising the ceiling.")
     print(f"[compile-yolo] device:        cuda:{args.gpu_id}")
     print()
 
@@ -123,7 +145,9 @@ def compile_one(model_path: Path, args) -> int:
         # Ultralytics writes the engine to model_path.with_suffix(".engine").
         # When dynamic=True, the engine accepts:
         #   - any batch size from 1 to args.max_batch
-        #   - any imgsz from 32 to args.workspace * args.det_imgsz
+        #   - any imgsz from 32 to max(2, args.workspace or 2) * args.det_imgsz
+        # workspace<=0 -> pool limit never set (TRT 10 default: full device
+        # VRAM), ceiling falls back to 2*imgsz.
         # opt-tuned for (args.max_batch, args.det_imgsz).
         # When dynamic=False, shape is locked to (args.max_batch, args.det_imgsz).
         # Ultralytics asserts batch>1 when dynamic=True; we honor that here.
@@ -227,13 +251,22 @@ def main() -> int:
              "causing 'could not find any implementation' build failures. "
              "Batch 8 requests ~1.32GB and builds cleanly. Only raise this if "
              "your pipeline truly needs >8 frames per detection batch AND you "
-             "also raise --workspace to fit the larger scratch.",
+             "also enlarge the pool -- prefer --workspace 0 (uncapped) over "
+             "raising the workspace number, which would also raise the shape "
+             "ceiling.",
     )
     parser.add_argument(
-        "--workspace", type=int, default=4,
-        help="TRT workspace in GB (default: 4). With --dynamic, this also caps "
-             "the engine's max accepted imgsz at workspace*imgsz "
-             "(e.g. 4*640=2560).",
+        "--workspace", type=int, default=2,
+        help="TRT builder memory pool in GB (default: 2, matching the server's "
+             "compile path). COUPLING (hard-coded in ultralytics): with "
+             "--dynamic this same number also multiplies the engine's max "
+             "accepted imgsz -- max H,W = max(2, workspace)*imgsz. Raising it "
+             "past 2 therefore inflates worst-case shapes and can FAIL the "
+             "build on 8GB cards (workspace 4 at imgsz 800 -> 3200^2 -> 10GB "
+             "tactic requests, field event 2026-08-16). Use 0 to leave the "
+             "pool UNCAPPED (TensorRT default: full device VRAM) while the "
+             "shape ceiling stays at 2*imgsz -- the clean way to offer the "
+             "builder more tactic memory.",
     )
     parser.add_argument(
         "--gpu-id", type=int, default=0,
@@ -276,13 +309,28 @@ def main() -> int:
     else:
         models = [target]
 
+    return _compile_all(models, args)
+
+
+def _compile_all(models, args) -> int:
     # Compile each; keep going on failure but remember if any failed.
     failures = []
     for i, model_path in enumerate(models, 1):
         if len(models) > 1:
             print(f"===== [{i}/{len(models)}] {model_path.name} "
                   f"=======================================")
-        rc = compile_one(model_path, args)
+        # Batch 39 r2 (Gman: generic names are useless in a folder of
+        # five logs): each MODEL gets its own log, named after the model,
+        # written next to it -- our prints, ultralytics, and TensorRT's
+        # native builder lines (the tactic/OOM warnings) all captured.
+        from chitramaya.compile_log import (
+            compile_log_path, tee_compile_output, write_log_header,
+        )
+        _log_path = compile_log_path(model_path.parent, model_path.stem)
+        with tee_compile_output(_log_path):
+            write_log_header(argv=sys.argv)
+            print(f"[compile-yolo] model: {model_path}")
+            rc = compile_one(model_path, args)
         if rc != 0:
             failures.append(model_path.name)
         # Always release CUDA between models so a failed or successful build

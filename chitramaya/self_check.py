@@ -45,6 +45,7 @@ from typing import List, Optional, Tuple
 # Keep in sync when batches add modules; the spec ledgers are the
 # file-level twin of this list.
 _MODULE_LEDGER = [
+    "chitramaya.compile_log",
     "chitramaya.config",
     "chitramaya.console_buffer",
     "chitramaya.device",
@@ -209,6 +210,19 @@ def devprobe_main() -> int:
     elif edition == "xpu":
         if getattr(torch, "xpu", None) and torch.xpu.is_available():
             dev, name = "xpu", torch.xpu.get_device_name(0)
+    # v1.50.00: append VRAM size to the device name -- the 8GB-vs-16GB
+    # question should never need a follow-up message (field event: the
+    # ROCm tester's card variant stayed unknown through a full PASS).
+    # Rides inside the name field, so the parent's parser is unchanged.
+    if dev is not None:
+        try:
+            if dev == "cuda":
+                _tot = torch.cuda.get_device_properties(0).total_memory
+            else:
+                _tot = torch.xpu.get_device_properties(0).total_memory
+            name = f"{name} ({_tot / (1024**3):.1f} GB VRAM)"
+        except Exception:
+            pass
     if dev is None:
         print("DEVPROBE|none||")
         return 0
@@ -402,7 +416,20 @@ def _check_optional_stacks(t: _Tally, edition: str) -> None:
     for mod, friendly, required_on in probes:
         try:
             m = importlib.import_module(mod)
-            ver = getattr(m, "__version__", "?")
+            ver = getattr(m, "__version__", None)
+            if not ver:
+                # v1.50.00: fall back to installed-distribution metadata --
+                # after the PyNvVideoCodec 2.2 API break, the exact wheel
+                # version in a paste is diagnostic gold, and some builds
+                # do not expose __version__.
+                try:
+                    from importlib import metadata as _md
+                    _dist = {"PyNvVideoCodec": "pynvvideocodec",
+                             "cv2": "opencv-python",
+                             "flask": "Flask"}.get(mod, mod)
+                    ver = _md.version(_dist)
+                except Exception:
+                    ver = "?"
             t.line("OK", f"{friendly} {ver}")
         except BaseException as e:
             if edition in required_on:

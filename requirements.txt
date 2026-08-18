@@ -33,6 +33,10 @@ torch_tensorrt==2.11.0
 cuda-python>=12.0
 
 # ── Video codec (NVDEC / NVENC) ───────────────────────────────────────
+# 2.2.0 changed Encode()/EndEncode() to return packet-dict lists where
+# 2.1 returned raw bytes (field break 2026-08-16); encoder.py normalizes
+# BOTH shapes (_bitstream_bytes), so the open bound stays. AV1 under 2.2
+# is untested in the field -- verify CM-091 seek fix on first AV1 run.
 PyNvVideoCodec>=2.1
 
 # ── YOLO mosaic detector ──────────────────────────────────────────────
@@ -66,3 +70,21 @@ tqdm>=4.67
 # been lost" by ~18s on a 5060 Ti field incident, so the watchdog alarms
 # on it. Optional at runtime -- if missing, the canary is silently off.
 nvidia-ml-py>=12.0
+
+# ── NVIDIA Video Effects / Maxine (CM-077 RTX Super-Res secondary) ────
+# Imports as `nvvfx`. Optional at RUNTIME (the pipeline warns and runs
+# without the secondary if missing) but listed here so a venv rebuild
+# does not silently lose SuperRes -- field event 2026-08-16: the
+# post-ROCm venv rebuild dropped it and every run logged "[Secondary]
+# WARNING: No module named 'nvvfx'". Plain PyPI package; needs an RTX
+# GPU + recent driver at runtime, but installs anywhere.
+nvidia-vfx>=0.1
+
+# ── vs_temporalfix (CM-078 Temporal Fix): DELIBERATELY NOT LISTED ─────
+# The temporal stabilizer is VENDORED, not a dependency: the
+# architecture is reimplemented in
+# chitramaya/mosaic/restorer/temporalfix_arch.py (credit: pifroggi,
+# https://github.com/pifroggi/vs_temporalfix, Apache-2.0) and the
+# weights ship in weights/. The upstream package is a VapourSynth
+# plugin, is NOT on PyPI, and is never imported -- adding it here would
+# make `pip install -r requirements.txt` FAIL. Do not add it.

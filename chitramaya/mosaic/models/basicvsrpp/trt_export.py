@@ -10,6 +10,10 @@ involved, falling back to torch.save for cases where multi-subgraph
 dynamic shapes can't be exported.
 
 Faithful port of Jasna's torch_tensorrt_export.py.
+
+Copyright (c) the Jasna authors (Kruk2). Derivative work of Jasna's
+implementation; both projects are AGPL-3.0 (see LICENSE). Credit also
+appears in the README Acknowledgements.
 """
 from __future__ import annotations
 

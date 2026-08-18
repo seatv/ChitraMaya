@@ -2,7 +2,7 @@
 
 A TensorRT-accelerated mosaic restoration studio with a real-time visual editor. Load a video, preview the restoration on your *actual* frames, and decide what to commit before spending time on a full encode — or point it at a whole folder and let it work through the queue.
 
-Built for NVIDIA RTX cards — and now, **experimentally, for Intel Arc** (see [the Intel Arc edition](#intel-arc-xpu-edition--experimental)).
+Built for NVIDIA RTX cards — with **experimental editions for AMD Radeon (ROCm)** and **Intel Arc** (see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Intel Arc edition](#intel-arc-xpu-edition--experimental)).
 
 ![ChitraMaya — the mosaic input and the restored result, side by side](docs/InAction.png)
 
@@ -38,7 +38,7 @@ You are solely responsible for what you create with it and for complying with al
 - **[For Users](#for-users)** — download the installer, get models, compile, run. No Python, no build tools.
 - **[For Developers](#for-developers)** — clone the repo, set up a venv, run from source, or build the installer.
 
-**Intel Arc owner?** The NVIDIA instructions below don't apply to you — jump to **[the Intel Arc edition](#intel-arc-xpu-edition--experimental)**.
+**AMD Radeon or Intel Arc owner?** The NVIDIA instructions below don't apply to you — jump to **[the AMD edition](#amd-radeon-rocm-edition--experimental)** or **[the Intel Arc edition](#intel-arc-xpu-edition--experimental)**.
 
 ---
 
@@ -46,7 +46,7 @@ You are solely responsible for what you create with it and for complying with al
 
 ### 1. Requirements
 
-- **GPU:** NVIDIA RTX card. Native TensorRT builders ship for **RTX 50-series (Blackwell), 40-series (Ada), and 30-series (Ampere)**. Other cards still work via a slower PTX fallback for the first compile. **AV1 output** additionally requires an RTX 40-series or newer (older cards can decode AV1, but only Ada/Blackwell NVENC can encode it — the app checks and tells you). The optional **RTX Super-Res** second stage needs an RTX card with a recent NVIDIA driver. *(Intel Arc cards: see [the Arc edition](#intel-arc-xpu-edition--experimental) — it is a separate download.)*
+- **GPU:** NVIDIA RTX card. Native TensorRT builders ship for **RTX 50-series (Blackwell), 40-series (Ada), and 30-series (Ampere)**. Other cards still work via a slower PTX fallback for the first compile. **AV1 output** additionally requires an RTX 40-series or newer (older cards can decode AV1, but only Ada/Blackwell NVENC can encode it — the app checks and tells you). The optional **RTX Super-Res** second stage needs an RTX card with a recent NVIDIA driver. *(AMD Radeon and Intel Arc cards: see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Arc edition](#intel-arc-xpu-edition--experimental) — each is a separate download.)*
 - **OS:** Windows 10/11 with an up-to-date NVIDIA driver.
 - Nothing else — CUDA, TensorRT, ffmpeg, and Python are all bundled in the installer.
 
@@ -64,8 +64,8 @@ Grab the latest release from the **[Releases](https://github.com/seatv/ChitraMay
 > - [ ] `ChitraMaya-install.7z.002`
 > - [ ] `ChitraMaya-install.exe`
 >
-> *(The Intel Arc edition is different: it is **one** `.7z` file you extract
-> yourself — see the Arc section.)*
+> *(The AMD and Intel Arc editions are different: each is **one**
+> `*-install.exe` you double-click — see their sections.)*
 
 Run `ChitraMaya-install.exe` — it reassembles the parts and extracts automatically. You'll get a `ChitraMaya` folder containing `ChitraMaya.exe`, `ChitraMaya-cli.exe`, a `models\` folder, and `Compile-All-Engines.ps1`. If the install fails immediately, check that all three downloads completed and are in one folder.
 
@@ -112,11 +112,13 @@ When it finishes, the badges flip to **Compiled** and the models are ready to us
 
 > [!IMPORTANT]
 > ### The 8 GB VRAM rule
-> On an **8 GB card**, use **Max Clip Length 60** and **encoder preset P5**. Larger MCL values load a bigger restoration engine set that roughly doubles resident VRAM; the run may start, then die mid-encode once the driver starts paging (eGPU/constrained-PCIe setups are hit hardest, and the NVENC error that results is misleadingly labeled). MCL 60 + P5 runs the full quality stack — Super-Res and Temporal Stability included — inside the budget. **12 GB+ cards:** run MCL 90+; our field data says the extra clip length is worth having.
+> On an **8 GB card**, use **Max Clip Length 60** (90 is fine too) and **encoder preset P5**. The key fact: a TensorRT engine set reserves VRAM for the clip size it was **compiled** at, not the Max Clip value you dial — selecting MCL 60 while only a 180-frame set is compiled still pays the 180-frame memory bill. So **compile a set for each Max Clip value you actually use** (30/60/90 — Manage Models, one compile each); the app always loads the *smallest* compiled set that covers your dial. From v1.50.00 the console warns you **before the run starts** if the set about to load is too big for your card, and checks encoder headroom after models land — heed both. Sets of 90 and below run the full quality stack comfortably on 8 GB; 120 is marginal; 180 needs 16 GB. **12 GB+ cards:** run MCL 90+ freely; our field data says the extra clip length is worth having.
 
 A few more things worth knowing before a full run:
 
 - **Max Clip Length is flexible.** A restoration engine set compiled at N handles any clip length up to N, so you can set Max Clip to any value up to your largest compiled size — the app loads the smallest set that covers your request and runs at the ceiling you asked for. Longer clips give better temporal stability but cost more VRAM.
+- **Full-clip restoration on the PyTorch path (v1.50.00).** With **Use Tensor** off, the Max Clip dial unlocks up to **600 frames** and the restorer propagates detail across the whole window in one pass — the dial *is* the temporal window there, limited only by memory. If a long window doesn't fit, add `"restoreChunkFrames": 32` to `ChitraMaya-config.json` (or `--restore-chunk-frames 32`) to restore the old chunked behavior.
+- **Two copies at once is fine.** Launching a second instance automatically picks the next port (the console says so) and writes its own `ChitraMaya-console-<pid>.log`, so parallel sessions don't fight over one log file.
 - **VRAM pre-flight warning.** Before processing starts, ChitraMaya checks free GPU memory against what the run needs and warns you up front — from "headroom is thin" through "VRAM tight, may page" up to "this configuration does not fit this GPU" — and names the levers that would help (lower Max Clip, a smaller compiled engine set, PyTorch detection). Heed it, especially on 8 GB and smaller cards.
 - **Async Encode is off by default.** Synchronous encoding is the dependable default and saves ~500–600 MB of VRAM at 4K. If your card has headroom, tick **Async Encode** in the Encoder panel to overlap encode with restoration for a faster run.
 - **Output codec.** The Encoder panel offers **HEVC** (default), **H.264**, and **AV1** (RTX 40-series or newer). Your **QP** setting always uses the familiar HEVC 0–51 scale; for AV1 the app maps it internally to AV1's finer quantizer scale (the log shows the mapping), so QP 18 means the same quality intent regardless of codec. AV1 outputs are automatically post-processed so they seek correctly in every player (a hardware-encoder quirk ChitraMaya repairs at packaging time). The **Preset** dropdown offers the full P1 (fastest) to P7 (best) ladder — on 8 GB cards stay at **P5 or below**.
@@ -203,6 +205,29 @@ Auto mode reuses the detection pipeline: pick a detection model (e.g. an NSFW de
 
 ---
 
+## AMD Radeon (ROCm) Edition — EXPERIMENTAL
+
+> [!CAUTION]
+> **Very early field coverage.** The AMD edition has so far been validated
+> on a small number of machines (first field card: an RX 9060 XT — clean
+> self-check and the app runs; broader restore mileage is still
+> accumulating). It may work well on your card; it may not. Use with
+> caution and please report what you find.
+
+The AMD edition is a **separate download** — a single **`ChitraMaya-rocm-install.exe`**: double-click, pick a folder, and run `ChitraMaya.cmd` from the extracted folder. Do not mix it with the NVIDIA install.
+
+**How it differs from the NVIDIA edition:**
+
+- **Requires Adrenalin driver 26.2.2 or newer.** Earlier drivers lack the runtime the bundled PyTorch ROCm stack needs.
+- **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch (and from v1.50.00, with the full-clip temporal window: the biggest quality change this edition has received). Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step.
+- **ffmpeg does decode and encode** (AMD AMF hardware encoders where available).
+- **NVIDIA-only features say so and step aside:** RTX Super-Res and the PCIe monitor are unavailable by design. Temporal Stability works fully.
+- Everything else — the editor, Test Frame, Process Folder, Add Mosaic, SBS View, the watchdog, keep-awake, crash hardening — is the same product.
+
+**Reporting problems:** attach `ChitraMaya-console.log` and the `*.misses.json` beside your output, and state your GPU model, driver version, and Resizable BAR state. Run `ChitraMaya-cli.exe -self-check` and include its output — from v1.50.00 it reports your card's VRAM too. No explicit content in issues, per the issue template.
+
+---
+
 ## Intel Arc (XPU) Edition — EXPERIMENTAL
 
 > [!CAUTION]
@@ -212,7 +237,7 @@ Auto mode reuses the detection pipeline: pick a detection model (e.g. an NSFW de
 > may work; it may not. Use with caution, expect rough edges, and
 > please report what you find.
 
-The Arc edition is a **separate download** (`ChitraMaya-xpu-install.7z` — a single file; extract it anywhere with Explorer, 7-Zip, or WinRAR and run `ChitraMaya.cmd`). Do not mix it with the NVIDIA install.
+The Arc edition is a **separate download** — a single `ChitraMaya-xpu-install` file (an `.exe` installer from v1.50.00 on: double-click, pick a folder; earlier releases were a plain `.7z` you extract yourself). Run `ChitraMaya.cmd` from the extracted folder. Do not mix it with the NVIDIA install.
 
 **What works (field-validated on the test machine):** the complete product path — detection, BasicVSR++ restoration, Temporal Stability, encode — on the Arc; **Quick Sync hardware decode** (with D3D11VA and CPU fallbacks — the console tells you which was picked) and **Quick Sync hardware encode** (AV1, HEVC, H.264); crash hardening (a failed run still yields a playable partial output plus a `*.misses.json` diagnostic report with the console tail embedded); the stall watchdog, VRAM telemetry, and keep-awake for long runs.
 
@@ -256,7 +281,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-**Intel Arc source setup:** use `requirements-xpu.txt` instead of `requirements.txt` (it installs the torch `+xpu` wheels and the Intel runtime; do **not** install IPEX — it is discontinued and upstreamed into PyTorch). Everything else is identical; the app picks CUDA → XPU → CPU automatically at startup.
+**Intel Arc source setup:** use `requirements-xpu.txt` instead of `requirements.txt` (it installs the torch `+xpu` wheels and the Intel runtime; do **not** install IPEX — it is discontinued and upstreamed into PyTorch). **AMD ROCm source setup:** use `requirements-rocm.txt` (torch `+rocm` wheels; Adrenalin 26.2.2+ on the target machine). Everything else is identical; the app picks CUDA → XPU/ROCm → CPU automatically at startup.
 
 Models are not shipped; place detection `.pt` and restoration `.pth` files in `models/` (compiled engines are cached in `models/engines/`). The temporal-stability weights are the exception: they live in the repo and ship in the package.
 
@@ -314,6 +339,8 @@ Useful CLI flags:
 | `--batch-skip-existing` / `--no-batch-skip-existing` | Skip files whose output already exists (the resume mechanism; on by default) |
 | `--rest-backend` | `auto` (default — loads a covering engine set, or falls back to PyTorch), `trt` (force TensorRT sub-engines), or `pytorch` (force fallback, no precompiled engines needed) |
 | `--rest-max-clip-length` | Frames per restoration clip. Any value up to your largest compiled set — the app loads the smallest set that covers it and runs at this ceiling. Defaults to 30 if omitted. **8 GB cards: 60** (see the VRAM rule). |
+| `--restore-chunk-frames` | PyTorch restoration path only: cap the temporal window at N frames (`32` = pre-v1.50 behavior). Default `0` = no cap — the whole clip is restored in one pass. |
+| `--det-dump-rois` | Write every detection rectangle per frame into the run's `.misses.json` (for analysis tools like `tools/ab_eval.py`) |
 | `--secondary-restoration` | `none` (default), `rtx-2x`, or `rtx-4x` — RTX Super-Res upscale of restored regions before paste-back (recommended; needs RTX + recent driver) |
 | `--temporal-stability` | `0` (off, default) to `3` — flow-gated temporal smoothing of restored regions (recommended: 2; weights bundled) |
 | `--rest-blendmask` | `none` (default) or `facefusion` — shape-aware Face Swap blend for paste-back edges |
@@ -331,17 +358,23 @@ Useful CLI flags:
 
 Run `chitramaya -restore --help` for the full list. In the packaged app, use `ChitraMaya-cli.exe` for all of the above — the windowed `ChitraMaya.exe` detaches from the terminal and prints nothing there.
 
+### Measure quality (v1.50.00)
+
+`tools/ab_eval.py` is the paired-evaluation harness we use to compare restoration arms (and to keep ourselves honest against other tools). Give it the pristine original, the mosaic'd input, and one or more restored outputs; it aligns the clips automatically (metrics on unaligned clips are garbage — it refuses to make that mistake), masks the analysis to the *restored regions* (run the restore with `--det-dump-rois` so the true detection footprint is in the `.misses.json`), and reports fidelity, texture, motion, and flicker per arm, plus side-by-side renders and a contact sheet. Run `python tools/ab_eval.py --help` from a source checkout.
+
 ### Build the installer
 
 ```powershell
-# From the repo root, in your release venv:
+# From the repo root, in the matching release venv:
 # NVIDIA edition:
 powershell -ExecutionPolicy Bypass .\packaging\windows\chitramaya-packager.ps1
 # Intel Arc edition (from the Arc venv):
 powershell -ExecutionPolicy Bypass .\packaging\windows\chitramaya-xpu-packager.ps1
+# AMD ROCm edition (from the ROCm venv):
+powershell -ExecutionPolicy Bypass .\packaging\windows\chitramaya-rocm-packager.ps1
 ```
 
-The NVIDIA packager produces a split, self-extracting installer under `dist\`; TensorRT builder resources are trimmed to the shipped consumer architectures (plus PTX) to keep the size down — edit `_DROP_TRT_BUILDER_ARCHS` in `packaging\windows\chitramaya.spec` to change which GPUs are supported natively. The Arc packager produces a **single `.7z`** when the build fits under GitHub's 2 GB asset limit (no installer needed), falling back to the split installer only when it doesn't. Both specs verify at build time that every expected module and bundled data file is present, fail loudly naming anything missing — and the Arc spec additionally refuses to build from a non-`+xpu` venv and probes the bundled ffmpeg for the QSV encoders.
+As of v1.50.00 all three packagers share the same behavior: pass **`-FfmpegDir <folder>`** to pin exactly which ffmpeg/ffprobe build gets bundled (otherwise the first one on PATH wins — a field bug once shipped a stray tool's ffmpeg). Each produces **one double-click installer exe** when the build fits under GitHub's 2 GB asset limit, or split volumes plus a small shepherd installer exe (which verifies all parts are present, naming any missing file) when it doesn't — the NVIDIA CUDA/TRT stack normally takes the split path. TensorRT builder resources in the NVIDIA build are trimmed to the shipped consumer architectures (plus PTX) to keep the size down — edit `_DROP_TRT_BUILDER_ARCHS` in `packaging\windows\chitramaya.spec` to change which GPUs are supported natively. All three specs verify at build time that every expected module and bundled data file is present and fail loudly naming anything missing; the Arc and ROCm specs additionally refuse to build from the wrong venv and probe the bundled ffmpeg for the hardware encoders they need (QSV / AMF).
 
 ---
 
@@ -355,6 +388,10 @@ NVIDIA:  Decode (NVDEC) -> [VR Projection] -> Detect (YOLO) -> Track scenes
 Intel Arc:  Decode (ffmpeg / Quick Sync) -> Detect (YOLO) -> Track scenes
             -> Restore (BasicVSR++ / PyTorch xpu) -> [Temporal Stability]
             -> Composite -> Encode (ffmpeg / Quick Sync)
+
+AMD ROCm:   Decode (ffmpeg) -> Detect (YOLO) -> Track scenes
+            -> Restore (BasicVSR++ / PyTorch rocm) -> [Temporal Stability]
+            -> Composite -> Encode (ffmpeg / AMF)
 ```
 
 A YOLO detector locates mosaic regions per frame, a scene tracker groups them into temporally coherent clips, and a BasicVSR++ restoration model (run through TensorRT sub-engines, or a PyTorch fallback) reconstructs each clip with temporal consistency. Restored regions then pass through two optional quality stages — a flow-gated **temporal stabilizer** that removes frame-to-frame shimmer, and an **RTX Super-Res** upscale so large regions are pasted back without stretching — before being composited into the frame, with an optional **Face Swap** blend that follows the mosaic's actual shape for a softer edge. With **VR Projection** enabled, detection through restoration run in a per-eye fisheye space and only the restored regions are warped back, leaving every other pixel of the original untouched.
@@ -365,7 +402,7 @@ Full restores stream the whole file through NVDEC for throughput; *Test Frame* a
 
 A few things are intentionally incomplete or have known limitations in this release:
 
-- **The Intel Arc edition is experimental and single-machine-tested** — see the caution in [its section](#intel-arc-xpu-edition--experimental). It is also roughly 20× slower than an equivalent NVIDIA card on the current PyTorch Intel stack; that gap is expected to narrow as Intel's software matures, not something you can tune away.
+- **The Intel Arc and AMD ROCm editions are experimental with thin field coverage** — see the cautions in [the Arc section](#intel-arc-xpu-edition--experimental) and [the AMD section](#amd-radeon-rocm-edition--experimental). The Arc edition is also roughly 20× slower than an equivalent NVIDIA card on the current PyTorch Intel stack; that gap is expected to narrow as Intel's software matures, not something you can tune away.
 - **Automatic mosaic detection is experimental — do not rely on it to censor.** The Auto-detect / censor mode depends on a third-party NSFW detection model that does not reliably detect all explicit content; it misses regions and whole frames and is not suitable for production censoring. Use the manual draw-rectangles Add Mosaic with the max-recall settings and two-pass leak check, and review every frame of any output yourself.
 - **Some users have reported blend artifacts with the Face Swap blend mask** on certain content — visible edge irregularities around restored regions. If you see them, set Blend Mask to **None** (the classic blend is unaffected). Under investigation.
 - **On warped-mosaic VR content, run statistics cannot detect a quality failure.** With VR Projection Off on such content, the stats can report full coverage while the output still shows mosaic (the models "restore" blocks they cannot parse). Use **Test Frame** to judge — see the VR section.
@@ -383,7 +420,7 @@ ChitraMaya stands on the work of others, and it's a pleasure to say so:
 
 - **[HypoX64](https://github.com/HypoX64/DeepMosaics)** — author of **DeepMosaics**, where it all began. The first proof that video mosaic restoration was possible at all: [github.com/HypoX64/DeepMosaics](https://github.com/HypoX64/DeepMosaics).
 - **[ladaapp](https://codeberg.org/ladaapp/lada)** — author of **lada**. Working with him on the Windows port is what gave me the idea to begin this project, and ChitraMaya uses his excellent detection and restoration models.
-- **Kruk2** — author of **Jasna**. ChitraMaya's BasicVSR++ TensorRT sub-engine implementation (the split of the recurrent network into separately compiled engines, the compile flow, and the runtime orchestration) is ported from Jasna's, as the source file headers note. Both projects are AGPL-3.0 — the license that makes building on each other's work possible.
+- **[Kruk2](https://github.com/kruk2)** — author of **Jasna**. ChitraMaya's BasicVSR++ TensorRT sub-engine implementation (the split of the recurrent network into separately compiled engines, the compile flow, and the runtime orchestration) is ported from Jasna's, as the source file headers note. Both projects are AGPL-3.0 — the license that makes building on each other's work possible.
 - **[zelefans](https://codeberg.org/zelefans/vr_remove_mosaic)** — for the VR mosaic detection models and the fisheye-to-flat projection idea behind ChitraMaya's VR Projection mode.
 - **[pifroggi](https://github.com/pifroggi/vs_temporalfix)** — author of **vs_temporalfix**, the flow-gated temporal stabilization model behind ChitraMaya's Temporal Stability feature (Apache-2.0; license included with the bundled weights).
 - **NVIDIA Maxine** — the Video Effects SDK powering the RTX Super-Res secondary stage.

@@ -267,6 +267,33 @@ def _derive_ffprobe(ffmpeg_path: str) -> str:
     return "ffprobe"
 
 
+def _finalize_timeout_s(*paths) -> int:
+    """Timeout (seconds) for a finalize/remux ffmpeg call, scaled to the
+    bytes it must move.
+
+    The flat 900s (15 min) died in the field on a ~50 GB output (The-Idol,
+    2026-08): the finalize remux is stream-copy, but ``-movflags
+    +faststart`` makes ffmpeg write the whole file and then REWRITE it a
+    second time to move the moov atom to the front -- two full passes of
+    disk I/O over the entire output. At spinning-disk / SMR / USB / network
+    speeds, two passes over tens of GB take far more than 15 minutes, and
+    killing a remux that is still making disk progress converts a slow
+    finalize into a failed run (every frame already safely encoded).
+
+    Budget: 25 MB/s effective throughput (deliberately pessimistic), two
+    passes, +300s slack, floored at the old 900s. 50 GB -> ~72 min ceiling;
+    the short clips that dominate testing keep the familiar 15 min.
+    """
+    total = 0
+    for p in paths:
+        try:
+            if p:
+                total += os.path.getsize(str(p))
+        except OSError:
+            pass
+    return max(900, int(total / (25 * 1024 * 1024)) * 2 + 300)
+
+
 def _probe_stream_start_seconds(ffprobe: str, path: str, stream: str) -> Optional[float]:
     """Return a stream's start_time in seconds via ffprobe.
 
@@ -522,6 +549,38 @@ class Encoder:
             print("[Encoder] AV1 seek fix armed: sequence headers will be "
                   "verified and repeated in-band at the remux stage (CM-091).")
 
+    @staticmethod
+    def _bitstream_bytes(ret) -> bytes:
+        """Normalize Encode()/EndEncode() output across PyNvVideoCodec
+        API generations.
+
+        PyNvVideoCodec 2.1 returns a bytes-like blob (possibly empty).
+        PyNvVideoCodec 2.2 changed the API: it returns a LIST of packet
+        dicts {"data", "picture_type", "timestamp"}; NVIDIA's own 2.2
+        samples concatenate bytes(p["data"]) before writing. Field event
+        2026-08-16: requirements' open bound (>=2.1) pulled 2.2.0 into a
+        rebuilt dev venv and every frame write raised
+        TypeError: 'dict' object cannot be interpreted as an integer --
+        first drain died, .hevc got no headers, remux unrecoverable.
+        This helper accepts both shapes so the encoder works against
+        either wheel; frozen releases bundle whichever was installed at
+        build time.
+        """
+        if not ret:
+            return b""
+        if isinstance(ret, (bytes, bytearray, memoryview)):
+            return bytes(ret)
+        if isinstance(ret, (list, tuple)):
+            parts = []
+            for p in ret:
+                if isinstance(p, dict):
+                    parts.append(bytes(p["data"]))
+                else:
+                    parts.append(bytes(p))
+            return b"".join(parts)
+        # Unknown-but-buffer-like (future API drift): let bytes() try.
+        return bytes(ret)
+
     def encode_frame(self, frame: torch.Tensor) -> None:
         """Encode a single BGRA HWC4 uint8 CUDA tensor."""
         if self._closed:
@@ -531,17 +590,17 @@ class Encoder:
         if frame.device.type == "cuda":
             torch.cuda.synchronize(device=frame.device)
 
-        bitstream = self._encoder.Encode(frame)
-        if bitstream:
-            self._file.write(bytearray(bitstream))
+        payload = self._bitstream_bytes(self._encoder.Encode(frame))
+        if payload:
+            self._file.write(payload)
         self._frames_encoded += 1
 
     def flush(self) -> None:
         """Flush remaining frames from encoder."""
         try:
-            tail = self._encoder.EndEncode()
+            tail = self._bitstream_bytes(self._encoder.EndEncode())
             if tail:
-                self._file.write(bytearray(tail))
+                self._file.write(tail)
         except Exception as e:
             print(f"[Encoder] Flush error: {e}")
         print(f"[Encoder] Flushed ({self._frames_encoded} frames)")
@@ -763,9 +822,13 @@ class Encoder:
         else:
             print(f"[Encoder] Done: {self.output_path}")
 
-    def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg") -> bool:
+    def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg",
+                    timeout_s: int = 900) -> bool:
         """Run one ffmpeg command; return True on rc==0. Shared by both remux
-        passes. UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames."""
+        passes. UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames.
+        ``timeout_s``: pass _finalize_timeout_s(...) for whole-file remux
+        steps (v1.50.00, the 50GB Idol lesson); the 900s default suits
+        everything else."""
         print(f"[Encoder] {label}: {' '.join(cmd)}")
         try:
             result = subprocess.run(
@@ -774,7 +837,7 @@ class Encoder:
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=900,
+                timeout=timeout_s,
                 **NOWINDOW,
             )
             if result.returncode != 0:
@@ -785,6 +848,12 @@ class Encoder:
                 return False
             print(f"[Encoder] {label} OK")
             return True
+        except subprocess.TimeoutExpired:
+            print(f"[Encoder] {label} TIMED OUT after {timeout_s}s with no "
+                  f"result. Every encoded frame is preserved in the raw "
+                  f"bitstream -- use the recovery command printed below, "
+                  f"ideally targeting a faster disk.")
+            return False
         except Exception as e:
             print(f"[Encoder] {label} error: {e}")
             return False
@@ -880,6 +949,60 @@ class Encoder:
             elif self.codec == "av1":
                 tag_args = ["-tag:v", "av01"]
 
+        # v1.50.00 rider (from the lada A/B "pop" investigation): propagate
+        # the SOURCE's color tags into the output. Restored files used to
+        # ship with color_space=unknown while sources carry bt709 -- players
+        # then GUESS, and can render output vs source subtly differently.
+        # With -c:v copy the reliable channel is the codec VUI via the
+        # *_metadata bitstream filter, applied on the command that wraps the
+        # raw stream. Conservative: only known name->code mappings; unknown
+        # sources keep today's behavior.
+        color_args: List[str] = []
+        try:
+            if self.codec in ("hevc", "h265", "h264", "avc") and self.input_path:
+                import subprocess as _sp
+                _pr = _sp.run(
+                    [_derive_ffprobe(self.ffmpeg_path), "-v", "error",
+                     "-select_streams", "v:0", "-show_entries",
+                     "stream=color_space,color_transfer,color_primaries,"
+                     "color_range", "-of", "default=nw=1",
+                     str(self.input_path)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                _cv = {}
+                for _l in (_pr.stdout or "").splitlines():
+                    if "=" in _l:
+                        k, v = _l.split("=", 1)
+                        _cv[k.strip()] = v.strip().lower()
+                _PRI = {"bt709": 1, "bt470bg": 5, "smpte170m": 6, "bt2020": 9}
+                _TRC = {"bt709": 1, "smpte170m": 6, "bt2020-10": 14,
+                        "smpte2084": 16, "arib-std-b67": 18}
+                _MAT = {"bt709": 1, "bt470bg": 5, "smpte170m": 6,
+                        "bt2020nc": 9}
+                _parts = []
+                if _cv.get("color_primaries") in _PRI:
+                    _parts.append(f"colour_primaries="
+                                  f"{_PRI[_cv['color_primaries']]}")
+                if _cv.get("color_transfer") in _TRC:
+                    _parts.append(f"transfer_characteristics="
+                                  f"{_TRC[_cv['color_transfer']]}")
+                if _cv.get("color_space") in _MAT:
+                    _parts.append(f"matrix_coefficients="
+                                  f"{_MAT[_cv['color_space']]}")
+                if _cv.get("color_range") in ("tv", "pc"):
+                    _parts.append(f"video_full_range_flag="
+                                  f"{1 if _cv['color_range'] == 'pc' else 0}")
+                if _parts:
+                    _flt = ("hevc_metadata"
+                            if self.codec in ("hevc", "h265")
+                            else "h264_metadata")
+                    color_args = ["-bsf:v", f"{_flt}=" + ":".join(_parts)]
+                    print(f"[Encoder] color tags: propagating source "
+                          f"{','.join(sorted(v for v in _cv.values() if v and v != 'unknown'))} "
+                          f"into the output VUI")
+        except Exception:
+            color_args = []
+
         timescale_args = (
             ["-video_track_timescale", "90000"] if self._container == "mp4" else []
         )
@@ -924,8 +1047,11 @@ class Encoder:
                          "-r", self.fps_str,
                          *input_fmt_args, "-i", str(raw_path),
                          "-map", "0:v:0", "-c:v", "copy"]
-                step1 += tag_args + timescale_args + [str(temp_video)]
-                if not self._run_ffmpeg(step1, "video-container"):
+                step1 += color_args + tag_args + timescale_args + [str(temp_video)]
+                # v1.50.00: scale finalize timeouts with the bytes moved
+                # (the 50GB Idol lesson -- faststart = TWO passes of I/O).
+                _t_s = _finalize_timeout_s(raw_path)
+                if not self._run_ffmpeg(step1, "video-container", timeout_s=_t_s):
                     return False
 
                 # Mux with lada's input ordering: the un-delayed AUDIO source is
@@ -945,7 +1071,8 @@ class Encoder:
                              "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
                              "-map", "0:v:0", "-c:v", "copy"] + tag_args
                 step2 += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
-                return self._run_ffmpeg(step2, "remux")
+                return self._run_ffmpeg(
+                    step2, "remux", timeout_s=_finalize_timeout_s(temp_video))
 
             # No video delay: single pass raw -> final. audio_delay (rare: source
             # video led its audio) is applied on the audio CONTAINER input, which
@@ -959,11 +1086,13 @@ class Encoder:
                 if audio_delay > 0:
                     cmd += ["-itsoffset", f"{audio_delay:.6f}"]
                 cmd += ["-i", self.input_path]
-            cmd += ["-map", "0:v:0", "-c:v", "copy"] + tag_args
+            cmd += ["-map", "0:v:0", "-c:v", "copy"] + color_args + tag_args
             if has_audio_source:
                 cmd += ["-map", "1:a?", "-c:a", "copy"]
             cmd += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
-            return self._run_ffmpeg(cmd, "remux")
+            # v1.50.00: size-scaled timeout (the 50GB Idol lesson).
+            return self._run_ffmpeg(
+                cmd, "remux", timeout_s=_finalize_timeout_s(raw_path))
         finally:
             if temp_video is not None:
                 try:
@@ -1399,14 +1528,21 @@ class FfmpegEncoder:
         cmd += [self.output_path]
 
         print(f"[Encoder] remux: {' '.join(cmd)}")
+        # v1.50.00: size-scaled timeout (the 50GB Idol lesson -- faststart
+        # rewrites the whole output a second time; flat 900s killed a remux
+        # that was still making disk progress).
+        _t_s = _finalize_timeout_s(venc)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
-                               timeout=900, **NOWINDOW)
+                               timeout=_t_s, **NOWINDOW)
             ok = (r.returncode == 0)
             if not ok:
                 for line in (r.stderr or "").strip().split("\n")[-5:]:
                     print(f"  {line}")
+        except subprocess.TimeoutExpired:
+            ok = False
+            print(f"[Encoder] remux TIMED OUT after {_t_s}s with no result.")
         except Exception as e:
             ok = False
             print(f"[Encoder] remux error: {e}")

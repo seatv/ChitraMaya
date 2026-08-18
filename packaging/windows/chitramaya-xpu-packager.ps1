@@ -15,6 +15,13 @@ param(
   [string]$Name = "ChitraMaya",
   [switch]$SkipFfmpeg = $false,
   [switch]$SwapPolarsLtsCpu = $true,
+  [string]$FfmpegDir = "",   # folder containing the ffmpeg.exe/ffprobe.exe
+                             # to bundle. Prepended to PATH for this run so
+                             # the spec bundles EXACTLY this build instead of
+                             # whatever another tool put first on PATH (field
+                             # event on the ROCm edition: a stray
+                             # C:\MyPrograms\<other-tool>\ffmpeg.exe was
+                             # winning the PATH race).
   [int]$SplitMB = -1   # -1 = AUTO: single volume when the dist fits under
                        # GitHub's 2GB asset limit, else 1900MB parts.
                        # 0 = force single volume; >0 = force that part size.
@@ -37,13 +44,26 @@ if (-not $env:VIRTUAL_ENV) {
 }
 
 # ── ffmpeg preflight (the spec hard-fails without it; fail fast here) ────
+if ($FfmpegDir) {
+  if (-not (Test-Path (Join-Path $FfmpegDir "ffmpeg.exe"))) {
+    throw "-FfmpegDir '$FfmpegDir' does not contain ffmpeg.exe."
+  }
+  if (-not (Test-Path (Join-Path $FfmpegDir "ffprobe.exe"))) {
+    throw "-FfmpegDir '$FfmpegDir' does not contain ffprobe.exe."
+  }
+  $env:Path = "$FfmpegDir;$env:Path"
+  Write-Host "Using -FfmpegDir: $FfmpegDir (prepended to PATH for this run)" -ForegroundColor Cyan
+}
 if (-not $SkipFfmpeg) {
   $ff = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
   $fp = Get-Command ffprobe.exe -ErrorAction SilentlyContinue
   if (-not ($ff -and $fp)) {
-    throw "ffmpeg.exe/ffprobe.exe not on PATH. On the XPU edition ffmpeg IS the decoder and encoder. Put the chosen gyan.dev build first on PATH (the spec bundles exactly what it finds), or pass -SkipFfmpeg (not recommended)."
+    throw "ffmpeg.exe/ffprobe.exe not on PATH. On the XPU edition ffmpeg IS the decoder and encoder. Pass -FfmpegDir <folder with the gyan.dev 'full' build>, or put it first on PATH (the spec bundles exactly what it finds and needs the QSV encoders)."
   }
   Write-Host ("Bundling ffmpeg from: {0}" -f $ff.Source) -ForegroundColor Cyan
+  # Provenance in the build log: exact version line of the chosen binary.
+  $ffVer = (& $ff.Source -version 2>$null | Select-Object -First 1)
+  if ($ffVer) { Write-Host ("  {0}" -f $ffVer) -ForegroundColor Gray }
 }
 
 # ── PyInstaller ──────────────────────────────────────────────────────────
@@ -101,12 +121,13 @@ New-Item -ItemType Directory -Force -Path (Join-Path $distDir "models") | Out-Nu
   Set-Content -Encoding ASCII (Join-Path $distDir "models\PUT-MODELS-HERE.txt")
 
 # ── Release artifact ─────────────────────────────────────────────────────
-# Two shapes, chosen by what actually fits:
-#   FITS under GitHub's 2GB asset limit  -> ONE file: ChitraMaya-xpu-install.7z
-#       No SFX, no volumes, no installer scripts -- a single archive the
-#       user extracts wherever they want (Explorer on Win11, or 7-Zip/
-#       WinRAR). An installer exists to shepherd MULTI-part downloads;
-#       a one-file release needs no shepherd.
+# Two shapes, chosen by what actually fits -- both are ONE double-click
+# installer exe (r6, ported from the ROCm packager: consistent install
+# experience across editions):
+#   FITS under GitHub's 2GB asset limit  -> ONE file:
+#       ChitraMaya-xpu-install.exe = 7z.sfx extract-dialog stub + the
+#       archive. Double-click, pick a folder, extracts. (Falls back to a
+#       plain .7z only if 7z.sfx is not installed.)
 #   DOES NOT FIT -> the two-stage SFX installer, same as the NVIDIA
 #       edition: split volumes + a small ChitraMaya-xpu-install.exe that
 #       verifies and extracts them (vendor setup: packaging\windows\
@@ -149,9 +170,18 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
     Write-Warning "Close it (or wait a minute) and re-run the packager. Skipping artifact creation."
   } else {
     # ── Pass 1: single plain archive (no volume suffix) ──────────────────
+    # AUTO short-circuit: a raw dist bigger than 6000 MB cannot land under
+    # the 2GB asset limit (that would need >3:1 on binaries that are
+    # already mostly compressed), so skip the wasted single-archive pass
+    # and go straight to split volumes.
     $needSplit = $false
+    $distMB = [math]::Round((Get-ChildItem -Recurse -File ".\dist\$Name" |
+               Measure-Object Length -Sum).Sum / 1MB)
     if ($SplitMB -gt 0) {
       $needSplit = $true   # forced by parameter
+    } elseif ($SplitMB -lt 0 -and $distMB -gt 6000) {
+      Write-Host ("Dist is {0} MB raw -- cannot fit one 2GB asset; going straight to split volumes." -f $distMB) -ForegroundColor Yellow
+      $needSplit = $true
     } else {
       7z a -t7z "$installBase.7z" ".\dist\$Name"
       if ($LASTEXITCODE -ne 0) { Write-Warning "Archive creation failed."; $needSplit = $null }
@@ -159,10 +189,43 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
         $single = Get-Item "$installBase.7z"
         $mb = [math]::Round($single.Length / 1MB)
         if ($mb -le $limitMB) {
-          Write-Host "" 
-          Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
-          Write-Host "No installer needed -- release this ONE file. Users extract it" -ForegroundColor Cyan
-          Write-Host "anywhere they like (Windows 11 Explorer, 7-Zip, or WinRAR)." -ForegroundColor Cyan
+          # r6 (Gman, 2026-08-15: "We produce an install executable - why
+          # skip that??"): make the single-file release an INSTALL EXE,
+          # consistent with the multi-part editions -- still exactly ONE
+          # release asset, but double-clickable. 7z.sfx is 7-Zip's
+          # extract-dialog module (ships next to 7z.exe): stub + archive
+          # concatenated = an exe that asks for a folder and extracts.
+          $sfxGui = $null
+          $sevenZCmd = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($sevenZCmd) {
+            $cand = Join-Path (Split-Path $sevenZCmd.Source) "7z.sfx"
+            if (Test-Path $cand) { $sfxGui = $cand }
+          }
+          if ($sfxGui) {
+            $outPath = Join-Path (Get-Location) "$installBase.exe"
+            try {
+              $outFs = [IO.File]::Create($outPath)
+              try {
+                foreach ($pf in @($sfxGui, $single.FullName)) {
+                  $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
+                  $outFs.Write($bytes, 0, $bytes.Length)
+                }
+              } finally { $outFs.Close() }
+              Remove-Item -Force $single.FullName
+              $exeMb = [math]::Round((Get-Item $outPath).Length / 1MB)
+              Write-Host ""
+              Write-Host ("SINGLE-FILE INSTALLER: {0}  ({1} MB)" -f "$installBase.exe", $exeMb) -ForegroundColor Green
+              Write-Host "Release this ONE file. Users double-click it, pick a folder," -ForegroundColor Cyan
+              Write-Host "and it extracts there -- same experience as the other editions." -ForegroundColor Cyan
+            } catch {
+              Write-Warning ("SFX assembly failed: {0}. Falling back to the plain archive." -f $_.Exception.Message)
+              Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
+            }
+          } else {
+            Write-Warning "7z.sfx not found next to 7z.exe (it ships with the full 7-Zip install). Releasing the plain archive instead."
+            Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
+            Write-Host "Users extract it anywhere they like (Windows 11 Explorer, 7-Zip, or WinRAR)." -ForegroundColor Cyan
+          }
         } else {
           Write-Host ("Archive is {0} MB (> {1} MB limit) -- switching to split volumes + SFX installer." -f $mb, $limitMB) -ForegroundColor Yellow
           Remove-Item -Force "$installBase.7z"

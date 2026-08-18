@@ -2587,17 +2587,32 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
     # sys.stdout/stderr are None there, the tee becomes the only stdout, and
     # ChitraMaya-console.log (next to the exe / in the working dir) is the
     # post-mortem for crashes that happen before the drawer is opened.
+    # CM-094 (v1.50.00): discover the port BEFORE installing the console
+    # mirror so a second instance gets its own log file. Two instances
+    # writing the same ChitraMaya-console.log interleave silently on
+    # Windows (no mandatory locking) and the resulting file is garbage
+    # for support. Instance number derives from the port offset; the
+    # first instance keeps the classic name so nothing changes for the
+    # common case.
+    port = find_free_port()
+    _instance_n = port - 5100 + 1
     from chitramaya.console_buffer import install as _install_console
     try:
-        _log_path = str(_app_base_dir() / "ChitraMaya-console.log")
+        if _instance_n == 1:
+            _log_name = "ChitraMaya-console.log"
+        else:
+            _log_name = f"ChitraMaya-console-{os.getpid()}.log"
+        _log_path = str(_app_base_dir() / _log_name)
     except Exception:
         _log_path = None
     _install_console(log_path=_log_path)
+    if _instance_n > 1:
+        print(f"[ChitraMaya] Instance {_instance_n}: port 5100 busy; "
+              f"running on port {port} (console log: {_log_name})")
 
     global _server
     _server = SwapServer(models_dir=models_dir, gpu_id=gpu_id)
 
-    port = find_free_port()
     url = f"http://127.0.0.1:{port}"
 
     # Start Flask in a thread

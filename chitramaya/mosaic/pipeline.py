@@ -68,6 +68,13 @@ class DetStats:
     # Set of frame_nums where the detector found at least one box.
     # Used to diagnose "detected but not restored" precisely.
     frames_with_det_set: set = field(default_factory=set)
+    # Batch 44 (ab_eval support): when dump_rois is on, keep every
+    # frame's final boxes (post-dilate/clip/seam-split -- exactly what
+    # the restorer sees) for the misses JSON, so offline analysis tools
+    # can mask metrics to the true detected regions instead of
+    # reverse-engineering them from output divergence.
+    dump_rois: bool = False
+    rois: dict = field(default_factory=dict)
 
     def add(self, boxes, w: int, h: int, frame_num: int = -1) -> None:
         self.frames_total += 1
@@ -79,6 +86,10 @@ class DetStats:
         self.frames_with_det += 1
         if frame_num >= 0:
             self.frames_with_det_set.add(int(frame_num))
+            if self.dump_rois:
+                self.rois[int(frame_num)] = [
+                    [int(t), int(l), int(b), int(r)] for (t, l, b, r) in boxes
+                ]
         self.total_boxes += len(boxes)
 
         a = 0.0
@@ -459,6 +470,11 @@ class Pipeline:
         self.det_conf: float = float(self.cfg.get("detection", "conf_threshold", default=0.30))
         self.det_iou: float = float(self.cfg.get("detection", "iou_threshold", default=0.70))
         self.det_fp16: bool = bool(self.cfg.get("detection", "fp16", default=True))
+        # Batch 44: opt-in per-frame ROI box dump into the misses JSON
+        # (tools/ab_eval.py consumes it for region-masked metrics).
+        self.det_dump_rois: bool = bool(
+            self.cfg.get("detection", "dump_rois", default=False)
+        )
 
         self.roi_dilate: int = int(self.cfg.get("roi_dilate", default=0))
         self.use_seg_masks: bool = bool(self.cfg.get("use_seg_masks", default=True))
@@ -536,6 +552,15 @@ class Pipeline:
                 f"(expected 'auto', 'trt', or 'pytorch')"
             )
 
+        # Batch 42: PyTorch-path temporal window cap. 0 (default) = feed
+        # each clip to BasicVSR++ whole, matching lada's pipeline semantics
+        # (clip length IS the temporal window); a positive value caps the
+        # per-forward window (low-VRAM safety valve; 32 = the pre-Batch-42
+        # behavior). Tensor path unaffected (engines already run whole
+        # clips up to their compiled length).
+        self.rest_chunk_frames: int = int(
+            self.cfg.get("restoration", "chunk_frames", default=0) or 0
+        )
         self.rest_clip_size: int = int(self.cfg.get("restoration", "clip_size", default=256))
         self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
@@ -561,6 +586,17 @@ class Pipeline:
         # [CHANGE 2] FrameStore backpressure
         # 0 = auto-compute from resolution + max_clip_length;  -1 = unlimited
         self.store_max_frames: int = int(self.cfg.get("store_max_frames", default=0))
+        # CM-084 (Batch 36): FrameStore backend. "auto" (default) keeps
+        # today's device-resident store whenever it fits free VRAM and
+        # flips to system RAM only when the projected store would not fit
+        # (the long-MCL enabler); "device"/"host" force the choice.
+        self.store_backend: str = str(
+            self.cfg.get("store_backend", default="auto") or "auto"
+        ).strip().lower()
+        if self.store_backend not in ("auto", "device", "host"):
+            print(f"[FrameStore] WARNING: invalid store_backend "
+                  f"{self.store_backend!r}; using 'auto'.")
+            self.store_backend = "auto"
 
         # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
@@ -726,6 +762,35 @@ class Pipeline:
                             f"clip length <= {max(_smaller)} selects b{max(_smaller)}, "
                             f"which reserves substantially less VRAM."
                         )
+                    # CM-103 (v1.50.00): engine-set-aware preflight. A TRT
+                    # execution context reserves activation memory for its
+                    # WORST-CASE COMPILED shape, so a b120+ set reserves the
+                    # same near-whole-card memory at Max Clip 30 as at its
+                    # ceiling — the MCL dial does not shrink it. Field event
+                    # 2026-08-16: b180 + detection context left ~0 MB free on
+                    # an 8 GB card at 4K and NVENC died mid-run with
+                    # nvEncLockBitstream error 8 at EVERY Max Clip value.
+                    # Say so BEFORE the run walks into it.
+                    if self.device.type == "cuda" and int(engine_mcl) >= 120:
+                        _tot_b = torch.cuda.get_device_properties(
+                            self.device).total_memory
+                        if _tot_b < 12 * (1024 ** 3):
+                            _fix = (f"lower Max Clip to <= {max(_smaller)} to "
+                                    f"select the b{max(_smaller)} set"
+                                    if _smaller else
+                                    "compile a b60-class set (Manage Models, "
+                                    "Max Clip Length 60) or turn restore "
+                                    "Use Tensor off")
+                            print(
+                                f"[Restorer] CAUTION: engine set "
+                                f"b{int(engine_mcl)} on a "
+                                f"{_tot_b // (1024**3)} GB GPU typically "
+                                f"leaves no VRAM for the encoder — runs "
+                                f"tend to fail mid-encode (NVENC error 8) "
+                                f"regardless of the Max Clip value, because "
+                                f"the reservation follows the COMPILED size, "
+                                f"not the dial. Recommended: {_fix}."
+                            )
                 except Exception:
                     pass
 
@@ -788,12 +853,23 @@ class Pipeline:
                     raise
                 print(f"[Restorer] TRT path unavailable ({e}); using PyTorch")
 
-        print("[Restorer] Using PyTorch BasicVSR++ (no sub-engines)")
+        # Batch 42: the temporal window follows the clip (lada semantics)
+        # unless restoreChunkFrames caps it. Say which, loudly -- the
+        # window length is the quality/VRAM trade the user is making.
+        _chunk = int(self.rest_chunk_frames)
+        if _chunk > 0:
+            print(f"[Restorer] Using PyTorch BasicVSR++ (no sub-engines); "
+                  f"temporal window CAPPED at {_chunk} frames per forward "
+                  f"(restoreChunkFrames)")
+        else:
+            print(f"[Restorer] Using PyTorch BasicVSR++ (no sub-engines); "
+                  f"temporal window = whole clip (up to Max Clip "
+                  f"{self.rest_max_clip_length}; VRAM scales with it)")
         return BasicVSRPPClipRestorer(
             model_path=self.rest_model,
             device=self.device,
             fp16=self.rest_fp16,
-            max_frames=32,
+            max_frames=_chunk,
         )
 
     def _stabilize_restored(self, restored):
@@ -869,6 +945,7 @@ class Pipeline:
         out.parent.mkdir(parents=True, exist_ok=True)
 
         metrics = PipelineMetrics()
+        metrics.det_stats.dump_rois = bool(self.det_dump_rois)
         metrics.wall_start = _dt.datetime.now()
         t0_all = time.perf_counter()
 
@@ -1084,6 +1161,19 @@ class Pipeline:
         # free VRAM reflects their contexts, and the store is still empty). For
         # an AUTO store we lower the cap toward what fits; either way we warn
         # up-front if the config is likely to page instead of failing silently.
+        #
+        # CM-084 (Batch 36): the store backend is resolved HERE, from the same
+        # measurement. auto -> "device" whenever the requested store fits
+        # (byte-identical to pre-CM-084 behavior), "host" when it would not
+        # fit -- in host mode the cap is NOT reduced (system RAM holds it),
+        # which is what makes MCL-180-class runs possible on 8GB cards.
+        store_backend = self.store_backend
+        if store_backend == "host" and self._vrproj is not None:
+            print("[FrameStore] NOTE: VR projection composites into device "
+                  "frames; host offload disabled for this run.")
+            store_backend = "device"
+        if store_backend != "device" and self.device.type not in ("cuda", "xpu"):
+            store_backend = "device"   # cpu device: frames are host-resident anyway
         final_cap = requested_cap
         if requested_cap > 0:
             # Batch 23c: measure AFTER releasing torch's cache, so the sizing
@@ -1106,25 +1196,95 @@ class Pipeline:
                     free_bytes=_free_b, total_bytes=_total_b,
                     reserve_bytes=_reserve_b,
                 )
-                if store_is_auto and _reduced:
-                    final_cap = _plan_frames
-                    # Honest wording: the reduction may have bottomed out at the
-                    # one-clip floor, which does NOT necessarily fit free VRAM —
-                    # the warning below states the real situation.
-                    print(
-                        f"[FrameStore] VRAM-aware: reduced auto max_frames "
-                        f"{requested_cap}->{final_cap} (free VRAM after models: "
-                        f"~{_free_b // (1024*1024)} MB; backpressure can still bump "
-                        f"if a scene needs it)"
-                    )
-                if _warn is not None:
-                    print(f"[Pipeline] WARNING: {_warn}"
-                          f"{getattr(self, '_rest_engine_note', '')}")
-        store = FrameStore(max_frames=final_cap)
+                # CM-084: auto backend decision rides the SAME plan. _reduced
+                # means "the requested store does not fit device memory" --
+                # exactly the condition under which offloading beats shrinking.
+                if store_backend == "auto":
+                    store_backend = "host" if _reduced else "device"
+                if store_backend == "host":
+                    _need_mb = requested_cap * (w * h * 3) // (1024 * 1024)
+                    _ram_note = ""
+                    try:
+                        import psutil
+                        _avail_b = int(psutil.virtual_memory().available)
+                        _ram_note = (f"; system RAM available: "
+                                     f"{_avail_b // (1024*1024)} MB")
+                        if requested_cap * (w * h * 3) > 0.7 * _avail_b:
+                            print(f"[FrameStore] WARNING: projected host store "
+                                  f"({_need_mb} MB) is more than 70% of "
+                                  f"available system RAM -- consider a lower "
+                                  f"store_max_frames or shorter max clip "
+                                  f"length.")
+                    except Exception:
+                        pass
+                    print(f"[FrameStore] backend: HOST -- up to {requested_cap} "
+                          f"frames (~{_need_mb} MB) held in system RAM instead "
+                          f"of VRAM (free VRAM after models: "
+                          f"~{_free_b // (1024*1024)} MB{_ram_note})")
+                else:
+                    if store_is_auto and _reduced:
+                        final_cap = _plan_frames
+                        # Honest wording: the reduction may have bottomed out at
+                        # the one-clip floor, which does NOT necessarily fit free
+                        # VRAM — the warning below states the real situation.
+                        print(
+                            f"[FrameStore] VRAM-aware: reduced auto max_frames "
+                            f"{requested_cap}->{final_cap} (free VRAM after models: "
+                            f"~{_free_b // (1024*1024)} MB; backpressure can still bump "
+                            f"if a scene needs it)"
+                        )
+                    if _warn is not None:
+                        print(f"[Pipeline] WARNING: {_warn}"
+                              f"{getattr(self, '_rest_engine_note', '')}")
+                # CM-103 (v1.50.00): encoder-headroom preflight. The host
+                # store can rescue the FRAME STORE from a full card, but the
+                # NVENC encoder's surfaces and bitstream buffers must live in
+                # VRAM — with ~0 MB free after models, the first big drain
+                # dies with nvEncLockBitstream error 8 (field-calibrated:
+                # ~410-460 MB free encoded 4K fine; ~0 MB free always died).
+                # Warn up front with the fix instead of failing 5 minutes in.
+                try:
+                    _enc_obj = (encoder.underlying
+                                if isinstance(encoder, AsyncEncoder)
+                                else encoder)
+                    _enc_is_nvenc = type(_enc_obj).__name__ == "Encoder"
+                    _enc_headroom_b = max(192 * 1024 * 1024, int(w * h * 36))
+                    if _enc_is_nvenc and _free_b < _enc_headroom_b:
+                        print(
+                            f"[Pipeline] WARNING: only "
+                            f"~{_free_b // (1024*1024)} MB VRAM free after "
+                            f"models, but the NVENC encoder needs roughly "
+                            f"{_enc_headroom_b // (1024*1024)} MB at "
+                            f"{w}x{h}. This run will likely FAIL mid-encode "
+                            f"(NVENC error 8)."
+                            f"{getattr(self, '_rest_engine_note', '') or ' Levers: a smaller restoration engine set, restore Use Tensor off, or smaller --det-imgsz.'}"
+                        )
+                except Exception:
+                    pass
+        if store_backend == "auto":
+            store_backend = "device"   # no measurement possible -> today's behavior
+        store = FrameStore(max_frames=final_cap, backend=store_backend)
+
+        # CM-084: NVENC consumes device tensors, so a host-backed store pays
+        # one H2D upload per frame at drain time. The ffmpeg encoder path
+        # takes CPU frames as-is (it pipes CPU bytes into ffmpeg anyway --
+        # host mode actually REMOVES its per-frame download). FOI runs use
+        # a discard encoder: nothing to upload.
+        store_upload_device = (
+            self.device
+            if (store.backend == "host" and nvenc_available()
+                and foi_capture is None)
+            else None
+        )
 
         if store.max_frames > 0:
             est_mb = (store.max_frames * w * h * 3) / (1024.0 * 1024.0)
-            print(f"[FrameStore] max_frames={store.max_frames} (~{est_mb:.0f} MB VRAM budget)")
+            # v1.50.00: say where the budget actually lives -- a host-backed
+            # store holds frames in system RAM, and calling that "VRAM
+            # budget" confused the very run it was designed to enable.
+            _budget_kind = "RAM" if store.backend == "host" else "VRAM"
+            print(f"[FrameStore] max_frames={store.max_frames} "
+                  f"(~{est_mb:.0f} MB {_budget_kind} budget)")
         else:
             print("[FrameStore] max_frames=unlimited")
 
@@ -1474,6 +1634,7 @@ class Pipeline:
             t0 = time.perf_counter()
             drain_store_to_encoder(
                 store=store,
+                upload_device=store_upload_device,  # CM-084
                 safe_before=int(safe_before_batch),
                 encoder=encoder,
                 device=self.device,
@@ -1584,6 +1745,7 @@ class Pipeline:
 
                         drain_store_to_encoder(
                             store=store,
+                            upload_device=store_upload_device,  # CM-084
                             safe_before=sb,
                             encoder=encoder,
                             device=self.device,
@@ -1644,6 +1806,7 @@ class Pipeline:
 
                         drain_store_to_encoder(
                             store=store,
+                            upload_device=store_upload_device,  # CM-084
                             safe_before=sb,
                             encoder=encoder,
                             device=self.device,
@@ -1733,6 +1896,13 @@ class Pipeline:
             try:
                 if tracker is not None and restorer is not None:
                     for clip in tracker.flush_eof():
+                        # v1.50.00: attribute EOF-flush restore time to
+                        # t_restore. A single clip that closes at EOF used to
+                        # report t_restore=0.00s with the whole restore hiding
+                        # in "Overhead" (field artifact: the 226-frame
+                        # Flower&Fruit runs), which made the timing summary
+                        # lie about where the run's time went.
+                        _t_eof = time.perf_counter()
                         restored = restorer.restore_clip(clip)
                         restored = self._stabilize_restored(restored)  # CM-078
                         # Batch 26 fix: the EOF flush previously omitted
@@ -1764,6 +1934,7 @@ class Pipeline:
                             )
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
+                        metrics.t_restore += (time.perf_counter() - _t_eof)
                         if (_foi_target is not None
                                 and int(_foi_target) in clip.frame_nums
                                 and int(_foi_target) in store.frames_bgr_u8):
@@ -1773,6 +1944,7 @@ class Pipeline:
 
                 drain_store_to_encoder(
                     store=store,
+                    upload_device=store_upload_device,  # CM-084
                     safe_before=10**18,
                     encoder=encoder,
                     device=self.device,
@@ -2067,6 +2239,19 @@ class Pipeline:
                         "len_max": int(clip_max),
                         "len_mean": float(clip_mean),
                     },
+                    # Batch 44 (opt-in via detection.dump_rois /
+                    # --det-dump-rois / detDumpRois): per-frame FINAL
+                    # detection boxes (post dilate/clip/seam-split -- what
+                    # the restorer actually saw). Consumed by
+                    # tools/ab_eval.py to mask metrics to the true
+                    # restored regions. Absent when the option is off.
+                    **({"detection_rois_format":
+                            "frame_num -> [[top,left,bottom,right], ...] "
+                            "(pixel coords, inclusive)",
+                        "detection_rois": {
+                            str(k): v for k, v in
+                            sorted(metrics.det_stats.rois.items())
+                        }} if metrics.det_stats.rois else {}),
                     # CM-077b: secondary (RTX Super-Res) engagement. Only
                     # present when the stage was active this run. The frame
                     # list is the seek-and-inspect tool: pause on one of
@@ -2231,6 +2416,8 @@ class MosaicPipelineConfig:
     # of restored crops (7-frame window; real restoration mode only).
     temporal_stability: int = 0
     store_max_frames: int = 0
+    # CM-084: FrameStore backend -- "auto" | "device" | "host".
+    store_backend: str = "auto"
     det_imgsz: int = 640
     det_iou: float = 0.70
     roi_dilate: int = 0
@@ -2259,7 +2446,7 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "sbs_enabled", "sbs_layout",
     "sbs_det_split", "vr_projection", "secondary_restoration",
     "temporal_stability",
-    "store_max_frames", "det_imgsz", "det_iou", "roi_dilate",
+    "store_max_frames", "store_backend", "det_imgsz", "det_iou", "roi_dilate",
     "use_seg_masks", "feather_radius", "blendmask",
 })
 _MPC_INERT_FIELDS = frozenset({
@@ -2340,6 +2527,7 @@ class MosaicPipeline:
                 "block": int(getattr(c, "censor_block", 16)),
             },
             "store_max_frames": int(getattr(c, "store_max_frames", 0)),
+            "store_backend": str(getattr(c, "store_backend", "auto") or "auto"),
             "sbs_enabled": bool(getattr(c, "sbs_enabled", False)),
             "sbs_layout": str(getattr(c, "sbs_layout", "lr")),
             "sbs_det_split": bool(getattr(c, "sbs_det_split", False)),
@@ -2382,21 +2570,87 @@ class MosaicPipeline:
         # GUI runs too. Anchored the same way the server anchors that file:
         # the exe's own dir when frozen, cwd when running from source.
         # <=0 disables the watchdog (existing StallWatchdog contract).
-        _wd_stall = 120.0
+        # Batch 36r2: load the flat UI-state file ONCE; both the watchdog
+        # threshold and the CM-084 FrameStore knobs below read from it.
+        _flat: dict = {}
         try:
             import json as _json
             _base = (Path(_sys.executable).parent
                      if getattr(_sys, "frozen", False) else Path.cwd())
             _cfg_file = _base / "ChitraMaya-config.json"
             if _cfg_file.exists():
-                _flat = _json.loads(_cfg_file.read_text(encoding="utf-8"))
-                if "watchdogStallSeconds" in _flat:
-                    _wd_stall = float(_flat["watchdogStallSeconds"])
-                    print(f"[Pipeline] watchdog stall threshold: "
-                          f"{_wd_stall:.0f}s (from ChitraMaya-config.json)")
+                _loaded = _json.loads(_cfg_file.read_text(encoding="utf-8"))
+                if isinstance(_loaded, dict):
+                    _flat = _loaded
+        except Exception:
+            _flat = {}
+
+        _wd_stall = 120.0
+        try:
+            if "watchdogStallSeconds" in _flat:
+                _wd_stall = float(_flat["watchdogStallSeconds"])
+                print(f"[Pipeline] watchdog stall threshold: "
+                      f"{_wd_stall:.0f}s (from ChitraMaya-config.json)")
         except Exception:
             _wd_stall = 120.0
         data["monitoring"] = {"watchdog_stall_seconds": _wd_stall}
+
+        # CM-084 (Batch 36r2): FrameStore knobs from the SAME flat file.
+        # to_pipeline_config() (the UI path) carries no store_* fields, so
+        # without this a GUI user could never reach them -- the exact gap
+        # X5c fixed for watchdogStallSeconds, repeated. File value wins
+        # over the dataclass default; the CLI still wins over the file
+        # because headless runs build their Config from CLI args directly.
+        try:
+            # Precedence (Batch 38): the LIVE UI dropdown (arriving via the
+            # dataclass, already in data) wins whenever it says something
+            # explicit; the flat-file "storeBackend" key applies only when
+            # the UI value is "auto" -- it remains the hand-edit channel
+            # (the dropdown persists under its own control id, so these
+            # two never collide).
+            _sb = _flat.get("storeBackend")
+            if (_sb is not None
+                    and str(data.get("store_backend", "auto")).lower() == "auto"):
+                _sb = str(_sb).strip().lower()
+                if _sb in ("auto", "device", "host"):
+                    data["store_backend"] = _sb
+                    print(f"[FrameStore] backend request: {_sb} "
+                          f"(from ChitraMaya-config.json)")
+                else:
+                    print(f"[FrameStore] WARNING: ignoring invalid "
+                          f"storeBackend {_sb!r} in ChitraMaya-config.json "
+                          f"(use auto, device, or host).")
+        except Exception:
+            pass
+        try:
+            _smf = _flat.get("storeMaxFrames")
+            if _smf is not None:
+                data["store_max_frames"] = int(_smf)
+                print(f"[FrameStore] max frames: {int(_smf)} "
+                      f"(from ChitraMaya-config.json)")
+        except Exception:
+            pass
+        # Batch 42: PyTorch temporal-window cap from the same flat file
+        # (hand-edit channel, same pattern as watchdogStallSeconds).
+        # 0 = whole clip (default, lada semantics); N>0 caps the window
+        # (low-VRAM safety valve; 32 = pre-Batch-42 behavior).
+        try:
+            _rcf = _flat.get("restoreChunkFrames")
+            if _rcf is not None:
+                data["restoration"]["chunk_frames"] = int(_rcf)
+                print(f"[Restorer] chunk frames: {int(_rcf)} "
+                      f"(from ChitraMaya-config.json)")
+        except Exception:
+            pass
+        # Batch 44: opt-in per-frame ROI dump for tools/ab_eval.py.
+        try:
+            _dr = _flat.get("detDumpRois")
+            if _dr is not None:
+                data["detection"]["dump_rois"] = bool(_dr)
+                print(f"[Detector] ROI dump: {bool(_dr)} "
+                      f"(from ChitraMaya-config.json)")
+        except Exception:
+            pass
         # Mask Preview maps to mode="pseudo": the host builds the detector +
         # PseudoClipRestorer (flat fill), so detection + compositing run but
         # BasicVSR++ does not. mode="real" restores normally.

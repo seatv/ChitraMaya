@@ -125,17 +125,92 @@ foreach ($p in $parts) {
     Write-Host ("      {0}  ({1} MB)" -f $p.Name, $mb) -ForegroundColor Green
 }
 Write-Host ""
+
+# CM-101 (field bug 2026-08-16): where the VOLUMES are and where the app
+# should INSTALL are two different questions. $srcDir keys off the exe's
+# location (right for finding parts); the destination used to silently
+# reuse it, so running the installer from a terminal in C:\MyPrograms
+# with the exe on a mapped drive installed onto the mapped drive. Now the
+# destination is explicit: default to the terminal's working directory
+# when it is a real folder (not the SFX temp dir), else the exe's folder,
+# and always let the user type a different path. Double-click users press
+# Enter and get the old behavior.
+function Test-LocalFixedPath([string]$p) {
+    # True only for a path on a LOCAL FIXED disk. Mapped network drives
+    # (DriveType 4) and UNC paths are excluded: r2 field lesson - the exe
+    # was run from a mapped T: (the dev box's project share) and the
+    # installer defaulted the INSTALL there, next to the source tree.
+    try {
+        if (-not $p) { return $false }
+        if ($p.StartsWith("\\")) { return $false }          # UNC
+        $root = [IO.Path]::GetPathRoot($p)
+        if (-not $root) { return $false }
+        $ld = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $root.TrimEnd('\')) -ErrorAction Stop
+        return ($ld -and [int]$ld.DriveType -eq 3)          # 3 = local fixed
+    } catch { return $false }
+}
+
+# Destination preference, r2:
+#   1. the terminal's working directory, when it is usable and local
+#      (a user who ran the exe from a prompt expects "install here"),
+#   2. the exe's own folder, but ONLY if that is a local fixed disk,
+#   3. %USERPROFILE% - never a mapped drive, never the SFX temp dir.
+# In every case the prompt below lets the user type something else, so a
+# wrong guess costs one keystroke, not a reinstall.
+$tmpRoot = [IO.Path]::GetTempPath().TrimEnd('\')
+$cwd = $null
+try {
+    $c = (Get-Location).Path
+    if ($c -and (Test-Path $c) -and
+        -not $c.StartsWith($tmpRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $c.StartsWith($PSScriptRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-LocalFixedPath $c)) {
+        $cwd = $c
+    }
+} catch { }
+
+if ($cwd) {
+    $destDefault = $cwd
+} elseif (Test-LocalFixedPath $srcDir) {
+    $destDefault = $srcDir
+} else {
+    $destDefault = $env:USERPROFILE
+    Write-Host "  NOTE: this installer is running from a network or mapped" -ForegroundColor Yellow
+    Write-Host "  drive ($srcDir)." -ForegroundColor Yellow
+    Write-Host "  Installing THERE would put the program on that share, so the" -ForegroundColor Yellow
+    Write-Host "  default below is a local folder instead." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+Write-Host "  ChitraMaya will be installed as a 'ChitraMaya' folder inside:" -ForegroundColor Cyan
+Write-Host ("      {0}" -f $destDefault)
+Write-Host ""
+$destInput = Read-Host "  Press Enter to accept, or type a different folder"
+$destDir = if ($destInput -and $destInput.Trim()) { $destInput.Trim().Trim('"') } else { $destDefault }
+if (-not (Test-Path $destDir)) {
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+}
+if (-not (Test-Path $destDir)) {
+    Write-Host ""
+    Write-Host "  *** CANNOT CREATE FOLDER: $destDir ***" -ForegroundColor Red
+    Write-Host "  Check the path and permissions, then run the installer again." -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "  Press Enter to close"
+    exit 1
+}
+
+Write-Host ""
 Write-Host "  Extracting (this can take a few minutes)..." -ForegroundColor Cyan
 Write-Host ""
 
 $sevenZr = Join-Path $PSScriptRoot "7zr.exe"
-& $sevenZr x -y ("-o{0}" -f $srcDir) (Join-Path $srcDir "$BaseName.7z.001")
+& $sevenZr x -y ("-o{0}" -f $destDir) (Join-Path $srcDir "$BaseName.7z.001")
 $rc = $LASTEXITCODE
 
 Write-Host ""
 if ($rc -eq 0) {
     Write-Host "  DONE. ChitraMaya was extracted to:" -ForegroundColor Green
-    Write-Host ("      {0}\ChitraMaya" -f $srcDir)
+    Write-Host ("      {0}\ChitraMaya" -f $destDir)
     Write-Host ""
     Write-Host "  Next steps:" -ForegroundColor Cyan
     Write-Host "    1. Open the ChitraMaya folder and run ChitraMaya.exe"

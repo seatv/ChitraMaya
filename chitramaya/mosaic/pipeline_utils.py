@@ -289,20 +289,35 @@ class FrameStore:
     - Tracks per-frame PTS (presentation timestamp) from the decoder.
     - Supports a max_frames watermark for backpressure.
     - Provides vram_bytes() estimate for monitoring.
+    - CM-084 (Batch 36): optional HOST backend. backend="host" moves every
+      stored frame to system RAM at put() time, so long-MCL runs (180+)
+      can hold hundreds of lookahead frames without touching VRAM. The
+      compositor already handles CPU-resident frames (its numpy blend
+      branch downloads only the crop-sized restored region), and the
+      drain functions upload frames back to the device only when the
+      encoder actually needs device memory (NVENC). backend="device" is
+      byte-identical to the pre-CM-084 behavior.
     """
     frames_bgr_u8: Dict[int, torch.Tensor]
     frame_pts: Dict[int, Optional[int]]           # [CHANGE 4] frame_num -> PTS (nanoseconds or codec ticks)
     max_frames: int                                 # [CHANGE 2] 0 = unlimited
+    backend: str                                    # CM-084: "device" | "host"
     _frame_bytes: int                               # cached per-frame byte size
 
-    def __init__(self, max_frames: int = 0) -> None:
+    def __init__(self, max_frames: int = 0, backend: str = "device") -> None:
         self.frames_bgr_u8 = {}
         self.frame_pts: Dict[int, Optional[int]] = {}
         self.max_frames = int(max_frames)
+        self.backend = "host" if str(backend).lower() == "host" else "device"
         self._frame_bytes = 0
 
     def put(self, frame_num: int, frame_bgr_u8: torch.Tensor, pts: Optional[int] = None) -> None:
         k = int(frame_num)
+        if self.backend == "host" and frame_bgr_u8.device.type != "cpu":
+            # CM-084: one full-frame D2H per decoded frame. Plain pageable
+            # copy for now -- a pinned-memory ring is a future optimization
+            # if the transfer ever shows up in t_encode/t_decode.
+            frame_bgr_u8 = frame_bgr_u8.to("cpu")
         self.frames_bgr_u8[k] = frame_bgr_u8
         self.frame_pts[k] = pts                     # [CHANGE 4]
         if self._frame_bytes == 0 and frame_bgr_u8.numel() > 0:
@@ -434,6 +449,7 @@ def drain_store_to_encoder(
     safe_before: int,
     encoder,
     device: torch.device,
+    upload_device: Optional[torch.device] = None,
     sync_before_encode: bool = True,
     pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,
 ) -> int:
@@ -458,6 +474,11 @@ def drain_store_to_encoder(
     count = 0
     for k in drain_keys:
         frm_bgr, pts = store.pop_with_pts(k)
+        # CM-084: host-backed store + NVENC -> one H2D upload per frame
+        # (the ffmpeg encoder takes CPU frames directly; upload_device is
+        # None on that path, and also on device-backed stores).
+        if upload_device is not None and frm_bgr.device.type == "cpu":
+            frm_bgr = frm_bgr.to(upload_device, non_blocking=True)
         _maybe_dump_preencode_frame(k, frm_bgr, pts)
         if pts_log is not None:
             pts_log.append((k, pts))
@@ -606,6 +627,7 @@ def drain_store_to_async_encoder(
     safe_before: int,
     async_encoder: AsyncEncoder,
     device: torch.device,
+    upload_device: Optional[torch.device] = None,
     sync_before_encode: bool = True,
     pts_log: Optional[List[Tuple[int, Optional[int]]]] = None,
 ) -> int:
@@ -626,6 +648,11 @@ def drain_store_to_async_encoder(
     count = 0
     for k in drain_keys:
         frm_bgr, pts = store.pop_with_pts(k)
+        # CM-084: host-backed store + NVENC -> one H2D upload per frame
+        # (the ffmpeg encoder takes CPU frames directly; upload_device is
+        # None on that path, and also on device-backed stores).
+        if upload_device is not None and frm_bgr.device.type == "cpu":
+            frm_bgr = frm_bgr.to(upload_device, non_blocking=True)
         _maybe_dump_preencode_frame(k, frm_bgr, pts)
         if pts_log is not None:
             pts_log.append((k, pts))

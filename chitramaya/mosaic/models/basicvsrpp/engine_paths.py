@@ -9,6 +9,10 @@ compiled on one machine aren't accidentally loaded on another.
 This module has no torch / tensorrt imports — pure path helpers.
 
 Faithful port of Jasna's engine_paths.py (BasicVSR++ subset only).
+
+Copyright (c) the Jasna authors (Kruk2). Derivative work of Jasna's
+implementation; both projects are AGPL-3.0 (see LICENSE). Credit also
+appears in the README Acknowledgements.
 """
 from __future__ import annotations
 

@@ -32,6 +32,11 @@ from pathlib import Path
 
 import torch
 
+from chitramaya.compile_log import (
+    compile_log_path,
+    tee_compile_output,
+    write_log_header,
+)
 from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
     _basicvsrpp_sub_engine_dir,
     all_basicvsrpp_sub_engines_exist,
@@ -105,15 +110,6 @@ def main() -> int:
     max_clip_size = int(args.rest_max_clip_length)
 
     engine_dir = _basicvsrpp_sub_engine_dir(str(model_path))
-    print(f"[compile] checkpoint:      {model_path}")
-    print(f"[compile] engine dir:      {engine_dir}")
-    print(f"[compile] precision:       {'fp16' if fp16 else 'fp32'}")
-    print(f"[compile] max_clip_size:   {max_clip_size}")
-    print(f"[compile] device:          {device}")
-    print(f"[compile] optimization:    {args.optimization_level}")
-    print(f"[compile] workspace:       {args.workspace} GB" if args.workspace > 0
-          else "[compile] workspace:       95% of free (unbounded)")
-    print()
 
     if (not args.force) and all_basicvsrpp_sub_engines_exist(
         str(model_path), fp16=fp16, max_clip_size=max_clip_size,
@@ -128,6 +124,32 @@ def main() -> int:
             size_mb = os.path.getsize(p) / (1024 * 1024) if os.path.isfile(p) else 0
             print(f"           {k:30s} ({size_mb:6.1f} MB)  {p}")
         return 0
+
+    # Batch 39 (GenSRT port): everything from here on -- our prints,
+    # PyTorch, and TensorRT's native builder output (the tactic/OOM
+    # warnings that motivated this) -- is teed into a timestamped log
+    # next to the engines. A failed or suspicious compile becomes a
+    # shareable file instead of a scrolled-away memory. The no-op path
+    # above exits BEFORE the tee so trivial re-runs create no log files.
+    # Batch 39 r2: named after the MODEL, not a generic tag.
+    _log_path = compile_log_path(engine_dir, Path(model_path).stem)
+    with tee_compile_output(_log_path):
+        write_log_header(argv=sys.argv)
+        return _compile_body(args, model_path, device, fp16,
+                             max_clip_size, engine_dir)
+
+
+def _compile_body(args, model_path, device, fp16, max_clip_size,
+                  engine_dir) -> int:
+    print(f"[compile] checkpoint:      {model_path}")
+    print(f"[compile] engine dir:      {engine_dir}")
+    print(f"[compile] precision:       {'fp16' if fp16 else 'fp32'}")
+    print(f"[compile] max_clip_size:   {max_clip_size}")
+    print(f"[compile] device:          {device}")
+    print(f"[compile] optimization:    {args.optimization_level}")
+    print(f"[compile] workspace:       {args.workspace} GB" if args.workspace > 0
+          else "[compile] workspace:       95% of free (unbounded)")
+    print()
 
     if args.force:
         # Remove existing engines so compile doesn't skip them
