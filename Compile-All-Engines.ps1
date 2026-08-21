@@ -40,10 +40,10 @@
     more VRAM during compile.
 
 .PARAMETER RestMaxClipLength
-    BasicVSR++ max_clip_size. Engines compiled at value N are valid for
-    clips of length 1..N at inference. Defaults to 60. Run with a larger
-    value to support longer clips; engine files for different mcl values
-    coexist (filenames encode the size).
+    DEPRECATED (v1.60, CM-104): restoration engines are clip-size
+    independent; one compile serves every Max Clip Length setting. The
+    parameter is accepted so existing invocations do not break, but it
+    is no longer passed to the compiler.
 
 .PARAMETER RestWorkspace
     TRT workspace in GB for the BasicVSR++ compile. Bounds the scratch the
@@ -77,9 +77,10 @@
     Use a larger detection envelope. Requires more VRAM during compile.
 
 .EXAMPLE
-    .\Compile-All-Engines.ps1 -RestMaxClipLength 180 -Force
+    .\Compile-All-Engines.ps1 -Force
 
-    Recompile the BasicVSR++ sub-engines for mcl=180 ceiling.
+    Recompile all engines (v1.60: restoration engines are clip-size
+    independent; one compile serves every Max Clip setting).
 
 .EXAMPLE
     .\Compile-All-Engines.ps1 -SkipRestoration
@@ -179,7 +180,7 @@ Write-Host "  Models dir:        $ModelsDir"
 Write-Host "  Det opt-imgsz:     $DetImgsz"
 Write-Host "  Det max batch:     $DetMaxBatch"
 Write-Host "  Det workspace:     $DetWorkspace GB (max imgsz = $($DetWorkspace * $DetImgsz))"
-Write-Host "  Rest max clip:     $RestMaxClipLength"
+Write-Host "  Rest engines:      clip-size independent (v1.60; one compile serves every Max Clip)"
 Write-Host "  Rest workspace:    $RestWorkspace GB"
 Write-Host "  Precision:         $(if ($NoFp16) {'fp32'} else {'fp16'})"
 Write-Host "  Force rebuild:     $Force"
@@ -257,10 +258,12 @@ if ($SkipRestoration) {
 
         $modelPath = $restModel.FullName  # capture for closure
         Invoke-CompileStep -Name $stepName -Command {
+            # v1.60 (CM-104): engines are clip-size independent; the
+            # -RestMaxClipLength parameter is deprecated and no longer
+            # passed through (one compile serves every Max Clip setting).
             $stepArgs = @(
                 "-compile-rest",
                 "--rest-model",            $modelPath,
-                "--rest-max-clip-length",  $RestMaxClipLength,
                 "--workspace",             $RestWorkspace,
                 $Fp16Flag
             )

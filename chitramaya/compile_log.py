@@ -50,10 +50,15 @@ def compile_log_path(anchor_dir: str | os.PathLike, tag: str) -> str:
     return str(d / f"{tag}-compile-{stamp}.log")
 
 
-def write_log_header(argv=None) -> None:
+def write_log_header(argv=None, gpu_id: int | None = None) -> None:
     """Print (through the tee) a self-describing header: what ran, on what
     hardware, against which stack. This is the block that turns a pasted
-    log into a remotely debuggable artifact."""
+    log into a remotely debuggable artifact.
+
+    ``gpu_id``: the CUDA device the compile will actually run on. v1.60
+    fix (field event, dual-GPU box 2026-08-18): the header hardcoded
+    device 0 and reported the WRONG card for ``--gpu-id 1`` compiles —
+    on a Franken+12GB box every log claimed the 6GB laptop chip."""
     print("=" * 70)
     print(f"[compile] ChitraMaya engine compile log")
     print(f"[compile] started: {datetime.datetime.now().isoformat(timespec='seconds')}")
@@ -69,8 +74,10 @@ def write_log_header(argv=None) -> None:
         import torch
         print(f"[compile] torch:   {torch.__version__}")
         if torch.cuda.is_available():
-            _free, _total = torch.cuda.mem_get_info()
-            print(f"[compile] gpu:     {torch.cuda.get_device_name(0)} "
+            _dev = int(gpu_id) if gpu_id is not None else 0
+            _free, _total = torch.cuda.mem_get_info(_dev)
+            print(f"[compile] gpu:     cuda:{_dev} "
+                  f"{torch.cuda.get_device_name(_dev)} "
                   f"(free {_free // (1024*1024)} MB / "
                   f"total {_total // (1024*1024)} MB)")
     except Exception:
@@ -126,6 +133,9 @@ class tee_compile_output:
         self._saved = {}      # fd -> saved dup
         self._pumps = []
         self._py_fallback = None
+        self._orig_std = None       # (sys.stdout, sys.stderr) before rebind
+        self._new_std = None
+        self._retargeted = []       # [(logging handler, original stream)]
         self._lock = threading.Lock()
 
     # -- internals ---------------------------------------------------------
@@ -166,31 +176,42 @@ class tee_compile_output:
             return self
 
         hooked_any = False
-        for fd in (1, 2):
-            try:
-                saved = os.dup(fd)
-                r, w = os.pipe()
-                os.dup2(w, fd)
-                os.close(w)
-            except OSError:
-                continue
-            t = threading.Thread(target=self._pump, args=(r, saved),
-                                 daemon=True)
-            t.start()
-            self._saved[fd] = saved
-            self._pumps.append(t)
-            hooked_any = True
-        # r3 (field finding, restore log 2026-08-15): with fd1 swapped to a
-        # pipe, Python BLOCK-buffers stdout, so sparse [compile] prints sat
-        # in the buffer until exit while stderr streamed through -- the log
-        # read as "all warnings first, then the whole compile". Force line
-        # buffering so every line lands near its real time.
-        if hooked_any:
-            for _st in (sys.stdout, sys.stderr):
+        try:
+            for fd in (1, 2):
                 try:
-                    _st.reconfigure(line_buffering=True)
-                except Exception:
-                    pass
+                    saved = os.dup(fd)
+                    r, w = os.pipe()
+                    os.dup2(w, fd)
+                    os.close(w)
+                except OSError:
+                    continue
+                t = threading.Thread(target=self._pump, args=(r, saved),
+                                     daemon=True)
+                t.start()
+                self._saved[fd] = saved
+                self._pumps.append(t)
+                hooked_any = True
+            if hooked_any:
+                # r4 (field crash 2026-08-16, interactive Windows console):
+                # sys.stdout/sys.stderr there are _WindowsConsoleIO objects,
+                # which write via WriteConsoleW -- legal ONLY on console
+                # handles. After the dup2 swap, their fds are pipes, so the
+                # very first print raised OSError(22, 'Incorrect function')
+                # and killed the compile ("lost sys.stderr"). The server
+                # path never hit it (subprocess stdout is a pipe from
+                # birth), and Linux never hits it -- the exact
+                # worked-in-every-test-on-Linux trap the GenSRT notes warn
+                # about. Fix: rebind Python's stream objects to fresh
+                # line-buffered wrappers over the (now piped) fds -- valid
+                # everywhere -- and retarget logging handlers that captured
+                # the old objects at import time (torch/ultralytics do).
+                # Line buffering here also subsumes the r3 ordering fix.
+                self._rebind_python_streams()
+        except Exception:
+            # Doctrine: the capture must NEVER break the compile. Unwind
+            # any partial fd surgery and fall back to the Python-level tee.
+            self._unwind_fds()
+            hooked_any = False
 
         if not hooked_any:
             # No usable console fds (windowed frozen exe corner). Fall back
@@ -204,6 +225,65 @@ class tee_compile_output:
                   "TensorRT lines.")
         print(f"[compile] full log: {self.log_path}")
         return self
+
+    def _rebind_python_streams(self) -> None:
+        import logging
+        old_out, old_err = sys.stdout, sys.stderr
+        new_out = open(1, "w", buffering=1, encoding="utf-8",
+                       errors="replace", closefd=False)
+        new_err = open(2, "w", buffering=1, encoding="utf-8",
+                       errors="replace", closefd=False)
+        sys.stdout, sys.stderr = new_out, new_err
+        self._orig_std = (old_out, old_err)
+        self._new_std = (new_out, new_err)
+        try:
+            handlers = list(logging.root.handlers)
+            for lg in logging.Logger.manager.loggerDict.values():
+                if isinstance(lg, logging.Logger):
+                    handlers.extend(lg.handlers)
+            for h in handlers:
+                stream = getattr(h, "stream", None)
+                if not isinstance(h, logging.StreamHandler):
+                    continue
+                if stream is old_out:
+                    self._retargeted.append((h, old_out))
+                    h.setStream(new_out)
+                elif stream is old_err:
+                    self._retargeted.append((h, old_err))
+                    h.setStream(new_err)
+        except Exception:
+            pass
+
+    def _restore_python_streams(self) -> None:
+        for h, orig in self._retargeted:
+            try:
+                h.setStream(orig)
+            except Exception:
+                pass
+        self._retargeted = []
+        if self._new_std is not None:
+            for st in self._new_std:
+                try:
+                    st.flush()
+                except Exception:
+                    pass
+        if self._orig_std is not None:
+            sys.stdout, sys.stderr = self._orig_std
+            self._orig_std = None
+        self._new_std = None
+
+    def _unwind_fds(self) -> None:
+        self._restore_python_streams()
+        for fd, saved in list(self._saved.items()):
+            try:
+                os.dup2(saved, fd)
+                os.close(saved)
+            except OSError:
+                pass
+        self._saved.clear()
+        for t in self._pumps:
+            t.join(timeout=5)
+        self._pumps = []
 
     def __exit__(self, exc_type, exc, tb):
         # A dying compile writes its traceback THROUGH the tee first, so
@@ -223,6 +303,10 @@ class tee_compile_output:
         if self._py_fallback is not None:
             sys.stdout, sys.stderr = self._py_fallback
             self._py_fallback = None
+
+        # r4: put Python's original stream objects back BEFORE the fds
+        # become consoles again (no prints may happen in between).
+        self._restore_python_streams()
 
         for fd, saved in self._saved.items():
             try:

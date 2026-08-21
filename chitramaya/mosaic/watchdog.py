@@ -196,6 +196,14 @@ class StallWatchdog:
 
     POLL_SECONDS = 5.0
 
+    # Batch 50: PCIe flap governor tuning. ESCALATE is how long a held
+    # down-train may stay unrecovered before it alarms in full anyway --
+    # the 5060 pre-failure signature killed the GPU ~18s after the
+    # down-train, so 30s of no recovery is decisively "not a flap".
+    # SUMMARY is the minimum spacing between flap-count one-liners.
+    PCIE_FLAP_ESCALATE_S = 30.0
+    PCIE_FLAP_SUMMARY_S = 60.0
+
     def __init__(
         self,
         get_progress: Callable[[], int],
@@ -245,6 +253,28 @@ class StallWatchdog:
         last_change = time.monotonic()
         last_alarm = 0.0
         polls = 0
+        # Batch 50: PCIe flap governor state. Field 2026-08-19 (the Idol
+        # forensics run AND the 4060 benchmark): during GPU-starved crawl
+        # phases the link power-states down and re-trains every few
+        # seconds -- ~30 verbatim ALARM/RECOVERED pairs buried the log's
+        # real information. Policy:
+        #   - the FIRST down-train and FIRST recovery print verbatim (the
+        #     full educational text must appear once per run);
+        #   - later down-trains are HELD for PCIE_FLAP_ESCALATE_S: if the
+        #     link recovers inside the window the pair is counted silently
+        #     and a one-line flap summary prints at most every
+        #     PCIE_FLAP_SUMMARY_S;
+        #   - a held down-train that does NOT recover inside the window
+        #     escalates with the full alarm text plus a "has not
+        #     recovered" note. The non-recovering down-train (the 5060
+        #     'GPU has been lost' signature) is exactly the event this
+        #     governor must never suppress.
+        flap_first_alarm = False    # first ALARM printed verbatim?
+        flap_first_rec = False      # first RECOVERED printed verbatim?
+        flap_pending = None         # (held_since, alarm_text) or None
+        flap_escalated = False      # an escalated alarm awaits its all-clear
+        flap_count = 0
+        flap_last_summary = 0.0
         while not self._stop.wait(self.POLL_SECONDS):
             now = time.monotonic()
             polls += 1
@@ -257,7 +287,12 @@ class StallWatchdog:
                 except Exception:
                     pass
                 if alarm:
-                    print(f"[Watchdog] ALARM: {alarm}")
+                    if not flap_first_alarm:
+                        flap_first_alarm = True
+                        print(f"[Watchdog] ALARM: {alarm}")
+                    else:
+                        flap_pending = (now, alarm)
+                        flap_count += 1
                 # v1.50.00: close the loop on transient down-trains -- a
                 # recovered link gets an explicit all-clear so a completed
                 # run never ends on an unresolved alarm.
@@ -266,7 +301,37 @@ class StallWatchdog:
                 except Exception:
                     _rec = None
                 if _rec:
-                    print(f"[Watchdog] {_rec}")
+                    if flap_pending is not None:
+                        # Recovered inside the hold window: a flap. Count
+                        # it; summarize on a cadence instead of printing
+                        # the pair.
+                        flap_pending = None
+                        if (now - flap_last_summary) >= self.PCIE_FLAP_SUMMARY_S:
+                            flap_last_summary = now
+                            print(f"[Watchdog] PCIe link flapping: "
+                                  f"{flap_count} down-train/recover "
+                                  f"cycle(s) so far this run -- transient "
+                                  f"power-state churn while the GPU is "
+                                  f"starved, not the pre-failure "
+                                  f"signature. Individual alarms are "
+                                  f"suppressed; a down-train that does "
+                                  f"NOT recover within "
+                                  f"{int(self.PCIE_FLAP_ESCALATE_S)}s "
+                                  f"still alarms in full.")
+                    if (not flap_first_rec) or flap_escalated:
+                        flap_first_rec = True
+                        flap_escalated = False
+                        print(f"[Watchdog] {_rec}")
+                # Escalation: a held down-train that never recovered.
+                if (flap_pending is not None
+                        and (now - flap_pending[0]) >= self.PCIE_FLAP_ESCALATE_S):
+                    print(f"[Watchdog] ALARM: {flap_pending[1]} NOTE: this "
+                          f"down-train has NOT recovered for "
+                          f"{int(self.PCIE_FLAP_ESCALATE_S)}s -- unlike "
+                          f"the earlier transient flaps, this matches the "
+                          f"pre-failure signature.")
+                    flap_pending = None
+                    flap_escalated = True
                 # 25d: judge link speed UNDER LOAD, not at arm time (idle
                 # links legitimately sit at Gen1 via ASPM). By the 3rd poll
                 # (~15s into the main loop) the GPU is demonstrably working;

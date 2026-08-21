@@ -45,3 +45,6 @@ ChitraMaya-ReleaseNotes*
 Forum*
 !packaging/windows/vendor/7zr.exe
 !packaging/windows/vendor/7zSD.sfx
+.patch-cache/*
+GitShouldNotSee/*
+ChitraMaya-patch*

@@ -13,9 +13,25 @@ feedforward inner step (loop body) and orchestrate the recurrence in
 Python (BasicVSRPlusPlusNetSplit.propagate). The LR residual is added
 in Python after the upsample engine call.
 
+v1.60.00 (CM-104): FIXED-BATCH engines, ported from Jasna v0.9.1. A TRT
+execution context reserves scratch for its largest PROFILE shape, so
+preprocess/upsample engines compiled at the clip size reserved clip-sized
+memory for strictly per-frame math. They are now compiled at fixed batch
+sizes (preprocess b60 / upsample b30) and the runtime loops the clip
+through in batches — preprocess batches overlap by ONE frame because
+SPyNet consumes consecutive pairs. Jasna's measured correctness: batched
+upsample is bit-exact vs whole-clip; preprocess feature maps bit-exact
+with SPyNet flow deltas <= 0.07 px (same magnitude as TRT tactic
+differences between any two profiles); propagation untouched. Legacy
+clip-sized sets remain loadable (the loader reports per-file batch caps
+and the same batched runtime chunks within them). Jasna's CUDA-graphs
+mode is deliberately NOT ported yet: graph capture poisons concurrent
+CUDA work from other threads, and ChitraMaya's threaded decoder issues
+CUDA work during engine load — revisit with a capture barrier if wanted.
+
 Faithful port of Jasna's basicvsrpp_sub_engines.py — wrappers, compile
-flow, and runtime orchestration are byte-equivalent. Only the module
-imports are adapted to ChitraMaya's package paths.
+flow, and runtime orchestration follow Jasna's (v0.9.1 fixed-batch
+revision). Module imports are adapted to ChitraMaya's package paths.
 
 Copyright (c) the Jasna authors (Kruk2). This file is a derivative work
 of Jasna's implementation. Jasna and ChitraMaya are both licensed under
@@ -36,11 +52,12 @@ import torchvision
 
 from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
     BASICVSRPP_DIRECTIONS as DIRECTIONS,
+    BASICVSRPP_PREPROCESS_BATCH as PREPROCESS_BATCH,
+    BASICVSRPP_UPSAMPLE_BATCH as UPSAMPLE_BATCH,
     _basicvsrpp_sub_engine_dir as _sub_engine_dir,
     engine_precision_name,
     engine_system_suffix,
-    get_basicvsrpp_sub_engine_paths as get_sub_engine_paths,
-    all_basicvsrpp_sub_engines_exist as all_sub_engines_exist,
+    find_basicvsrpp_engine_files,
 )
 from chitramaya.mosaic.models.basicvsrpp.trt_export import (
     compile_and_save_torchtrt_dynamo,
@@ -50,11 +67,9 @@ from chitramaya.mosaic.models.basicvsrpp.trt_export import (
 
 logger = logging.getLogger(__name__)
 
-# DIRECTIONS imported from engine_paths
+# DIRECTIONS / PREPROCESS_BATCH / UPSAMPLE_BATCH imported from engine_paths
 FEATURE_SIZE = 64
 INPUT_SIZE = 256
-MAX_DYNAMIC_BATCH = 180
-OPT_DYNAMIC_BATCH = 60
 
 
 class _PropagateBodyWrapper(nn.Module):
@@ -236,16 +251,16 @@ def _loop_body_engine_path(engine_dir: str, direction: str, fp16: bool) -> str:
     return os.path.join(engine_dir, f"loop_body_{direction}.trt_{prec}{suf}.engine")
 
 
-def _upsample_engine_path(engine_dir: str, fp16: bool, max_clip_size: int) -> str:
+def _upsample_engine_path(engine_dir: str, fp16: bool) -> str:
     prec = engine_precision_name(fp16=fp16)
     suf = engine_system_suffix()
-    return os.path.join(engine_dir, f"upsample_dyn_b{max_clip_size}.trt_{prec}{suf}.engine")
+    return os.path.join(engine_dir, f"upsample_dyn_b{UPSAMPLE_BATCH}.trt_{prec}{suf}.engine")
 
 
-def _preprocess_engine_path(engine_dir: str, fp16: bool, max_clip_size: int) -> str:
+def _preprocess_engine_path(engine_dir: str, fp16: bool) -> str:
     prec = engine_precision_name(fp16=fp16)
     suf = engine_system_suffix()
-    return os.path.join(engine_dir, f"preprocess_b{max_clip_size}.trt_{prec}{suf}.engine")
+    return os.path.join(engine_dir, f"preprocess_b{PREPROCESS_BATCH}.trt_{prec}{suf}.engine")
 
 
 def _get_inference_generator(model: nn.Module) -> nn.Module:
@@ -259,11 +274,22 @@ def compile_basicvsrpp_sub_engines(
     device: torch.device,
     fp16: bool,
     model_weights_path: str,
-    max_clip_size: int = 60,
+    max_clip_size: int | None = None,
     optimization_level: int = 5,
     workspace_gb: int | None = None,
 ) -> dict[str, str]:
     import torch_tensorrt  # type: ignore[import-not-found]
+
+    # v1.60 (CM-104): engines are clip-size independent — preprocess/upsample
+    # compile at FIXED batches (b60/b30). ``max_clip_size`` is accepted for
+    # backward compatibility but no longer affects what gets built.
+    if max_clip_size is not None:
+        print(
+            f"[compile] NOTE: --rest-max-clip-length ({max_clip_size}) no "
+            f"longer affects engine compilation (v1.60, CM-104): engines "
+            f"are clip-size independent. One compile serves every Max Clip "
+            f"setting; the dial now costs activation memory only."
+        )
 
     dtype = torch.float16 if fp16 else torch.float32
     engine_dir = _sub_engine_dir(model_weights_path)
@@ -327,8 +353,10 @@ def compile_basicvsrpp_sub_engines(
         )
         del wrapper, inp_fp, inp_g1, inp_fn2, inp_g2, inp_fc, inp_f1, inp_f2, inp_bp
 
-    # ── preprocess engine (feat_extract + downsample + bidirectional SPyNet, dynamic batch) ──
-    path = _preprocess_engine_path(engine_dir, fp16, max_clip_size)
+    # ── preprocess engine (feat_extract + downsample + bidirectional SPyNet,
+    #    FIXED batch b{PREPROCESS_BATCH}; runtime chunks longer clips with a
+    #    one-frame overlap) ──
+    path = _preprocess_engine_path(engine_dir, fp16)
     paths["preprocess"] = path
     if os.path.isfile(path):
         logger.info("Sub-engine already exists: %s", path)
@@ -338,8 +366,8 @@ def compile_basicvsrpp_sub_engines(
         ).to(device=device, dtype=dtype).eval()
         dyn_input = torch_tensorrt.Input(
             min_shape=[3, 3, INPUT_SIZE, INPUT_SIZE],
-            opt_shape=[max_clip_size, 3, INPUT_SIZE, INPUT_SIZE],
-            max_shape=[max_clip_size, 3, INPUT_SIZE, INPUT_SIZE],
+            opt_shape=[PREPROCESS_BATCH, 3, INPUT_SIZE, INPUT_SIZE],
+            max_shape=[PREPROCESS_BATCH, 3, INPUT_SIZE, INPUT_SIZE],
             dtype=dtype,
         )
         compile_and_save_torchtrt_dynamo(
@@ -348,14 +376,15 @@ def compile_basicvsrpp_sub_engines(
             output_path=path,
             dtype=dtype,
             workspace_size_bytes=workspace_size,
-            message=f"Compiling sub-engine 5/6: preprocess (batch=3..{max_clip_size})",
+            message=f"Compiling sub-engine 5/6: preprocess (batch=3..{PREPROCESS_BATCH})",
             device=device,
             optimization_level=optimization_level,
         )
         del wrapper
 
-    # ── upsample engine (dynamic batch – called once for all frames) ──
-    path = _upsample_engine_path(engine_dir, fp16, max_clip_size)
+    # ── upsample engine (per-frame stage, FIXED batch b{UPSAMPLE_BATCH};
+    #    runtime accumulates frames and calls in batches) ──
+    path = _upsample_engine_path(engine_dir, fp16)
     paths["upsample"] = path
     if os.path.isfile(path):
         logger.info("Sub-engine already exists: %s", path)
@@ -370,8 +399,8 @@ def compile_basicvsrpp_sub_engines(
         ).to(device=device, dtype=dtype).eval()
         dyn_input = torch_tensorrt.Input(
             min_shape=[1, in_ch, FEATURE_SIZE, FEATURE_SIZE],
-            opt_shape=[max_clip_size, in_ch, FEATURE_SIZE, FEATURE_SIZE],
-            max_shape=[max_clip_size, in_ch, FEATURE_SIZE, FEATURE_SIZE],
+            opt_shape=[UPSAMPLE_BATCH, in_ch, FEATURE_SIZE, FEATURE_SIZE],
+            max_shape=[UPSAMPLE_BATCH, in_ch, FEATURE_SIZE, FEATURE_SIZE],
             dtype=dtype,
         )
         compile_and_save_torchtrt_dynamo(
@@ -380,7 +409,7 @@ def compile_basicvsrpp_sub_engines(
             output_path=path,
             dtype=dtype,
             workspace_size_bytes=workspace_size,
-            message=f"Compiling sub-engine 6/6: upsample (batch=1..{max_clip_size})",
+            message=f"Compiling sub-engine 6/6: upsample (batch=1..{UPSAMPLE_BATCH})",
             device=device,
             optimization_level=optimization_level,
         )
@@ -396,12 +425,17 @@ def load_sub_engines(
     model_weights_path: str,
     device: torch.device,
     fp16: bool,
-    max_clip_size: int = 60,
-) -> tuple[dict[str, nn.Module], nn.Module, nn.Module] | None:
-    """Returns ``(loop_body_engines, preprocess, upsample)`` or *None*."""
-    paths = get_sub_engine_paths(model_weights_path, fp16, max_clip_size)
-    if not all(os.path.isfile(p) for p in paths.values()):
+) -> tuple[dict[str, nn.Module], nn.Module, nn.Module, dict] | None:
+    """Returns ``(loop_body_engines, preprocess, upsample, info)`` or *None*.
+
+    ``info`` is the ``find_basicvsrpp_engine_files`` dict: per-file batch
+    caps for the runtime chunking, plus which files were chosen (canonical
+    fixed-batch set or a legacy clip-sized set).
+    """
+    info = find_basicvsrpp_engine_files(model_weights_path, fp16)
+    if info is None:
         return None
+    paths = info["paths"]
 
     loop_body_engines: dict[str, nn.Module] = {}
     for d in DIRECTIONS:
@@ -414,7 +448,7 @@ def load_sub_engines(
     upsample_engine = load_torchtrt_export(
         checkpoint_path=paths["upsample"], device=device,
     )
-    return loop_body_engines, preprocess_engine, upsample_engine
+    return loop_body_engines, preprocess_engine, upsample_engine, info
 
 
 def _release_torchtrt_module(module: nn.Module) -> None:
@@ -445,6 +479,8 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
         loop_body_engines: dict[str, nn.Module],
         preprocess_engine: nn.Module,
         upsample_engine: nn.Module,
+        preprocess_cap: int = PREPROCESS_BATCH,
+        upsample_cap: int = UPSAMPLE_BATCH,
     ):
         super().__init__()
         self.mid_channels = generator.mid_channels
@@ -453,6 +489,11 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
         self._loop_body_engines = loop_body_engines
         self._preprocess_engine = preprocess_engine
         self._upsample_engine = upsample_engine
+        # v1.60 (CM-104): runtime chunk caps. Canonical fixed-batch engines
+        # use the constants; a legacy clip-sized engine caps at min(const,
+        # its compiled bN) so we never exceed its profile.
+        self._preprocess_cap = max(int(preprocess_cap), self._PREPROCESS_MIN_BATCH)
+        self._upsample_cap = max(int(upsample_cap), 1)
 
     def close(self) -> None:
         engines = []
@@ -619,22 +660,76 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
     def upsample(
         self, lqs: torch.Tensor, feats: dict[str, list[torch.Tensor]]
     ) -> torch.Tensor:
+        # v1.60 (CM-104, Jasna v0.9.1): run the per-frame upsample engine in
+        # cap-sized batches instead of one whole-clip call. Bit-exact vs the
+        # whole-clip call (per-frame conv stack); the fixed-batch engine's
+        # scratch no longer scales with clip length.
         t = lqs.size(1)
         mapping_idx = list(range(0, len(feats["spatial"])))
         mapping_idx += mapping_idx[::-1]
 
+        lqs_flat = lqs.squeeze(0)
+        out_batch = torch.empty_like(lqs_flat)
         hr_list: list[torch.Tensor] = []
+        start = 0
         for i in range(t):
             hr = [feats[k].pop(0) for k in feats if k != "spatial"]
             hr.insert(0, feats["spatial"][mapping_idx[i]])
             hr_list.append(torch.cat(hr, dim=1))
+            if len(hr_list) < self._upsample_cap and i < t - 1:
+                continue
+            stop = i + 1
+            torch.add(
+                self._upsample_engine(torch.cat(hr_list, dim=0)),
+                lqs_flat[start:stop],
+                out=out_batch[start:stop],
+            )
+            hr_list.clear()
+            start = stop
 
-        hr_batch = torch.cat(hr_list, dim=0)
-        out_batch = self._upsample_engine(hr_batch)
-        out_batch = out_batch + lqs.squeeze(0)
         return out_batch.unsqueeze(0)
 
     _PREPROCESS_MIN_BATCH = 3
+
+    def _preprocess(
+        self, lqs_flat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the preprocess engine in cap-sized batches (v1.60, CM-104).
+
+        SPyNet consumes consecutive frame pairs, so successive batches overlap
+        by one frame: batch [a, b) yields the flows for pairs a..b-2, and the
+        pair (b-1, b) comes from the next batch's first pair. Every batch keeps
+        at least ``_PREPROCESS_MIN_BATCH`` frames, the engine profile minimum.
+        (Ported from Jasna v0.9.1; feature maps are bit-exact vs the
+        whole-clip call, SPyNet flow deltas <= 0.07 px.)
+        """
+        n = lqs_flat.size(0)
+        cap = self._preprocess_cap
+        if n <= cap:
+            return self._preprocess_engine(lqs_flat)
+
+        feats_parts: list[torch.Tensor] = []
+        forward_parts: list[torch.Tensor] = []
+        backward_parts: list[torch.Tensor] = []
+        start = 0
+        covered = 0
+        while True:
+            stop = min(start + cap, n)
+            feats, flows_fwd, flows_bwd = self._preprocess_engine(lqs_flat[start:stop])
+            first_new_pair = max(covered - 1, start) - start
+            feats_parts.append(feats[covered - start : stop - start])
+            forward_parts.append(flows_fwd[first_new_pair:])
+            backward_parts.append(flows_bwd[first_new_pair:])
+            covered = stop
+            if stop >= n:
+                break
+            start = min(stop - 1, n - self._PREPROCESS_MIN_BATCH)
+
+        return (
+            torch.cat(feats_parts),
+            torch.cat(forward_parts),
+            torch.cat(backward_parts),
+        )
 
     def forward(self, lqs: torch.Tensor) -> torch.Tensor:
         n, t, c, h, w = lqs.size()
@@ -650,7 +745,7 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
         else:
             t_engine = t
 
-        feats_, flows_fwd, flows_bwd = self._preprocess_engine(lqs_flat)
+        feats_, flows_fwd, flows_bwd = self._preprocess(lqs_flat)
         h_f, w_f = feats_.shape[2:]
 
         feats_ = feats_[:t]
@@ -688,14 +783,19 @@ def create_split_forward(
     model_weights_path: str,
     device: torch.device,
     fp16: bool,
-    max_clip_size: int = 60,
+    max_clip_size: int | None = None,
 ) -> BasicVSRPlusPlusNetSplit | None:
-    result = load_sub_engines(model_weights_path, device, fp16, max_clip_size)
+    """Build the split-engine forward. ``max_clip_size`` is accepted for
+    backward compatibility and ignored (v1.60: engines are clip-size
+    independent; the loader picks the best files on disk)."""
+    result = load_sub_engines(model_weights_path, device, fp16)
     if result is None:
         return None
-    loop_body_engines, preprocess_engine, upsample_engine = result
+    loop_body_engines, preprocess_engine, upsample_engine, info = result
     generator = _get_inference_generator(model)
     split = BasicVSRPlusPlusNetSplit(
         generator, loop_body_engines, preprocess_engine, upsample_engine,
+        preprocess_cap=info["preprocess_cap"],
+        upsample_cap=info["upsample_cap"],
     )
     return split

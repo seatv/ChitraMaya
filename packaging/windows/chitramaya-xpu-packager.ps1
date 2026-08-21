@@ -111,6 +111,14 @@ if (Test-Path $cfgSrc) {
   Write-Host "No ChitraMaya-config.json at repo root (app will create one on first run)." -ForegroundColor Gray
 }
 
+# ── VERSION.txt (v1.60, CM-097): the frozen exe hides __version__, and the
+#    patch toolchain names + guards from/to versions by this file. ────────
+$verMatch = Select-String -Path .\chitramaya\__init__.py -Pattern '__version__\s*=\s*"([^"]+)"'
+if ($verMatch) {
+  Set-Content -Encoding ASCII (Join-Path $distDir "VERSION.txt") $verMatch.Matches[0].Groups[1].Value
+  Write-Host ("Stamped VERSION.txt = {0}" -f $verMatch.Matches[0].Groups[1].Value) -ForegroundColor Green
+}
+
 # ── Models drop folder (NO engines dir -- TensorRT does not exist here) ──
 New-Item -ItemType Directory -Force -Path (Join-Path $distDir "models") | Out-Null
 ("Place source model files here:" + [Environment]::NewLine +

@@ -478,47 +478,29 @@ class SwapServer:
               f"rest_fp16={bool(mosaic_cfg.mosaic_restoration_fp16)} "
               f"mcl={int(mosaic_cfg.mosaic_max_clip_size)}")
 
-        # If TRT restoration is requested but the requested clip size has no
-        # exact compiled sub-engine set: the compiled sets are DYNAMIC-batch
-        # (a set compiled at N covers clips 1..N), so when a LARGER set
-        # covers the request, keep the user's clip size — the pipeline's
-        # _build_restorer loads the covering set and runs at the requested
-        # ceiling. Only when every compiled set is SMALLER must the runtime
-        # ceiling shrink (clips longer than the engine's N cannot run).
-        # When nothing is compiled the request is left unchanged so the
-        # build raises the clean "compile first" error.
+        # v1.60 (CM-104): engines are CLIP-SIZE INDEPENDENT — the pipeline
+        # loads whatever complete sub-engine set exists (canonical fixed-
+        # batch, or a legacy clip-sized set) and the runtime chunks within
+        # per-file batch caps, so Max Clip is never snapped to compiled
+        # sizes any more. The pre-1.60 snapping logic lived here; it is
+        # gone on purpose. When nothing is compiled the request passes
+        # through unchanged so the pipeline raises the clean "compile
+        # first" error (backend=trt) or falls back to PyTorch (auto).
         if (mosaic_cfg.mosaic_restoration_trt and mosaic_cfg.restoration_model
                 and not mosaic_cfg.mosaic_mask_preview):
-            import dataclasses
             from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
-                list_basicvsrpp_compiled_clip_sizes,
-                pick_engine_clip_size,
+                basicvsrpp_engines_usable,
             )
-            avail = list_basicvsrpp_compiled_clip_sizes(
-                mosaic_cfg.restoration_model, bool(mosaic_cfg.mosaic_restoration_fp16),
-            )
-            req = int(mosaic_cfg.mosaic_max_clip_size)
-            if avail and req not in avail:
-                engine_mcl, runtime_mcl = pick_engine_clip_size(avail, req)
-                if runtime_mcl != req:
-                    logger.warning(
-                        "[mosaic] Max clip %d exceeds every compiled TRT engine "
-                        "set for %s (fp16=%s); capping to %d (available: %s)",
-                        req, mosaic_cfg.restoration_model,
-                        mosaic_cfg.mosaic_restoration_fp16, runtime_mcl, avail,
-                    )
-                    mosaic_cfg = dataclasses.replace(
-                        mosaic_cfg, mosaic_max_clip_size=runtime_mcl,
-                    )
-                else:
-                    logger.info(
-                        "[mosaic] Max clip %d has no exact engine set for %s "
-                        "(fp16=%s); pipeline will load the b%d set (dynamic "
-                        "1..%d) and run at %d",
-                        req, mosaic_cfg.restoration_model,
-                        mosaic_cfg.mosaic_restoration_fp16,
-                        engine_mcl, engine_mcl, req,
-                    )
+            if not basicvsrpp_engines_usable(
+                mosaic_cfg.restoration_model,
+                bool(mosaic_cfg.mosaic_restoration_fp16),
+            ):
+                logger.info(
+                    "[mosaic] No compiled TRT sub-engines for %s (fp16=%s); "
+                    "pipeline will fall back per backend policy",
+                    mosaic_cfg.restoration_model,
+                    mosaic_cfg.mosaic_restoration_fp16,
+                )
 
         # Tensor Detection: if requested and a compiled .engine exists for the
         # selected detection .pt, run detection on the engine (TRT). If the
@@ -613,18 +595,76 @@ class SwapServer:
             logger.exception("Failed to apply live detection score")
         return self._mosaic_pipeline
 
+    def _report_pipeline_error(self, pipeline, e, output_path) -> None:
+        """CM-107 (Batch 50): honest partial reporting on a failed run.
+
+        The pipeline's error cleanup flushes and remuxes whatever was
+        encoded before the failure (field case 2026-08-19: an NVENC
+        error-8 death still yielded a playable 37-minute file with full
+        stats) -- reporting only "error" tells the user they lost
+        everything when they usually did not. If the salvage record says
+        the output is playable, status becomes "partial" and the message
+        says exactly how much survived. Falls back to plain "error"."""
+        salvage = None
+        try:
+            salvage = pipeline.partial_result()
+        except Exception:
+            salvage = None
+        if (salvage and salvage.get("output_ok")
+                and int(salvage.get("frames_encoded", 0)) > 0):
+            enc_n = int(salvage["frames_encoded"])
+            tot_n = int(salvage.get("total_frames", 0) or
+                        self._progress.get("total", 0) or 0)
+            self._progress["status"] = "partial"
+            self._progress["frame"] = enc_n
+            if tot_n > 0:
+                self._progress["total"] = tot_n
+            self._progress["partial_output"] = str(
+                salvage.get("output_path") or output_path)
+            of = (f"PARTIAL: encoded {enc_n} of {tot_n} frames before the "
+                  f"error" if tot_n > 0 else
+                  f"PARTIAL: encoded {enc_n} frames before the error")
+            self._progress["error"] = (
+                f"{of} -- the output file is playable up to that point. "
+                f"{_describe_gpu_error(e)}")
+        else:
+            self._progress["status"] = "error"
+            self._progress["error"] = _describe_gpu_error(e)
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        """Compact ETA: '42s', '12m 40s', '1h 23m'."""
+        s = max(0, int(seconds))
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m {s % 60:02d}s"
+        return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
     def _mosaic_progress_cb(self, *, frame_num, total_frames, detections,
                             restorations, fps_win, fps_avg, buffered, mode):
         """Pipeline progress callback that writes into self._progress."""
         if self._cancel_flag.is_set():
             return
-        remaining = (total_frames - frame_num) / fps_win if fps_win > 0 else 0
+        # CM-090 (Batch 50): blended-fps ETA. The window fps swings an
+        # order of magnitude between passthrough (~70 it/s) and dense
+        # restore sections (1-5 it/s), so a window-only ETA whipsaws from
+        # "2h" to "250h" and back (field: the Idol runs). Blend the
+        # cumulative average (stable, but slow to admit a phase change)
+        # with the recent window (honest about NOW): the ETA moves when
+        # the content genuinely changes character and stays put when the
+        # dip is a blip.
+        if fps_win > 0 and fps_avg > 0:
+            fps_eta = 0.6 * fps_avg + 0.4 * fps_win
+        else:
+            fps_eta = fps_avg if fps_avg > 0 else fps_win
+        remaining = (total_frames - frame_num) / fps_eta if fps_eta > 0 else 0
         self._progress.update({
             "frame": frame_num,
             "total": total_frames,
             "fps": round(fps_win, 1),
             "fps_avg": round(fps_avg, 1),
-            "eta": f"{int(remaining)}s",
+            "eta": self._format_eta(remaining),
             "detections": int(detections),
             "restorations": int(restorations),
             "buffered": int(buffered),
@@ -703,8 +743,7 @@ class SwapServer:
             )
         except Exception as e:
             logger.exception("mosaic_full failed")
-            self._progress["status"] = "error"
-            self._progress["error"] = _describe_gpu_error(e)
+            self._report_pipeline_error(pipeline, e, output_path)
             return ""
 
         if self._cancel_flag.is_set():
@@ -1016,8 +1055,9 @@ class SwapServer:
             )
         except Exception as e:
             logger.exception("auto_mosaic failed")
-            self._progress["status"] = "error"
-            self._progress["error"] = _describe_gpu_error(e)
+            # CM-107: same salvage-aware reporting as mosaic_full -- censor
+            # runs are whole-file runs through the same pipeline.
+            self._report_pipeline_error(pipeline, e, output_path)
             return ""
         finally:
             if segment:
@@ -1811,6 +1851,7 @@ def api_list_mosaic_models():
     restoration: list[dict] = []
 
     from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
+        find_basicvsrpp_engine_files,
         list_basicvsrpp_compiled_clip_sizes,
     )
 
@@ -1828,14 +1869,28 @@ def api_list_mosaic_models():
                 })
             elif ext == ".pth":
                 mp = str(p)
-                # Compiled clip sizes per precision, so the UI can default and
-                # constrain Max Clip to what actually exists on disk.
+                # v1.60 (CM-104): "usable" is the flag that matters — any
+                # complete set (fixed-batch or legacy) serves ANY Max Clip,
+                # so the UI no longer constrains the dial to compiled sizes.
+                # "fixed" tells the UI whether the memory-lean canonical set
+                # is on disk (badge wording); the legacy sizes list stays
+                # for informational display of ladder-era files.
+                _info16 = find_basicvsrpp_engine_files(mp, True)
+                _info32 = find_basicvsrpp_engine_files(mp, False)
                 restoration.append({
                     "path": mp.replace("\\", "/"),
                     "label": p.stem,
                     "engines": {
                         "fp16": list_basicvsrpp_compiled_clip_sizes(mp, True),
                         "fp32": list_basicvsrpp_compiled_clip_sizes(mp, False),
+                    },
+                    "usable": {
+                        "fp16": _info16 is not None,
+                        "fp32": _info32 is not None,
+                    },
+                    "fixed": {
+                        "fp16": bool(_info16 and _info16["fixed"]),
+                        "fp32": bool(_info32 and _info32["fixed"]),
                     },
                 })
 
@@ -1874,8 +1929,10 @@ def _run_compile(models, imgsz, max_clip, force):
                             "--det-imgsz", str(int(imgsz)),
                             "--max-batch", "8", "--workspace", "2"]
         elif ext == ".pth":
+            # v1.60 (CM-104): no --rest-max-clip-length — engines are
+            # clip-size independent (the API still accepts max_clip for
+            # compatibility; it is simply not forwarded).
             cmd = prefix + ["-compile-rest", "--rest-model", mp,
-                            "--rest-max-clip-length", str(int(max_clip)),
                             "--workspace", "2"]
         else:
             with _compile_lock:

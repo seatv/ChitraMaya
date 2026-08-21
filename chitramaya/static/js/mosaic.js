@@ -174,54 +174,28 @@ let _mosaicDetEngines = {};
 // VRAM during the forward scales with clip length. Dial unlocked to 600;
 // a too-long clip fails with a catchable torch OOM, not a native crash.
 const MAX_CLIP_FREE = { min: 30, max: 600, step: 10 };
+// v1.60 (CM-104): with Tensor on, engines are clip-size independent — one
+// compiled set serves any Max Clip, so the dial runs free up to 720
+// (Jasna's validated ceiling; past ~180 wall time stops improving and only
+// activation VRAM grows).
+const MAX_CLIP_TRT = { min: 30, max: 720, step: 10 };
 
-// Default / constrain the Max Clip slider to what is actually compiled for the
-// selected restoration model + precision. Mirrors the server-side snap, so the
-// value the user sees matches what will run. With TRT off, the range is free.
+// Set the Max Clip slider range for the selected restoration model +
+// precision. v1.60: engines no longer constrain the dial — the range is
+// free on both paths; only the ceilings differ (PyTorch 600 / Tensor 720).
 function updateMaxClipConstraints() {
   const slider = document.getElementById('ctrlMosaicMaxClip');
   const valSpan = document.getElementById('valMosaicMaxClip');
   if (!slider) return;
 
-  const restModel = document.getElementById('ctrlMosaicRestModel').value;
-  const fp16 = document.getElementById('ctrlMosaicRestFp16').checked;
   const useTrt = document.getElementById('ctrlMosaicRestTrt').checked;
+  const range = useTrt ? MAX_CLIP_TRT : MAX_CLIP_FREE;
 
-  if (!useTrt) {
-    // PyTorch path — clip size is free.
-    slider.min = MAX_CLIP_FREE.min;
-    slider.max = MAX_CLIP_FREE.max;
-    slider.step = MAX_CLIP_FREE.step;
-    slider.disabled = false;
-    if (valSpan) valSpan.textContent = slider.value;
-    _updateRestorationButtonStates();
-    return;
-  }
-
-  const info = _mosaicRestEngines[restModel];
-  const avail = info ? (fp16 ? info.fp16 : info.fp32) : [];
-
-  if (!avail || avail.length === 0) {
-    // TRT requested but nothing compiled for this model + precision. Leave the
-    // slider free; the submit-time modal handles the no-engine case (Continue
-    // on PyTorch / Manage Models), so we don't block the button here.
-    slider.disabled = false;
-    if (valSpan) valSpan.textContent = slider.value;
-    _updateRestorationButtonStates();
-    return;
-  }
-
-  // The compiled sets are DYNAMIC-batch: a set compiled at N covers clips of
-  // any length 1..N, and the pipeline loads the smallest compiled set that
-  // covers the requested value. So every Max Clip up to the LARGEST compiled
-  // size is runnable — only values above it are impossible. Cap the slider
-  // there; no locking to exact compiled sizes.
-  const hi = avail[avail.length - 1];
-  slider.min = Math.min(MAX_CLIP_FREE.min, hi);
-  slider.max = hi;
-  slider.step = MAX_CLIP_FREE.step;
+  slider.min = range.min;
+  slider.max = range.max;
+  slider.step = range.step;
   slider.disabled = false;
-  if (parseInt(slider.value) > hi) slider.value = hi;
+  if (parseInt(slider.value) > range.max) slider.value = range.max;
   if (valSpan) valSpan.textContent = slider.value;
 
   _updateRestorationButtonStates();
@@ -735,7 +709,11 @@ function _pollMosaicProgress({onComplete, onError}) {
 
     if (prog.status === 'complete') {
       onComplete(prog);
-    } else if (prog.status === 'error' || prog.status === 'cancelled') {
+    } else if (prog.status === 'error' || prog.status === 'cancelled' ||
+               prog.status === 'partial') {
+      // CM-107 (Batch 50): 'partial' = the run errored but a playable
+      // partial output was saved. Routed through onError; handlers branch
+      // on prog.status to present it honestly.
       onError(prog);
     }
   }, 500);
@@ -825,7 +803,7 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
   progressCancel.textContent = 'Stop';
   progressCancel.onclick = async () => {
     const prog = await apiGet('/api/progress');
-    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled')) {
+    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled' || prog.status === 'partial')) {
       progressModal.classList.add('hidden');
       clearInterval(pollInterval);
       _updateRestorationButtonStates();
@@ -887,8 +865,21 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
     },
     onError: (prog) => {
       clearInterval(pollInterval);
-      progressTitle.textContent = prog.status === 'error' ? 'Error' : 'Cancelled';
-      progressPercent.textContent = prog.error || 'Processing failed';
+      if (prog.status === 'partial') {
+        // CM-107 (Batch 50): the run errored, but the output file holds
+        // everything encoded up to the failure and is playable. Field
+        // case 2026-08-19: 135,584 frames / 37 minutes survived an NVENC
+        // death and the UI said only "Error". Keep the bar at the real
+        // percentage -- the work shown was NOT lost.
+        const pct = prog.total > 0 ? Math.round((prog.frame / prog.total) * 100) : 0;
+        progressTitle.textContent =
+          `Partial result — ${prog.frame} of ${prog.total} frames saved`;
+        progressPercent.textContent = prog.error || 'Partial output saved.';
+        progressBar.style.width = pct + '%';
+      } else {
+        progressTitle.textContent = prog.status === 'error' ? 'Error' : 'Cancelled';
+        progressPercent.textContent = prog.error || 'Processing failed';
+      }
       progressCancel.textContent = 'Close';
       _updateRestorationButtonStates();
     },
@@ -897,7 +888,7 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
   progressCancel.textContent = 'Stop';
   progressCancel.onclick = async () => {
     const prog = await apiGet('/api/progress');
-    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled')) {
+    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled' || prog.status === 'partial')) {
       progressModal.classList.add('hidden');
       clearInterval(pollInterval);
       _updateRestorationButtonStates();
@@ -1195,11 +1186,20 @@ async function mmPopulateList() {
     _mmModels.push({ path: m.path, label: m.label, kind: 'det',
                      compiled: !!m.has_engine, detail: '' }));
   (data.restoration || []).forEach(m => {
+    // v1.60 (CM-104): a usable set serves ANY clip length. Badge wording:
+    // canonical fixed-batch set = "any clip length"; legacy ladder files =
+    // still usable, but flag that one recompile shrinks them.
+    const usable = !!(m.usable && (m.usable.fp16 || m.usable.fp32));
+    const fixed = !!(m.fixed && (m.fixed.fp16 || m.fixed.fp32));
     const sizes = [...new Set([...((m.engines && m.engines.fp16) || []),
                                ...((m.engines && m.engines.fp32) || [])])].sort((a, b) => a - b);
+    let detail = '';
+    if (usable) {
+      detail = fixed ? 'any clip length'
+                     : ('legacy b' + sizes.join(',') + ' - recompile to shrink');
+    }
     _mmModels.push({ path: m.path, label: m.label, kind: 'rest',
-                     compiled: sizes.length > 0,
-                     detail: sizes.length ? ('clips ' + sizes.join(',')) : '' });
+                     compiled: usable, detail });
   });
   for (const p of [..._mmSelected]) if (!_mmModels.some(m => m.path === p)) _mmSelected.delete(p);
   mmRenderList();
@@ -1291,7 +1291,10 @@ async function mmCompile() {
     return;
   }
   const imgsz = parseInt(document.getElementById('mmImgsz').value, 10) || 640;
-  const maxClip = parseInt(document.getElementById('mmMaxClip').value, 10) || 60;
+  // v1.60 (CM-104): restoration engines are clip-size independent; the
+  // Manage Models Max Clip slider is gone. max_clip is kept in the API
+  // for compatibility and ignored by the engine layer.
+  const maxClip = 60;
   const force = document.getElementById('mmForce').checked;
   _mmSetCompiling(true);
   if (log) log.textContent = 'Starting…';
@@ -1327,6 +1330,40 @@ async function openManageModels() {
     }
   }
 }
+
+// CM-109 (Batch 50, GenSRT precedent): the compile log is THE artifact users
+// paste for support (field: the dual-GPU compile forensics ran on phone
+// screenshots because the pane could not be copied). One click copies the
+// whole pane. Clipboard API first (127.0.0.1 is a secure context in
+// WebView2/Chromium); hidden-textarea execCommand fallback for older
+// runtimes. The pane itself is also selectable now (ui.html user-select).
+(function _mmWireLogCopy() {
+  const btn = document.getElementById('mmLogCopy');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const log = document.getElementById('mmLog');
+    const text = log ? log.textContent : '';
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch (e) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch (e2) { ok = false; }
+    }
+    const prev = 'Copy';
+    btn.textContent = ok ? 'Copied' : 'Copy failed';
+    setTimeout(() => { btn.textContent = prev; }, 1500);
+  });
+})();
 
 function closeManageModels() {
   const modal = document.getElementById('manageModelsModal');
@@ -1488,6 +1525,8 @@ async function mmDownload() {
 }
 
 // Slider readouts — self-contained (kept out of the config system).
+// (mmMaxClip removed in v1.60 — engines are clip-size independent; the
+// forEach tolerates the missing element either way.)
 ['mmImgsz', 'mmMaxClip'].forEach(id => {
   const dial = document.getElementById(id);
   const val = document.getElementById(id + 'Val');
@@ -2245,15 +2284,23 @@ document.getElementById('amSubmit').addEventListener('click', async () => {
     onError: (prog) => {
       clearInterval(pollInterval);
       const cancelled = prog.status === 'cancelled' && prog.frame > 0;
-      if (cancelled) {
+      if (prog.status === 'partial') {
+        // CM-107 (Batch 50): errored, but a playable partial output exists.
+        const pct = prog.total > 0 ? Math.round((prog.frame / prog.total) * 100) : 0;
+        progressTitle.textContent =
+          `Partial result — ${prog.frame} of ${prog.total} frames saved`;
+        progressPercent.textContent = prog.error || 'Partial output saved.';
+        progressBar.style.width = pct + '%';
+      } else if (cancelled) {
         progressTitle.textContent = `Cancelled — ${prog.frame} frames processed`;
         progressPercent.textContent = 'Partial output was saved and remuxed.';
         state.previewReady = true;
+        progressBar.style.width = '0%';
       } else {
         progressTitle.textContent = prog.status === 'error' ? 'Error' : 'Cancelled';
         progressPercent.textContent = prog.error || 'No frames processed';
+        progressBar.style.width = '0%';
       }
-      progressBar.style.width = '0%';
       progressCancel.textContent = 'Close';
       _amJobRunning = false;
       _updateRestorationButtonStates();
@@ -2263,7 +2310,7 @@ document.getElementById('amSubmit').addEventListener('click', async () => {
   progressCancel.textContent = 'Stop';
   progressCancel.onclick = async () => {
     const prog = await apiGet('/api/progress');
-    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled')) {
+    if (prog && (prog.status === 'complete' || prog.status === 'error' || prog.status === 'cancelled' || prog.status === 'partial')) {
       progressModal.classList.add('hidden');
       clearInterval(pollInterval);
       _updateRestorationButtonStates();

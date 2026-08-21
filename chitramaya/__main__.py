@@ -56,6 +56,20 @@ def main() -> int:
         _print_usage()
         return 0
 
+    # CM-110 (Batch 50): harden the CLI's console streams BEFORE any
+    # subcommand runs. Field event 2026-08-18: -compile-rest died with
+    # OSError(22, 'Incorrect function') / "lost sys.stderr" when the
+    # shared Windows console handle went bad mid-run (GUI open at the
+    # time) -- the compile itself was healthy. A dead console must never
+    # kill a run; see chitramaya/safe_console.py. The GUI path is already
+    # covered (console_buffer's tee swallows real-stream write errors).
+    if args:
+        try:
+            from chitramaya.safe_console import install as _safe_console
+            _safe_console()
+        except Exception:
+            pass
+
     if args and args[0] in ("-restore", "--restore", "restore"):
         sys.argv = ["ChitraMaya -restore"] + args[1:]
         from tools.process_mosaic import main as restore_main

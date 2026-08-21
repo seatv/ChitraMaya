@@ -2,12 +2,15 @@
 """Compile BasicVSR++ TensorRT sub-engines from a .pth checkpoint.
 
 Builds the 6 sub-engines (4 loop-body + preprocess + upsample) for a given
-checkpoint, precision (fp16/fp32), and max_clip_size. Engines are saved
-next to the .pth file in a ``<stem>_sub_engines/`` directory.
+checkpoint and precision (fp16/fp32). Engines are saved next to the .pth
+file in a ``<stem>_sub_engines/`` directory.
 
-Compile once per (model, precision, max_clip_size) combination. Engines for
-different max_clip_size values can coexist (the filename includes ``bN``),
-so you can pre-compile for several mcl ceilings if you switch often.
+v1.60 (CM-104): engines are CLIP-SIZE INDEPENDENT (fixed-batch preprocess
+b60 / upsample b30, ported from Jasna v0.9.1). Compile ONCE per (model,
+precision) — one set serves every Max Clip Length setting; the dial now
+costs activation memory only. Old clip-sized bN sets remain loadable but
+reserve far more VRAM; recompiling replaces them for practical purposes
+(the old files can be deleted).
 
 Usage from the chitramaya unified CLI:
 
@@ -16,7 +19,7 @@ Usage from the chitramaya unified CLI:
 Or directly:
 
     python -m tools.compile_basicvsrpp --rest-model PATH/TO/MODEL.pth \
-        --rest-max-clip-length 60 --fp16
+        --fp16
 
 Compile takes 5-15 minutes depending on optimization_level and the GPU.
 The output engines are platform-specific (Windows engines won't load on
@@ -60,10 +63,10 @@ def main() -> int:
         help="Path to BasicVSR++ checkpoint (.pth)",
     )
     parser.add_argument(
-        "--rest-max-clip-length", type=int, default=60,
-        help="Max clip size for dynamic-batch engines (default: 60). "
-             "Engines are valid for batches 1..N at inference. Compile "
-             "for the largest mcl you plan to use.",
+        "--rest-max-clip-length", type=int, default=None,
+        help="DEPRECATED (v1.60, CM-104): engines are clip-size independent; "
+             "this flag is accepted for backward compatibility and ignored. "
+             "One compile serves every Max Clip setting.",
     )
     parser.add_argument(
         "--fp16", action=argparse.BooleanOptionalAction, default=True,
@@ -107,19 +110,30 @@ def main() -> int:
 
     device = torch.device(f"cuda:{int(args.gpu_id)}")
     fp16 = bool(args.fp16)
-    max_clip_size = int(args.rest_max_clip_length)
+
+    if args.rest_max_clip_length is not None:
+        print(
+            f"[compile] NOTE: --rest-max-clip-length "
+            f"({args.rest_max_clip_length}) no longer affects engine "
+            f"compilation (v1.60, CM-104): engines are clip-size "
+            f"independent. One compile serves every Max Clip setting."
+        )
 
     engine_dir = _basicvsrpp_sub_engine_dir(str(model_path))
 
+    # v1.60 (CM-104): engines are clip-size independent — the canonical set
+    # is fixed-batch (preprocess b60 / upsample b30) and one compile serves
+    # every Max Clip setting. --rest-max-clip-length is accepted for
+    # backward compatibility and no longer affects what gets built.
     if (not args.force) and all_basicvsrpp_sub_engines_exist(
-        str(model_path), fp16=fp16, max_clip_size=max_clip_size,
+        str(model_path), fp16=fp16,
     ):
         print(
             f"[compile] All engines already present for this configuration. "
             f"Pass --force to rebuild."
         )
         for k, p in get_basicvsrpp_sub_engine_paths(
-            str(model_path), fp16=fp16, max_clip_size=max_clip_size,
+            str(model_path), fp16=fp16,
         ).items():
             size_mb = os.path.getsize(p) / (1024 * 1024) if os.path.isfile(p) else 0
             print(f"           {k:30s} ({size_mb:6.1f} MB)  {p}")
@@ -134,17 +148,16 @@ def main() -> int:
     # Batch 39 r2: named after the MODEL, not a generic tag.
     _log_path = compile_log_path(engine_dir, Path(model_path).stem)
     with tee_compile_output(_log_path):
-        write_log_header(argv=sys.argv)
-        return _compile_body(args, model_path, device, fp16,
-                             max_clip_size, engine_dir)
+        write_log_header(argv=sys.argv, gpu_id=int(args.gpu_id))
+        return _compile_body(args, model_path, device, fp16, engine_dir)
 
 
-def _compile_body(args, model_path, device, fp16, max_clip_size,
-                  engine_dir) -> int:
+def _compile_body(args, model_path, device, fp16, engine_dir) -> int:
     print(f"[compile] checkpoint:      {model_path}")
     print(f"[compile] engine dir:      {engine_dir}")
     print(f"[compile] precision:       {'fp16' if fp16 else 'fp32'}")
-    print(f"[compile] max_clip_size:   {max_clip_size}")
+    print(f"[compile] engine batches:  preprocess b60 / upsample b30 "
+          f"(clip-size independent, v1.60)")
     print(f"[compile] device:          {device}")
     print(f"[compile] optimization:    {args.optimization_level}")
     print(f"[compile] workspace:       {args.workspace} GB" if args.workspace > 0
@@ -154,7 +167,7 @@ def _compile_body(args, model_path, device, fp16, max_clip_size,
     if args.force:
         # Remove existing engines so compile doesn't skip them
         for p in get_basicvsrpp_sub_engine_paths(
-            str(model_path), fp16=fp16, max_clip_size=max_clip_size,
+            str(model_path), fp16=fp16,
         ).values():
             try:
                 os.remove(p)
@@ -181,7 +194,6 @@ def _compile_body(args, model_path, device, fp16, max_clip_size,
         device=device,
         fp16=fp16,
         model_weights_path=str(model_path),
-        max_clip_size=max_clip_size,
         optimization_level=int(args.optimization_level),
         workspace_gb=int(args.workspace),
     )
