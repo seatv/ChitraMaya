@@ -433,6 +433,64 @@ def _vram_plan(
     return final, reduced, warning
 
 
+# ---------------------------------------------------------------------------
+# CM-111 (Batch 50): host-store RAM plan
+# ---------------------------------------------------------------------------
+# Field-calibrated on the 2026-08-19 The-Idol forensics run (the first NVENC
+# error-8 death captured end-to-end by nvGPUMonitor): a 4K60 MCL-300 run on a
+# 23.3 GB machine filled its 7.9 GB HOST store on top of an 11 GB baseline,
+# system RAM peaked at 90.7%, and nvEncLockBitstream -- which needs lockable
+# (pinned, non-pageable) host memory -- failed with error 8. The old check
+# ("warn if store > 70% of available-at-startup") passed that run at 58%.
+# The two constants below encode what the telemetry actually showed:
+#
+#   _RAM_GROWTH_ALLOWANCE_MB: non-store host growth during the run. Measured
+#   ~3.0 GB on the forensics run (encoder queue pages, SR/TF host buffers,
+#   torch host allocations, other-process creep between startup and peak).
+#
+#   _RAM_FLOOR_*: physical free RAM that must survive AT PEAK for the OS and
+#   NVENC's pinned allocations. The dead run bottomed out at ~2.2 GB free;
+#   completed runs never went below ~4 GB.
+_RAM_GROWTH_ALLOWANCE_MB = 3072
+_RAM_FLOOR_MIN_MB = 3072
+_RAM_FLOOR_FRACTION = 0.125     # 1/8 of total RAM, if that is larger
+
+
+def _ram_plan_host(
+    *,
+    width: int,
+    height: int,
+    max_clip_length: int,
+    requested_frames: int,
+    avail_bytes: int,
+    total_bytes: int,
+) -> Tuple[bool, int, int, int]:
+    """Judge whether a HOST FrameStore of ``requested_frames`` fits system
+    RAM with the headroom a full run actually needs (see constants above).
+
+    Returns ``(fits, safe_frames, suggested_mcl, floor_bytes)``:
+      - fits          : the requested store stays inside the safe budget.
+      - safe_frames   : largest store (frames) the safe budget covers.
+      - suggested_mcl : largest Max Clip Length whose one-clip store floor
+                        (mcl + 32) fits, rounded DOWN to a multiple of 10
+                        (0 when even MCL 30 does not fit).
+      - floor_bytes   : the free-RAM floor -- also the runtime guard level.
+
+    NOTE: the store cap is NOT silently reduced on a miss. A host store
+    smaller than the MCL holdback window just jams against backpressure and
+    the emergency bump re-raises it -- the honest lever is a lower MCL, and
+    the caller prints exactly that.
+    """
+    mb = 1024 * 1024
+    frame_bytes = max(1, int(width) * int(height) * 3)
+    floor_b = max(_RAM_FLOOR_MIN_MB * mb, int(int(total_bytes) * _RAM_FLOOR_FRACTION))
+    safe_store_b = int(avail_bytes) - _RAM_GROWTH_ALLOWANCE_MB * mb - floor_b
+    safe_frames = max(0, safe_store_b // frame_bytes)
+    fits = int(requested_frames) <= safe_frames
+    suggested_mcl = max(0, (int(safe_frames) - 32) // 10 * 10)
+    return fits, int(safe_frames), int(suggested_mcl), int(floor_b)
+
+
 @dataclass
 class Pipeline:
     cfg: Config
@@ -690,143 +748,109 @@ class Pipeline:
             raise FileNotFoundError("Restoration model path is empty (check config.json or --rest-model)")
 
         # Prefer TensorRT sub-engines if they exist for this checkpoint +
-        # precision + max_clip_size. Falls back to PyTorch on any failure
+        # precision (v1.60: engines are clip-size independent — any complete
+        # set serves any Max Clip). Falls back to PyTorch on any failure
         # so a partial/incompatible engine set never blocks restoration.
         if str(self.rest_backend).lower() != "pytorch":
             try:
                 from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
                     _basicvsrpp_sub_engine_dir,
-                    all_basicvsrpp_sub_engines_exist,
-                    list_basicvsrpp_compiled_clip_sizes,
-                    pick_engine_clip_size,
+                    basicvsrpp_engines_usable,
+                    find_basicvsrpp_engine_files,
                 )
 
-                # Engine filenames bind (precision, max_clip_size) at compile
-                # time, but the compiled sets are DYNAMIC-batch (valid for
-                # clips 1..N), so the compiled size only decides which FILES
-                # to load — the user's request stays the RUNTIME clip
-                # ceiling whenever a compiled set covers it. See
-                # pick_engine_clip_size(). Without this resolution, a model
-                # compiled at e.g. b90 hard-failed — or, worse, silently
-                # fell back to PyTorch under backend=auto — just because
-                # --rest-max-clip-length was omitted or different.
+                # v1.60 (CM-104): engines are CLIP-SIZE INDEPENDENT. The
+                # loader picks the best files on disk (canonical fixed-batch
+                # set, or a legacy clip-sized set from pre-1.60 compiles) and
+                # the runtime chunks preprocess/upsample within per-file
+                # batch caps. Max Clip Length is purely the RUNTIME temporal
+                # window now — no snapping to compiled sizes, no ceiling from
+                # the engine layer; the dial costs activation memory only.
                 req_mcl = int(self.rest_max_clip_length)
-                engine_mcl = req_mcl
-                if not all_basicvsrpp_sub_engines_exist(
-                    self.rest_model, fp16=self.rest_fp16, max_clip_size=req_mcl,
-                ):
-                    avail = list_basicvsrpp_compiled_clip_sizes(
-                        self.rest_model, self.rest_fp16,
-                    )
-                    pick = pick_engine_clip_size(avail, req_mcl)
-                    if pick is not None:
-                        engine_mcl, runtime_mcl = pick
-                        if runtime_mcl == req_mcl:
-                            print(
-                                f"[Restorer] max_clip_length={req_mcl} has no "
-                                f"exact engine set; loading the b{engine_mcl} "
-                                f"set (dynamic, covers 1..{engine_mcl}) and "
-                                f"running with max_clip_length={req_mcl} "
-                                f"(compiled sizes: {avail})"
-                            )
-                        else:
-                            # Only smaller sets are compiled — clips longer
-                            # than the engine's ceiling cannot run, so the
-                            # runtime ceiling caps. This happens BEFORE run()
-                            # builds the tracker/store, so clip formation and
-                            # the engines stay consistent.
-                            print(
-                                f"[Restorer] No TRT sub-engines compiled for "
-                                f"max_clip_length>={req_mcl} "
-                                f"(fp16={self.rest_fp16}); capping "
-                                f"max_clip_length to {runtime_mcl} "
-                                f"(compiled sizes: {avail})"
-                            )
-                            self.rest_max_clip_length = int(runtime_mcl)
-
-                # VRAM-hint note, surfaced alongside run()'s VRAM warning: a
-                # larger engine set reserves dramatically more activation
-                # memory (observed: b180 + detection context left ~335 MB free
-                # on an 8 GB card at 4K). If smaller compiled sets exist,
-                # tell the user exactly which Max Clip selects them.
+                info = find_basicvsrpp_engine_files(
+                    self.rest_model, self.rest_fp16,
+                )
                 self._rest_engine_note = ""
-                try:
-                    _avail_all = list_basicvsrpp_compiled_clip_sizes(
-                        self.rest_model, self.rest_fp16,
-                    )
-                    _smaller = [n for n in _avail_all if n < int(engine_mcl)]
-                    if _smaller:
-                        self._rest_engine_note = (
-                            f" Note: restoration engine set b{int(engine_mcl)} is in "
-                            f"use; smaller compiled set(s) {_smaller} exist — a max "
-                            f"clip length <= {max(_smaller)} selects b{max(_smaller)}, "
-                            f"which reserves substantially less VRAM."
+                if info is not None:
+                    if info["fixed"]:
+                        _set_desc = (
+                            f"fixed-batch b{info['preprocess_b']}/"
+                            f"b{info['upsample_b']} (clip-size independent)"
                         )
-                    # CM-103 (v1.50.00): engine-set-aware preflight. A TRT
-                    # execution context reserves activation memory for its
-                    # WORST-CASE COMPILED shape, so a b120+ set reserves the
-                    # same near-whole-card memory at Max Clip 30 as at its
-                    # ceiling — the MCL dial does not shrink it. Field event
-                    # 2026-08-16: b180 + detection context left ~0 MB free on
-                    # an 8 GB card at 4K and NVENC died mid-run with
-                    # nvEncLockBitstream error 8 at EVERY Max Clip value.
-                    # Say so BEFORE the run walks into it.
-                    if self.device.type == "cuda" and int(engine_mcl) >= 120:
-                        _tot_b = torch.cuda.get_device_properties(
-                            self.device).total_memory
-                        if _tot_b < 12 * (1024 ** 3):
-                            _fix = (f"lower Max Clip to <= {max(_smaller)} to "
-                                    f"select the b{max(_smaller)} set"
-                                    if _smaller else
-                                    "compile a b60-class set (Manage Models, "
-                                    "Max Clip Length 60) or turn restore "
-                                    "Use Tensor off")
-                            print(
-                                f"[Restorer] CAUTION: engine set "
-                                f"b{int(engine_mcl)} on a "
-                                f"{_tot_b // (1024**3)} GB GPU typically "
-                                f"leaves no VRAM for the encoder — runs "
-                                f"tend to fail mid-encode (NVENC error 8) "
-                                f"regardless of the Max Clip value, because "
-                                f"the reservation follows the COMPILED size, "
-                                f"not the dial. Recommended: {_fix}."
-                            )
-                except Exception:
-                    pass
+                    else:
+                        _set_desc = (
+                            f"LEGACY preprocess_b{info['preprocess_b']} + "
+                            f"upsample_b{info['upsample_b']}"
+                        )
+                        # One recompile converts a ladder-era set into the
+                        # ~1 GB-class fixed-batch set. Not forced: legacy
+                        # files run correctly through the batched runtime,
+                        # they just keep their old (larger) reservation.
+                        self._rest_engine_note = (
+                            f" Note: legacy clip-sized engine files are in "
+                            f"use (preprocess_b{info['preprocess_b']}, "
+                            f"upsample_b{info['upsample_b']}). Recompiling "
+                            f"once (Manage Models -> Compile) builds the "
+                            f"v1.60 fixed-batch set, which reserves several "
+                            f"GB less VRAM and serves every Max Clip value."
+                        )
+                        print(f"[Restorer] {self._rest_engine_note.strip()}")
+                    # CM-103 (reworked for v1.60): the reservation follows
+                    # the largest COMPILED batch among the loaded files. A
+                    # legacy b120+ preprocess/upsample file still reserves
+                    # near-whole-card scratch on small GPUs (field-proven:
+                    # NVENC error 8 mid-encode). The fixed-batch set makes
+                    # this caution structurally silent.
+                    try:
+                        _max_file_b = max(
+                            int(info["preprocess_b"]), int(info["upsample_b"]),
+                        )
+                        if (self.device.type == "cuda"
+                                and not info["fixed"] and _max_file_b >= 120):
+                            _tot_b = torch.cuda.get_device_properties(
+                                self.device).total_memory
+                            if _tot_b < 12 * (1024 ** 3):
+                                print(
+                                    f"[Restorer] CAUTION: legacy engine file"
+                                    f"(s) compiled at b{_max_file_b} on a "
+                                    f"{_tot_b // (1024**3)} GB GPU typically "
+                                    f"leave no VRAM for the encoder — runs "
+                                    f"tend to fail mid-encode (NVENC error "
+                                    f"8) regardless of the Max Clip value, "
+                                    f"because the reservation follows the "
+                                    f"COMPILED size, not the dial. Fix: "
+                                    f"recompile once (Manage Models -> "
+                                    f"Compile) — v1.60 engines are small "
+                                    f"and clip-size independent."
+                                )
+                    except Exception:
+                        pass
 
-                if all_basicvsrpp_sub_engines_exist(
-                    self.rest_model,
-                    fp16=self.rest_fp16,
-                    max_clip_size=int(engine_mcl),
-                ):
                     from chitramaya.mosaic.restorer.basicvsrpp_trt_clip_restorer import (
                         BasicVSRPPTRTClipRestorer,
                     )
                     print(
                         f"[Restorer] Using TensorRT sub-engines "
-                        f"(engine_set=b{engine_mcl}, "
-                        f"max_clip_length={self.rest_max_clip_length}, "
+                        f"({_set_desc}, max_clip_length={req_mcl}, "
                         f"fp16={self.rest_fp16})"
                     )
                     return BasicVSRPPTRTClipRestorer(
                         model_path=self.rest_model,
                         device=self.device,
                         fp16=self.rest_fp16,
-                        max_clip_size=int(engine_mcl),
+                        max_clip_size=req_mcl,
                     )
                 elif str(self.rest_backend).lower() == "trt":
-                    # User explicitly asked for TRT but no engine set exists
-                    # for this precision at ANY clip size. Say exactly what
-                    # was looked for, where, and what IS on disk.
+                    # User explicitly asked for TRT but no complete engine
+                    # set exists for this precision. Say exactly what was
+                    # looked for, where, and what IS on disk.
                     eng_dir = _basicvsrpp_sub_engine_dir(self.rest_model)
-                    other = list_basicvsrpp_compiled_clip_sizes(
+                    if basicvsrpp_engines_usable(
                         self.rest_model, not self.rest_fp16,
-                    )
-                    if other:
+                    ):
                         hint = (
-                            f" Engines for fp16={not self.rest_fp16} DO exist "
-                            f"(clip sizes {other}) — match the compiled "
-                            f"precision with "
+                            f" Engines for fp16={not self.rest_fp16} DO "
+                            f"exist — match the compiled precision with "
                             f"{'--rest-fp16' if not self.rest_fp16 else '--no-rest-fp16'}, "
                             f"or recompile."
                         )
@@ -837,8 +861,8 @@ class Pipeline:
                         f"for fp16={self.rest_fp16} alongside {self.rest_model} "
                         f"(looked in {eng_dir})." + hint +
                         f" Compile with `ChitraMaya -compile-rest --rest-model "
-                        f"{self.rest_model} --rest-max-clip-length "
-                        f"{req_mcl}` or pass "
+                        f"{self.rest_model}` (one compile serves every Max "
+                        f"Clip setting) or pass "
                         f"--rest-backend pytorch to use the PyTorch path."
                     )
                 # else: backend=auto, nothing compiled → PyTorch fallback,
@@ -918,6 +942,12 @@ class Pipeline:
         so this is non-breaking; the UI bridge reads frame/detection counts
         off it).
         """
+        # CM-107 (Batch 50): reset the salvage record FIRST. It is written
+        # by the main finally below; a failure during setup (before that
+        # try is even entered) must not leave a PREVIOUS run's record for
+        # the server to misreport as this run's partial output.
+        self.last_run_salvage = None
+
         # Batch 32: hold the system awake for the whole run (model builds /
         # TRT compiles included). Long unattended runs otherwise die to the
         # idle-sleep timer -- field: two Arc soak deaths at ~21:30 on
@@ -1168,6 +1198,12 @@ class Pipeline:
         # fit -- in host mode the cap is NOT reduced (system RAM holds it),
         # which is what makes MCL-180-class runs possible on 8GB cards.
         store_backend = self.store_backend
+        # CM-111: runtime RAM-guard level; armed by the host-branch RAM plan
+        # below, None (guard off) for device stores / when psutil is absent.
+        # Reset per run -- the server reuses this Pipeline object across
+        # files and a stale floor from a previous host run must not throttle
+        # a device-store run.
+        self._ram_floor_bytes = None
         if store_backend == "host" and self._vrproj is not None:
             print("[FrameStore] NOTE: VR projection composites into device "
                   "frames; host offload disabled for this run.")
@@ -1204,17 +1240,52 @@ class Pipeline:
                 if store_backend == "host":
                     _need_mb = requested_cap * (w * h * 3) // (1024 * 1024)
                     _ram_note = ""
+                    # CM-111 (Batch 50): real RAM plan instead of the old
+                    # "70% of available at startup" check, which PASSED the
+                    # run that died (58% of available was still 90.7% of
+                    # total at peak once baseline usage and run growth were
+                    # counted). See _ram_plan_host for the calibration.
                     try:
                         import psutil
-                        _avail_b = int(psutil.virtual_memory().available)
+                        _vm = psutil.virtual_memory()
+                        _avail_b, _total_ram_b = int(_vm.available), int(_vm.total)
+                        _fits, _safe_frames, _sugg_mcl, _floor_b = _ram_plan_host(
+                            width=w, height=h,
+                            max_clip_length=self.rest_max_clip_length,
+                            requested_frames=requested_cap,
+                            avail_bytes=_avail_b, total_bytes=_total_ram_b,
+                        )
+                        # Arm the runtime guard (checked in the decode loop).
+                        self._ram_floor_bytes = _floor_b
+                        _safe_mb = _safe_frames * (w * h * 3) // (1024 * 1024)
                         _ram_note = (f"; system RAM available: "
-                                     f"{_avail_b // (1024*1024)} MB")
-                        if requested_cap * (w * h * 3) > 0.7 * _avail_b:
-                            print(f"[FrameStore] WARNING: projected host store "
-                                  f"({_need_mb} MB) is more than 70% of "
-                                  f"available system RAM -- consider a lower "
-                                  f"store_max_frames or shorter max clip "
-                                  f"length.")
+                                     f"{_avail_b // (1024*1024)} MB, safely "
+                                     f"usable for the store: ~{_safe_mb} MB")
+                        if not _fits:
+                            _mcl_lever = (
+                                f"lower Max Clip Length to ~{_sugg_mcl} or below"
+                                if _sugg_mcl >= 30 else
+                                "free system RAM (even MCL 30 does not fit right now)"
+                            )
+                            print(
+                                f"[FrameStore] WARNING: RAM plan does NOT fit: "
+                                f"the host store for Max Clip Length "
+                                f"{int(self.rest_max_clip_length)} at {w}x{h} "
+                                f"needs ~{_need_mb} MB of system RAM, but only "
+                                f"~{_safe_mb} MB is safely usable "
+                                f"({_avail_b // (1024*1024)} MB available minus "
+                                f"~{_RAM_GROWTH_ALLOWANCE_MB} MB run growth and a "
+                                f"{_floor_b // (1024*1024)} MB free-RAM floor the "
+                                f"OS and NVENC pinned memory need at peak). Runs "
+                                f"in this state die mid-encode with NVENC error 8 "
+                                f"when RAM tops out in a dense section "
+                                f"(field-traced 2026-08-19). Levers: "
+                                f"{_mcl_lever}, close other applications, or "
+                                f"add RAM. The RAM guard will pause decode-ahead "
+                                f"when free RAM hits the floor, which slows the "
+                                f"run instead of killing it -- but a fitting "
+                                f"Max Clip Length is the real fix."
+                            )
                     except Exception:
                         pass
                     print(f"[FrameStore] backend: HOST -- up to {requested_cap} "
@@ -1287,6 +1358,46 @@ class Pipeline:
                   f"(~{est_mb:.0f} MB {_budget_kind} budget)")
         else:
             print("[FrameStore] max_frames=unlimited")
+
+        # CM-111 (Batch 50): runtime RAM guard for HOST-backed stores. The
+        # startup plan predicts; this enforces. Checked alongside is_full()
+        # in the decode loops: when physical free RAM drops to the floor,
+        # decode-ahead pauses and the loop drains instead -- converting the
+        # Idol failure mode (RAM tops out -> nvEncLockBitstream error 8)
+        # into a slower-but-alive run. Sampled at most every 2s (psutil
+        # virtual_memory is cheap but not free at 70 it/s). NEVER allowed
+        # to deadlock: when nothing is drainable (an open clip needs MORE
+        # decode to close), the loop proceeds -- see the drain sites.
+        _ram_guard_floor = (self._ram_floor_bytes
+                            if store.backend == "host" else None)
+        _ram_guard = {"next": 0.0, "low": False, "warned": 0.0, "psutil": None}
+        if _ram_guard_floor is not None:
+            try:
+                import psutil as _ram_psutil
+                _ram_guard["psutil"] = _ram_psutil
+            except Exception:
+                _ram_guard_floor = None
+
+        def _ram_low() -> bool:
+            if _ram_guard_floor is None:
+                return False
+            _now = time.monotonic()
+            if _now < _ram_guard["next"]:
+                return _ram_guard["low"]
+            _ram_guard["next"] = _now + 2.0
+            try:
+                _avail = int(_ram_guard["psutil"].virtual_memory().available)
+            except Exception:
+                return False
+            _low = _avail < _ram_guard_floor
+            if _low and not _ram_guard["low"] and (_now - _ram_guard["warned"]) > 30.0:
+                _ram_guard["warned"] = _now
+                print(f"[FrameStore] RAM guard: {_avail // (1024*1024)} MB free "
+                      f"is below the {_ram_guard_floor // (1024*1024)} MB floor "
+                      f"-- pausing decode-ahead while the encoder drains "
+                      f"(CM-111). Throughput will dip; the run survives.")
+            _ram_guard["low"] = _low
+            return _low
 
         # Echo the effective batch size (decode + detection). Surfaced so the
         # "Detection Batch" control / --batch-size / --det-batch-size is
@@ -1735,7 +1846,7 @@ class Pipeline:
 
                     # [CHANGE 2+] Backpressure: enforce cap. If an active scene blocks draining,
                     # temporarily raise the cap (bounded) instead of letting the store grow unbounded.
-                    while store.is_full():
+                    while store.is_full() or _ram_low():
                         metrics.backpressure_waits += 1
 
                         # Drain frames that are guaranteed not to be touched by any active clip.
@@ -1743,7 +1854,7 @@ class Pipeline:
                         tracker_sb = int(min_start) if min_start is not None else int(frame_num + 1)
                         sb = tracker_sb
 
-                        drain_store_to_encoder(
+                        _drained = drain_store_to_encoder(
                             store=store,
                             upload_device=store_upload_device,  # CM-084
                             safe_before=sb,
@@ -1753,12 +1864,20 @@ class Pipeline:
                             pts_log=pts_log,
                         )
 
-                        if not store.is_full():
+                        if not (store.is_full() or _ram_low()):
+                            break
+
+                        # CM-111: RAM low but the store is not full and nothing
+                        # was drainable (an open clip needs MORE decoded frames
+                        # before it can close). Waiting here would deadlock the
+                        # run -- proceed with decode; the guard re-engages as
+                        # soon as frames become drainable again.
+                        if (not store.is_full()) and _drained == 0:
                             break
 
                         # If we cannot drain because the oldest stored frame is still within an
                         # active clip, bump the cap up to an emergency ceiling.
-                        if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
+                        if store.is_full() and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
                                 new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
@@ -1796,7 +1915,7 @@ class Pipeline:
 
                     # [CHANGE 2+] Backpressure: enforce cap. If an active scene blocks draining,
                     # temporarily raise the cap (bounded) instead of letting the store grow unbounded.
-                    while store.is_full():
+                    while store.is_full() or _ram_low():
                         metrics.backpressure_waits += 1
 
                         # Drain frames that are guaranteed not to be touched by any active clip.
@@ -1804,7 +1923,7 @@ class Pipeline:
                         tracker_sb = int(min_start) if min_start is not None else int(frame_num + 1)
                         sb = tracker_sb
 
-                        drain_store_to_encoder(
+                        _drained = drain_store_to_encoder(
                             store=store,
                             upload_device=store_upload_device,  # CM-084
                             safe_before=sb,
@@ -1814,12 +1933,20 @@ class Pipeline:
                             pts_log=pts_log,
                         )
 
-                        if not store.is_full():
+                        if not (store.is_full() or _ram_low()):
+                            break
+
+                        # CM-111: RAM low but the store is not full and nothing
+                        # was drainable (an open clip needs MORE decoded frames
+                        # before it can close). Waiting here would deadlock the
+                        # run -- proceed with decode; the guard re-engages as
+                        # soon as frames become drainable again.
+                        if (not store.is_full()) and _drained == 0:
                             break
 
                         # If we cannot drain because the oldest stored frame is still within an
                         # active clip, bump the cap up to an emergency ceiling.
-                        if store.max_frames > 0 and min_start is not None and len(store.frames_bgr_u8) > 0:
+                        if store.is_full() and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
                                 new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
@@ -2024,6 +2151,63 @@ class Pipeline:
                 )
 
             metrics.t_mux += (time.perf_counter() - t0)
+
+            # CM-107 (Batch 50): salvage record. The Idol forensics run
+            # (2026-08-19) errored mid-encode yet flushed 135,584 frames,
+            # remuxed cleanly, and produced a playable 37-minute file --
+            # and the UI still said only "Error". Record what actually
+            # survived so callers (server -> UI, CLI) can report "PARTIAL:
+            # encoded M of N" honestly instead of implying total loss.
+            try:
+                _real_enc = (encoder.underlying
+                             if isinstance(encoder, AsyncEncoder) else encoder)
+                _frames_enc = int(getattr(_real_enc, "_frames_encoded", 0) or 0)
+                _needs_remux = bool(getattr(_real_enc, "_needs_remux", False))
+                _remux_ok = bool(getattr(_real_enc, "_remux_ok", False))
+                _out_p = Path(self.output_path)
+                _out_ok = (_frames_enc > 0
+                           and foi_capture is None
+                           and _out_p.exists()
+                           and _out_p.stat().st_size > 0
+                           and ((not _needs_remux) or _remux_ok))
+                self.last_run_salvage = {
+                    "errored": bool(_inflight_exc),
+                    "frames_encoded": _frames_enc,
+                    "total_frames": int(total_frames),
+                    "output_ok": bool(_out_ok),
+                    "output_path": str(self.output_path),
+                }
+                if _inflight_exc and _out_ok:
+                    _sec = (_frames_enc / fps) if fps > 0 else 0.0
+                    print(f"[Pipeline] PARTIAL RESULT: the run errored, but "
+                          f"the output contains the first {_frames_enc} "
+                          f"frames (~{int(_sec // 60)}m{int(_sec % 60):02d}s "
+                          f"of video) and is playable: {self.output_path}")
+            except Exception:
+                self.last_run_salvage = None
+
+            # CM-111 (Batch 50): explicitly release the frame store. On a
+            # clean run the final drain already emptied it; after a run
+            # error the drain is skipped/fails and the full store would
+            # otherwise stay resident -- the Idol post-mortem telemetry
+            # showed ~8 GB (a full 4K MCL-300 host store) held by the
+            # process for 10 hours after the failure, so a retry without
+            # an app restart started 8 GB in the hole. Free it here,
+            # unconditionally, before the exception propagates.
+            try:
+                _held = len(store.frames_bgr_u8)
+                store.frames_bgr_u8.clear()
+                store.frame_pts.clear()
+                if _held:
+                    print(f"[FrameStore] released {_held} undrained frames "
+                          f"at cleanup (CM-111)")
+                import gc as _gc
+                _gc.collect()
+                if self.device.type in ("cuda", "xpu"):
+                    from chitramaya.device import empty_cache as _cm111_empty
+                    _cm111_empty(self.device)
+            except Exception:
+                pass
 
             metrics.wall_end = _dt.datetime.now()
 
@@ -2738,6 +2922,19 @@ class MosaicPipeline:
             restorations=int(len(metrics.frames_restored)),
             diag_path=diag_path,
         )
+
+    def partial_result(self) -> Optional[dict]:
+        """CM-107 (Batch 50): what the last run salvaged, or None.
+
+        When run() raises, the pipeline may still have flushed and remuxed
+        a playable partial output (field case 2026-08-19: 135,584 frames /
+        37 minutes survived an NVENC error-8 death). The server calls this
+        from its except path to report "PARTIAL: encoded M of N" instead
+        of a bare error. Keys: errored, frames_encoded, total_frames,
+        output_ok, output_path."""
+        host = getattr(self, "_host", None)
+        rec = getattr(host, "last_run_salvage", None)
+        return dict(rec) if isinstance(rec, dict) else None
 
     def close(self) -> None:
         """Release warm models/host and reclaim their GPU memory. Idempotent.

@@ -25,7 +25,7 @@ from chitramaya.mosaic.restorer.clip_restorer import BaseClipRestorer
 from chitramaya.mosaic.models.basicvsrpp.inference import load_model
 from chitramaya.mosaic.models.basicvsrpp.sub_engines import create_split_forward
 from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
-    all_basicvsrpp_sub_engines_exist,
+    basicvsrpp_engines_usable,
 )
 
 
@@ -54,20 +54,20 @@ class BasicVSRPPTRTClipRestorer(BaseClipRestorer):
 
         self.fp16 = bool(fp16) and (self.device.type == "cuda")
         self.model_dtype = torch.float16 if self.fp16 else torch.float32
+        # v1.60 (CM-104): max_clip_size is the RUNTIME temporal window for
+        # the inference chunking loop only — engines are clip-size
+        # independent and any window runs on one compiled set.
         self.max_clip_size = int(max_clip_size)
         # Chunk size for the inference loop. Default = max_clip_size so we
-        # send whole compatible clips through one engine call.
+        # send whole compatible clips through one forward pass.
         self.max_frames = int(max_frames) if max_frames is not None else self.max_clip_size
 
-        if not all_basicvsrpp_sub_engines_exist(
-            model_path, fp16=self.fp16, max_clip_size=self.max_clip_size,
-        ):
+        if not basicvsrpp_engines_usable(model_path, fp16=self.fp16):
             raise FileNotFoundError(
-                f"BasicVSR++ TRT sub-engines not found for "
-                f"max_clip_size={self.max_clip_size}, fp16={self.fp16} "
+                f"BasicVSR++ TRT sub-engines not found for fp16={self.fp16} "
                 f"alongside {model_path}. "
-                f"Run `ChitraMaya -compile-rest --rest-model {model_path} "
-                f"--rest-max-clip-length {self.max_clip_size}` first."
+                f"Run `ChitraMaya -compile-rest --rest-model {model_path}` "
+                f"first (one compile serves every Max Clip setting)."
             )
 
         # Load PyTorch model first — the split orchestrator references

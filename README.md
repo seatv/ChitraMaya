@@ -69,6 +69,18 @@ Grab the latest release from the **[Releases](https://github.com/seatv/ChitraMay
 
 Run `ChitraMaya-install.exe` — it reassembles the parts and extracts automatically. You'll get a `ChitraMaya` folder containing `ChitraMaya.exe`, `ChitraMaya-cli.exe`, a `models\` folder, and `Compile-All-Engines.ps1`. If the install fails immediately, check that all three downloads completed and are in one folder.
 
+> [!TIP]
+> ### Already running ChitraMaya? Updates are small patches now.
+> From v1.60.00 on, each release page also carries a **patch zip** (e.g.
+> `ChitraMaya-patch-1.50.00-to-1.60.00.zip`, under 100 MB) so existing users
+> skip the multi-GB re-download. Extract the patch zip anywhere and run
+> `powershell -ExecutionPolicy Bypass -File .\Apply-Patch.ps1` — it finds
+> your install (or asks), verifies every file it would touch belongs to the
+> release the patch was built from (a mismatch refuses cleanly, changing
+> nothing), backs up what it replaces, applies, and runs the self-check.
+> Your models, compiled engines, and settings are never touched, and
+> re-running a patch is safe.
+
 **Which exe?** `ChitraMaya.exe` is the app — windowed, no terminal; its console output goes to the in-app Console panel and to `ChitraMaya-console.log` next to the exe (the previous run is kept as `ChitraMaya-console.prev.log`). `ChitraMaya-cli.exe` is the same app for **terminal workflows** — headless restores and engine compiles in PowerShell, with live output and progress bars.
 
 ### 3. Get the models
@@ -91,8 +103,8 @@ TensorRT engines are hardware-specific, so they're built on your machine (once p
 
 1. Open **Manage Models**. Downloaded models show as **Not compiled**.
 2. Click **Select all not-compiled** (or pick individual rows).
-3. Set **Image Size** (detection; 640 is the tested default — **compile at 800 if you mostly restore 4K+ VR/SBS content**, see the tuning note below) and **Max Clip Length** (restoration — **60 on an 8 GB card**, see the VRAM rule below).
-4. Click **Compile** and watch the log. This takes a few minutes per model and pins the GPU — that's normal.
+3. Set **Image Size** (detection; 640 is the tested default — **compile at 800 if you mostly restore 4K+ VR/SBS content**, see the tuning note below). Restoration engines need no size choice: as of v1.60.00 they are **clip-size independent — one compile serves every Max Clip Length setting**.
+4. Click **Compile** and watch the log (selectable, with a **Copy** button for bug reports). This takes a few minutes per model and pins the GPU — that's normal.
 
 When it finishes, the badges flip to **Compiled** and the models are ready to use.
 
@@ -111,19 +123,35 @@ When it finishes, the badges flip to **Compiled** and the models are ready to us
 - **Temporal Stability → 2 (recommended).** Removes the frame-to-frame shimmer restoration models produce, smoothing each restored region across a 7-frame window only where content agrees — real motion passes through. Only restored pixels are touched. Weights are bundled; there's nothing to download. Especially worthwhile on 8 GB cards, where shorter clip lengths make shimmer more visible.
 
 > [!IMPORTANT]
-> ### The 8 GB VRAM rule
-> On an **8 GB card**, use **Max Clip Length 60** (90 is fine too) and **encoder preset P5**. The key fact: a TensorRT engine set reserves VRAM for the clip size it was **compiled** at, not the Max Clip value you dial — selecting MCL 60 while only a 180-frame set is compiled still pays the 180-frame memory bill. So **compile a set for each Max Clip value you actually use** (30/60/90 — Manage Models, one compile each); the app always loads the *smallest* compiled set that covers your dial. From v1.50.00 the console warns you **before the run starts** if the set about to load is too big for your card, and checks encoder headroom after models land — heed both. Sets of 90 and below run the full quality stack comfortably on 8 GB; 120 is marginal; 180 needs 16 GB. **12 GB+ cards:** run MCL 90+ freely; our field data says the extra clip length is worth having.
+> ### Max Clip Length in v1.60: engines are free, frames cost memory
+> The old "8 GB VRAM rule" is **retired**. As of v1.60.00, TensorRT
+> restoration engines are **clip-size independent** — they no longer reserve
+> VRAM for a compiled clip size, one compile serves every setting, and the
+> Max Clip dial is free from **30 to 720** on the Tensor path. In the field
+> this freed ~1.6 GB of VRAM on an 8 GB card versus v1.50, and Max Clip
+> **300 at 4K with the full quality stack completes on 8 GB cards**.
+>
+> What long clips *do* cost now is **memory for the frames in flight**: the
+> encoder must hold back roughly Max-Clip frames behind unfinished clips, and
+> at 4K that is ~24 MB per frame — held in VRAM when it fits, otherwise in
+> **system RAM**. High Max Clip x high resolution x high framerate is a real
+> RAM bill (4K/60 at MCL 300 ≈ 8 GB). The console now prints a **RAM plan**
+> at startup — if your Max Clip doesn't safely fit your machine, it says so
+> before the run and names the largest value that does — and a **RAM guard**
+> pauses decode-ahead mid-run rather than letting the machine run out.
+> Heed both lines. (Encoder advice is unchanged: **preset P5 on 8 GB cards**.)
 
 A few more things worth knowing before a full run:
 
-- **Max Clip Length is flexible.** A restoration engine set compiled at N handles any clip length up to N, so you can set Max Clip to any value up to your largest compiled size — the app loads the smallest set that covers your request and runs at the ceiling you asked for. Longer clips give better temporal stability but cost more VRAM.
+- **Max Clip Length is a pure runtime dial (v1.60).** Restoration engines are clip-size independent, so any Max Clip from 30 to 720 runs on the same compiled files. Longer clips give better temporal stability but hold more frames in memory — see the RAM-plan box above. Engines compiled under v1.50 are recognized as-is (no recompile); only much older sets load with a cap and a recompile hint.
 - **Full-clip restoration on the PyTorch path (v1.50.00).** With **Use Tensor** off, the Max Clip dial unlocks up to **600 frames** and the restorer propagates detail across the whole window in one pass — the dial *is* the temporal window there, limited only by memory. If a long window doesn't fit, add `"restoreChunkFrames": 32` to `ChitraMaya-config.json` (or `--restore-chunk-frames 32`) to restore the old chunked behavior.
 - **Two copies at once is fine.** Launching a second instance automatically picks the next port (the console says so) and writes its own `ChitraMaya-console-<pid>.log`, so parallel sessions don't fight over one log file.
-- **VRAM pre-flight warning.** Before processing starts, ChitraMaya checks free GPU memory against what the run needs and warns you up front — from "headroom is thin" through "VRAM tight, may page" up to "this configuration does not fit this GPU" — and names the levers that would help (lower Max Clip, a smaller compiled engine set, PyTorch detection). Heed it, especially on 8 GB and smaller cards.
+- **VRAM pre-flight warning.** Before processing starts, ChitraMaya checks free GPU memory against what the run needs and warns you up front — from "headroom is thin" through "VRAM tight, may page" up to "this configuration does not fit this GPU" — and names the levers that would help (lower Max Clip, smaller --det-imgsz, PyTorch detection). From v1.60 the same preflight also covers **system RAM** when the host frame store is used (see the Max Clip box above). Heed both, especially on 8 GB and smaller cards.
 - **Async Encode is off by default.** Synchronous encoding is the dependable default and saves ~500–600 MB of VRAM at 4K. If your card has headroom, tick **Async Encode** in the Encoder panel to overlap encode with restoration for a faster run.
 - **Output codec.** The Encoder panel offers **HEVC** (default), **H.264**, and **AV1** (RTX 40-series or newer). Your **QP** setting always uses the familiar HEVC 0–51 scale; for AV1 the app maps it internally to AV1's finer quantizer scale (the log shows the mapping), so QP 18 means the same quality intent regardless of codec. AV1 outputs are automatically post-processed so they seek correctly in every player (a hardware-encoder quirk ChitraMaya repairs at packaging time). The **Preset** dropdown offers the full P1 (fastest) to P7 (best) ladder — on 8 GB cards stay at **P5 or below**.
 - **Outputs never overwrite.** If the output name already exists, the new file gets a `-2`, `-3`, … suffix and the log says so.
-- **Stall protection.** A watchdog monitors long runs and calls out a stalled pipeline instead of letting it sit silently. On eGPU setups it also warns if the PCIe link is running below its trained speed *under load* — an early warning for VRAM-paging trouble. The stall threshold is configurable: add `"watchdogStallSeconds": 300` to `ChitraMaya-config.json` (next to the exe) if the default 120 seconds is too eager for your hardware.
+- **Stall protection.** A watchdog monitors long runs and calls out a stalled pipeline instead of letting it sit silently. On eGPU setups it also warns if the PCIe link is running below its trained speed *under load* — an early warning for VRAM-paging trouble — and (v1.60) summarizes benign link "flapping" into one line a minute instead of alarm storms, while a down-train that does *not* recover still alarms in full. The stall threshold is configurable: add `"watchdogStallSeconds": 300` to `ChitraMaya-config.json` (next to the exe) if the default 120 seconds is too eager for your hardware.
+- **Failed runs report what survived (v1.60).** A hard mid-run error no longer masquerades as total loss: everything encoded before the failure is flushed and remuxed as always, and the app now says **"PARTIAL: encoded M of N frames"** — the output file is playable up to that point, and the console names it.
 - **The system stays awake during runs.** ChitraMaya holds off the idle-sleep timer while processing (the display may still turn off), then releases it — overnight runs no longer die to a power plan.
 
 ![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
@@ -220,6 +248,7 @@ The AMD edition is a **separate download** — a single **`ChitraMaya-rocm-insta
 
 - **Requires Adrenalin driver 26.2.2 or newer.** Earlier drivers lack the runtime the bundled PyTorch ROCm stack needs.
 - **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch (and from v1.50.00, with the full-clip temporal window: the biggest quality change this edition has received). Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step.
+- **Which files to download:** in Manage Models, fetch one detection model (a `.pt` file — `lada_mosaic_detection_model_v2.pt` is the proven starting point) and one restoration model (a `.pth` file — `lada_mosaic_restoration_model_generic_v1.2.pth`). Those two are all a basic restore needs.
 - **ffmpeg does decode and encode** (AMD AMF hardware encoders where available).
 - **NVIDIA-only features say so and step aside:** RTX Super-Res and the PCIe monitor are unavailable by design. Temporal Stability works fully.
 - Everything else — the editor, Test Frame, Process Folder, Add Mosaic, SBS View, the watchdog, keep-awake, crash hardening — is the same product.
@@ -300,8 +329,10 @@ Or compile individually:
 
 ```bash
 chitramaya -compile-det  --det-model  models/<detection_model>.pt    --det-imgsz 640
-chitramaya -compile-rest --rest-model models/<restoration_model>.pth --rest-max-clip-length 60
+chitramaya -compile-rest --rest-model models/<restoration_model>.pth
 ```
+
+*(v1.60: restoration engines are clip-size independent — `--rest-max-clip-length` is deprecated at compile time and ignored with a note.)*
 
 *(NVIDIA only — the Arc edition runs models directly in PyTorch with no compile step.)*
 
@@ -337,8 +368,8 @@ Useful CLI flags:
 | `--input` | Input video **file**, or a **folder** to batch-process every video in it |
 | `--batch-video-extensions` | Comma-separated extensions to include when `--input` is a folder |
 | `--batch-skip-existing` / `--no-batch-skip-existing` | Skip files whose output already exists (the resume mechanism; on by default) |
-| `--rest-backend` | `auto` (default — loads a covering engine set, or falls back to PyTorch), `trt` (force TensorRT sub-engines), or `pytorch` (force fallback, no precompiled engines needed) |
-| `--rest-max-clip-length` | Frames per restoration clip. Any value up to your largest compiled set — the app loads the smallest set that covers it and runs at this ceiling. Defaults to 30 if omitted. **8 GB cards: 60** (see the VRAM rule). |
+| `--rest-backend` | `auto` (default — uses the compiled TensorRT engines when present, else falls back to PyTorch), `trt` (force TensorRT sub-engines), or `pytorch` (force fallback, no precompiled engines needed) |
+| `--rest-max-clip-length` | Frames per restoration clip (30–720 on the Tensor path; engines are clip-size independent as of v1.60). Defaults to 30 if omitted. Longer clips hold more frames in memory — watch the console's RAM-plan line at high values on 4K+/high-fps content. |
 | `--restore-chunk-frames` | PyTorch restoration path only: cap the temporal window at N frames (`32` = pre-v1.50 behavior). Default `0` = no cap — the whole clip is restored in one pass. |
 | `--det-dump-rois` | Write every detection rectangle per frame into the run's `.misses.json` (for analysis tools like `tools/ab_eval.py`) |
 | `--secondary-restoration` | `none` (default), `rtx-2x`, or `rtx-4x` — RTX Super-Res upscale of restored regions before paste-back (recommended; needs RTX + recent driver) |

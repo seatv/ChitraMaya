@@ -29,12 +29,17 @@ Pure stdlib, no Flask/GPU imports -- unit-testable anywhere.
 from __future__ import annotations
 
 import io
+import re
 import sys
 import threading
 from collections import deque
 from typing import List, Optional, Tuple
 
 _MAX_LINE_CHARS = 2000   # hard cap per line (a runaway line can't eat the buffer)
+
+# Batch 50 cosmetic: ANSI escape sequences (ultralytics and friends color
+# their warnings). Fine on a real console; garbage in the drawer/log file.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 class ConsoleBuffer:
@@ -77,9 +82,20 @@ class ConsoleBuffer:
                 self._commit_locked(line)
 
     def _commit_locked(self, line: str) -> None:
+        # Batch 50: a plain CRLF line ending is NOT a tqdm spinner -- strip
+        # the trailing \r first, or the collapse below reduces every
+        # CRLF-terminated line (werkzeug's banner, subprocess echoes) to
+        # the empty segment after its \r and drops it.
+        if line.endswith("\r"):
+            line = line[:-1]
         # tqdm-style updates: keep only the segment after the last \r.
         if "\r" in line:
             line = line.rsplit("\r", 1)[-1]
+        # Batch 50 cosmetic: strip ANSI color/cursor codes (ultralytics
+        # colorizes its settings WARNING) -- they render as garbage in the
+        # drawer and the log file.
+        if "\x1b" in line:
+            line = _ANSI_RE.sub("", line)
         line = line.rstrip()
         if not line:
             return
@@ -115,7 +131,16 @@ class _TeeStream(io.TextIOBase):
 
     # -- writing ----------------------------------------------------------
     def write(self, s) -> int:
-        s = str(s)
+        # Batch 50 cosmetic fix: werkzeug's startup banner arrives as BYTES
+        # in the frozen windowed build, and str(b"...") produced literal
+        # b'...' reprs whose \r\n stayed ESCAPE TEXT instead of newlines --
+        # gluing the whole Flask banner plus the dev-server WARNING into
+        # one unreadable first line of every console log (field: the first
+        # line of every misses-JSON console_tail). Decode bytes properly.
+        if isinstance(s, (bytes, bytearray)):
+            s = s.decode("utf-8", "replace")
+        else:
+            s = str(s)
         if self._real is not None:
             try:
                 self._real.write(s)
