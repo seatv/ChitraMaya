@@ -16,7 +16,7 @@
   "ctrlMosaicSbsSplit": false,
   "ctrlMosaicVrProjection": "none",
   "ctrlMosaicRestModel": "D:/MyProjects/chitramaya/models/lada_mosaic_restoration_model_generic_v1.2.pth",
-  "ctrlMosaicMaxClip": "180",
+  "ctrlMosaicMaxClip": "720",
   "ctrlMosaicRestFp16": true,
   "ctrlMosaicSecondary": "rtx-4x",
   "ctrlMosaicTemporalFix": "3",

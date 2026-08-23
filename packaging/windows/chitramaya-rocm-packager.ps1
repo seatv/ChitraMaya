@@ -117,11 +117,18 @@ cd /d %~dp0
 "%~dp0$Name.exe" %*
 "@ | Set-Content -Encoding ASCII $cmdPath
 
-# ── Copy config template next to the exe (if present) ────────────────────
+# ── ChitraMaya-config.json is NEVER shipped (Batch 53, field-caught) ─────
+# The old "copy config template if present" step silently packaged the
+# DEVELOPER'S personal config (output dirs, model paths, dial settings)
+# into every build made from a checkout that had one at the repo root.
+# The app creates a correct config on first run from the code's own
+# defaults (/api/default-config <- models.py dataclasses, the single
+# source of truth), so shipping a file here can only cause drift or leak
+# the builder's environment. If a repo-root config exists, say so and
+# deliberately skip it.
 $cfgSrc = Join-Path (Resolve-Path ".").Path "ChitraMaya-config.json"
 if (Test-Path $cfgSrc) {
-  Copy-Item -Force $cfgSrc (Join-Path $distDir "ChitraMaya-config.json")
-  Write-Host "Copied ChitraMaya-config.json" -ForegroundColor Green
+  Write-Host "NOTE: repo-root ChitraMaya-config.json is the builder's personal file -- NOT shipped (app creates defaults on first run)." -ForegroundColor Yellow
 } else {
   Write-Host "No ChitraMaya-config.json at repo root (app will create one on first run)." -ForegroundColor Gray
 }

@@ -105,6 +105,14 @@ Write-Host "Old tree: $oldTree"
 # -- Resolve the new tree -------------------------------------------------
 $NewDist = (Resolve-Path $NewDist).Path
 $newTree = $null
+# r3: accept the dist PARENT too (field event 2026-08-22: -NewDist dist
+# with the tree at dist\ChitraMaya fell through to the extraction path).
+if (-not ((Test-Path (Join-Path $NewDist "ChitraMaya.exe")) -or (Test-Path (Join-Path $NewDist "ChitraMaya-cli.exe")))) {
+  $childTree = Join-Path $NewDist "ChitraMaya"
+  if ((Test-Path (Join-Path $childTree "ChitraMaya.exe")) -or (Test-Path (Join-Path $childTree "ChitraMaya-cli.exe"))) {
+    $NewDist = $childTree
+  }
+}
 if ((Test-Path (Join-Path $NewDist "ChitraMaya.exe")) -or (Test-Path (Join-Path $NewDist "ChitraMaya-cli.exe"))) {
   $newTree = $NewDist
   Write-Host "New tree: $newTree (already extracted)"
@@ -112,7 +120,18 @@ if ((Test-Path (Join-Path $NewDist "ChitraMaya.exe")) -or (Test-Path (Join-Path 
   Write-Host "  actual new installer artifact rather than dist\ -- the"
   Write-Host "  released archive is what users will have."
 } else {
-  $newTree = Get-ExtractedTree $NewDist (Join-Path $CacheDir "new-extracted")
+  # r3 (field event 2026-08-22): NEVER reuse the new-side extraction cache.
+  # The done.txt short-circuit is correct for the OLD side (published
+  # releases are immutable) but a stale-cache landmine here: the rehearsal
+  # build's tree survived into the 1.60.01 patch attempt and make_patch's
+  # same-version guard fired against LAST build's files. The new artifact
+  # changes every build -- extract it fresh every time.
+  $newCache = Join-Path $CacheDir "new-extracted"
+  if (Test-Path $newCache) {
+    Write-Host "  clearing stale new-side extraction cache: $newCache"
+    Remove-Item -Recurse -Force $newCache
+  }
+  $newTree = Get-ExtractedTree $NewDist $newCache
   Write-Host "New tree: $newTree"
 }
 
