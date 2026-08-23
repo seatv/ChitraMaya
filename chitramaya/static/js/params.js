@@ -190,6 +190,15 @@ function applyConfig(cfg) {
   // which controls are inert for the just-loaded settings (e.g. Feather under
   // Blend Mask = None, Mask colour/opacity when Preview is off).
   if (typeof _updateControlEnableStates === 'function') _updateControlEnableStates();
+
+  // CM-116 (v1.60.01): reconcile the Max Clip range AFTER the whole config
+  // applied. The generic loop above restores ctrlMosaicMaxClip BEFORE
+  // ctrlMosaicRestTrt (list order), so the mode-correct ceiling (PyTorch
+  // 600 / Tensor 720) can only be computed once every control is in. The
+  // slider markup now carries the absolute ceiling (720) so the value
+  // restore itself can never under-clamp; this call applies the tighter
+  // per-mode limit with the RESTORED Tensor state.
+  if (typeof updateMaxClipConstraints === 'function') updateMaxClipConstraints();
 }
 
 // getDefaultConfig removed — defaults come from server /api/default-config

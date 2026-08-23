@@ -319,8 +319,17 @@
               <div class="ctrl-row">
                 <span class="ctrl-label" title="How many consecutive frames the restorer processes together as one clip - this IS the model's temporal window, so longer clips give smoother, more stable motion but use more VRAM. As of v1.60 engines are clip-size independent: with Use Tensor on the dial is free up to 720 on one compiled set (past ~180, wall time stops improving and only memory grows). With Use Tensor off (PyTorch) the dial is free up to 600. On both paths the only ceiling is memory - a too-long clip stops with a clean out-of-memory error; dial down and retry (the restoreChunkFrames config entry can also cap the PyTorch window without shortening clips). Independent of detection.">Max Clip</span>
                 <div class="ctrl-dial-container">
+                  <!-- CM-116 (v1.60.01): static max MUST be the absolute
+                       ceiling (720, the Tensor-path maximum). Batch 48 freed
+                       the JS ranges but left max="180" here, so applyConfig's
+                       value restore CLAMPED a saved Max Clip of 300 down to
+                       180 on every relaunch (field-caught by Gman day one) --
+                       range inputs silently clamp assignments to the markup
+                       max, and updateMaxClipConstraints() runs too late to
+                       help. The per-mode ceiling (PyTorch 600 / Tensor 720)
+                       is applied by updateMaxClipConstraints afterward. -->
                   <input type="range" class="ctrl-dial" id="ctrlMosaicMaxClip"
-                         min="30" max="180" step="10" value="90">
+                         min="30" max="720" step="10" value="90">
                   <span class="ctrl-value" id="valMosaicMaxClip">90</span>
                 </div>
               </div>
