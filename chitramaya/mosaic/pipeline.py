@@ -42,9 +42,11 @@ from .pipeline_utils import (
     cfg_first,
     cfg_path,
     compute_pts_fps,
+    pts_head_skip,
     drain_store_to_encoder,
     drain_store_to_async_encoder,
     AsyncEncoder,
+    PtsGapFiller,
     nv12_to_rgb_hwc_u8,
     rgb_hwc_to_bgr_hwc_u8,
     rgbp_chw_to_rgb_hwc_u8,
@@ -1335,6 +1337,12 @@ class Pipeline:
         if store_backend == "auto":
             store_backend = "device"   # no measurement possible -> today's behavior
         store = FrameStore(max_frames=final_cap, backend=store_backend)
+        # CM-120: arm decoder-drop compensation. Both drain helpers pick the
+        # filler up from the store, so every encode path (sync + async, all
+        # backpressure/final drains) is covered from one construction point.
+        # Inert when per-frame PTS are unavailable (see Decoder._frame_pts)
+        # or uniform (the ffmpeg fallback synthesizes exact-CFR PTS).
+        store.gap_filler = PtsGapFiller()
 
         # CM-084: NVENC consumes device tensors, so a host-backed store pays
         # one H2D upload per frame at drain time. The ffmpeg encoder path
@@ -2111,6 +2119,92 @@ class Pipeline:
                 _real_encoder._pts_fps = pts_fps
                 _real_encoder._pts_timecodes_path = tc_path
                 _real_encoder._pts_is_vfr = is_vfr
+
+                # CM-120r2: HEAD-SKIP detection. Stream captures often start
+                # mid-GOP and the hardware decode path silently discards the
+                # reference-broken head frames (field case: output frame 0
+                # showed source content from t=1.03s -> video led audio by
+                # ~1 s from the very first frame). No PTS DELTA can see a
+                # loss that precedes the first delivered frame, but the
+                # first frame's ABSOLUTE timestamp vs the stream's
+                # start_time measures it exactly. The remux compensates by
+                # delaying the video by the same amount (same -itsoffset
+                # machinery as the CM-121 source-offset restoration).
+                try:
+                    _stream_start = getattr(decoder.metadata, "start_time", None)
+                    _head_s, _first_pts, _spu = pts_head_skip(
+                        pts_log, fps, _stream_start)
+                    if _first_pts is not None and _spu is not None:
+                        print(f"[PTS] first delivered frame at source "
+                              f"t={_first_pts * _spu:.3f}s (stream start "
+                              f"{(_stream_start if _stream_start is not None else 0.0):.3f}s)")
+                    if _head_s > 0:
+                        print(f"[Pipeline] head-skip detected: decoder "
+                              f"discarded ~{_head_s:.3f}s (~{int(round(_head_s * fps))} "
+                              f"frames) at the stream head; the remux will "
+                              f"delay the video to keep audio in sync.")
+                        _real_encoder._head_skip_seconds = float(_head_s)
+                except Exception as _hs_e:
+                    print(f"[PTS] head-skip check failed ({_hs_e}); continuing")
+
+            # CM-120: gap-fill / decoder-drop honesty report. Never end a
+            # run with a silently short video: either the filler kept the
+            # sync (say what it did), or frames are missing and we could
+            # not see where (say THAT, loudly).
+            _filler = getattr(store, "gap_filler", None)
+            if _filler is not None and _filler.total_filled > 0:
+                print(f"[Pipeline] gap-fill: inserted {_filler.total_filled} "
+                      f"duplicate frame(s) across {len(_filler.gaps)} gap(s) "
+                      f"to keep A/V sync (decoder skipped source frames).")
+            if _filler is not None and _filler.skipped_gaps:
+                print(f"[Pipeline] WARNING: {len(_filler.skipped_gaps)} "
+                      f"timeline jump(s) were too large to fill -- audio "
+                      f"sync shifts at those points (source timeline is "
+                      f"discontinuous).")
+            try:
+                _promised = int(decoder.num_frames or 0)
+                _filled = int(_filler.total_filled) if _filler else 0
+                _short = _promised - int(metrics.processed_frames) - 0
+                if (_promised > 0 and _short > 0 and _filled == 0
+                        and self.max_frames is None
+                        and not (cancel_flag is not None and cancel_flag.is_set())):
+                    _sec = _short / fps if fps > 0 else 0.0
+                    _head_known = 0.0
+                    try:
+                        _head_known = float(getattr(_real_encoder, "_head_skip_seconds", 0.0) or 0.0)
+                    except Exception:
+                        _head_known = 0.0
+                    _head_frames = int(round(_head_known * fps)) if fps > 0 else 0
+                    if tc_path is not None and _head_frames >= _short:
+                        # The whole shortfall is the measured head skip and
+                        # the remux is compensating -- informational only.
+                        print(f"[Pipeline] NOTE: decoder delivered "
+                              f"{metrics.processed_frames} of the {_promised} "
+                              f"frames the stream reports; the missing "
+                              f"~{_sec:.1f}s is the stream HEAD the decoder "
+                              f"discarded, and the remux delays the video "
+                              f"to compensate. A/V sync is preserved.")
+                    elif tc_path is not None:
+                        print(f"[Pipeline] WARNING: decoder delivered "
+                              f"{metrics.processed_frames} of the {_promised} "
+                              f"frames the stream reports ({_short} missing, "
+                              f"~{_sec:.1f}s). Frame timestamps show a "
+                              f"CONTINUOUS timeline, so the loss is at the "
+                              f"stream head/tail or the decoder renumbers "
+                              f"frames and hides interior gaps -- AUDIO MAY "
+                              f"BE OUT OF SYNC. A software-decode run "
+                              f"(ffmpeg) of the source recovers all frames.")
+                    else:
+                        print(f"[Pipeline] WARNING: decoder delivered "
+                              f"{metrics.processed_frames} of the {_promised} "
+                              f"frames the stream reports ({_short} missing, "
+                              f"~{_sec:.1f}s) and no per-frame timestamps "
+                              f"were available to locate or fill the gap -- "
+                              f"AUDIO MAY BE OUT OF SYNC from the missing "
+                              f"span onward. A software-decode run (ffmpeg) "
+                              f"of the source will recover all frames.")
+            except Exception:
+                pass
 
             t0 = time.perf_counter()
             try:

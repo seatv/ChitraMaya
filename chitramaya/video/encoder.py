@@ -34,6 +34,13 @@ except Exception:
     nvc = None
 
 
+# CM-122: consecutive empty Encode() returns that mean the NVENC session is
+# dead, not merely latent. Legit output latency (priming + bf + rc_lookahead)
+# is bounded by a few dozen frames; 600 (=10s @ 59.94) is far beyond any of
+# it and still fails within seconds of a real mid-run death.
+_NVENC_DEAD_AFTER = 600
+
+
 def _raw_ext(codec: str) -> str:
     if codec in ("hevc", "h265"):
         return ".hevc"
@@ -310,8 +317,18 @@ def _probe_stream_start_seconds(ffprobe: str, path: str, stream: str) -> Optiona
             encoding="utf-8", errors="replace", timeout=30,
             **NOWINDOW,
         )
-        s = (out.stdout or "").strip()
-        return float(s) if s else None
+        # CM-121 (field, 2026-08-26): MPEG-TS sources (HLS stream rips,
+        # often wearing .mkv extensions) carry PROGRAMS, and ffprobe lists
+        # each stream twice -- once under the program, once standalone --
+        # so stdout is the value printed twice. float() on that blob raised
+        # and this probe silently returned None, which disabled A/V
+        # start-offset restoration for EVERY TS source (a constant ~67 ms
+        # audio-early error in the field). Parse the first usable line.
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if line and line.upper() != "N/A":
+                return float(line)
+        return None
     except Exception:
         return None
 
@@ -423,6 +440,23 @@ class Encoder:
         self._frames_encoded = 0
         self._closed = False
         self._remux_ok = False
+
+        # CM-122 NVENC liveness canary (field event 2026-08-28): an NVENC
+        # session died silently 16.5 minutes into an 11-hour run (metrics
+        # CSV: encoder_util 61% -> 0% at one sample boundary, never
+        # returned; no VRAM spike, no clock/thermal event). The 2.2 wheel's
+        # Encode() swallowed the error and returned empty packet lists for
+        # 217,020 consecutive calls, so the .hevc stopped growing at frame
+        # 12,792 while the pipeline "encoded" for 10.7 more hours and
+        # reported success. Empty returns are normal for the first few
+        # frames (NVENC priming/lookahead latency: a handful of frames,
+        # bounded by bf + rc_lookahead), but hundreds in a row after bytes
+        # have flowed means the session is dead. Fail fast and loud: the
+        # raw bitstream plus the RECOVER script are already on disk, so an
+        # abort here costs minutes, not the rest of the run.
+        self._bytes_written = 0
+        self._empty_streak = 0
+        self._nvenc_dead = False
 
         # Recovery sidecar (field event 7/22/2026): a 3h40m run under VRAM
         # paging was HARD-KILLED before close() ran, so the REMUX FAILED
@@ -593,6 +627,35 @@ class Encoder:
         payload = self._bitstream_bytes(self._encoder.Encode(frame))
         if payload:
             self._file.write(payload)
+            self._bytes_written += len(payload)
+            self._empty_streak = 0
+        else:
+            self._empty_streak += 1
+            if self._empty_streak == _NVENC_DEAD_AFTER:
+                self._nvenc_dead = True
+                mb = self._bytes_written / 1e6
+                # frames_encoded has not been incremented for THIS frame yet
+                # and includes streak-1 earlier empties.
+                n_payload = self._frames_encoded - (self._empty_streak - 1)
+                secs = n_payload / max(self.fps, 1.0)
+                print(
+                    f"[Encoder] FATAL (CM-122): NVENC returned no bitstream for "
+                    f"{self._empty_streak} consecutive frames -- the encode "
+                    f"session is dead. Bitstream on disk: {mb:.1f} MB "
+                    f"(~{secs:.1f}s of video from {n_payload} frames)."
+                )
+                print(
+                    "[Encoder] The raw bitstream and its RECOVER script are "
+                    "preserved next to the output. Aborting now instead of "
+                    "silently encoding nothing for the rest of the run."
+                )
+                raise RuntimeError(
+                    "NVENC session died mid-run (no bitstream for "
+                    f"{self._empty_streak} consecutive frames, CM-122). "
+                    "Partial bitstream preserved; re-run the job. If this "
+                    "repeats at the same spot, report it -- if it repeats at "
+                    "random spots, suspect drivers/power events on this GPU."
+                )
         self._frames_encoded += 1
 
     def flush(self) -> None:
@@ -601,9 +664,25 @@ class Encoder:
             tail = self._bitstream_bytes(self._encoder.EndEncode())
             if tail:
                 self._file.write(tail)
+                self._bytes_written += len(tail)
         except Exception as e:
             print(f"[Encoder] Flush error: {e}")
-        print(f"[Encoder] Flushed ({self._frames_encoded} frames)")
+        print(f"[Encoder] Flushed ({self._frames_encoded} frames, "
+              f"{self._bytes_written / 1e6:.1f} MB bitstream)")
+        # CM-122 end-of-run honesty check: catches a session death too close
+        # to the end to trip the streak canary. Even ultra-static content at
+        # high QP averages far more than 2 KB/frame; a lower average means
+        # frames were submitted that produced no bytes.
+        if self._frames_encoded > 0:
+            avg = self._bytes_written / self._frames_encoded
+            if avg < 2000:
+                print(
+                    f"[Encoder] WARNING (CM-122): bitstream averages only "
+                    f"{avg:.0f} bytes/frame across {self._frames_encoded} "
+                    f"frames -- far below any plausible encode. Part of this "
+                    f"run likely produced NO video; verify the output's video "
+                    f"duration before trusting it."
+                )
 
     def _mp4_tag(self) -> str:
         """Per-codec MP4 fourcc tag (hvc1/avc1/av01) — a wrong tag makes
@@ -934,6 +1013,23 @@ class Encoder:
                         f"v_start={v_start:.6f}s a_start={a_start:.6f}s "
                         f"-> video_delay={video_delay:.6f}s audio_delay={audio_delay:.6f}s"
                     )
+
+        # CM-120r2: HEAD-SKIP compensation. When the decode stage discarded
+        # the stream's head (mid-GOP capture start; measured by the pipeline
+        # from the first delivered frame's absolute PTS), the encoded video
+        # begins later in the content than the audio does -- delay the video
+        # by the same amount so the timelines line up again. Set by the
+        # pipeline as _head_skip_seconds; absent/0 on healthy files.
+        _head = 0.0
+        try:
+            _head = float(getattr(self, "_head_skip_seconds", 0.0) or 0.0)
+        except Exception:
+            _head = 0.0
+        if _head > 0:
+            video_delay += _head
+            print(f"[Encoder] Head-skip compensation: +{_head:.3f}s video "
+                  f"delay (decoder discarded the stream head; audio stays "
+                  f"aligned).")
 
         has_audio_source = bool(
             self.mux_audio and self.input_path and Path(self.input_path).exists()
@@ -1504,6 +1600,13 @@ class FfmpegEncoder:
                     video_delay = rel
                 elif rel < -1e-4:
                     audio_delay = -rel
+        try:
+            _head = float(getattr(self, "_head_skip_seconds", 0.0) or 0.0)
+        except Exception:
+            _head = 0.0
+        if _head > 0:
+            video_delay += _head
+            print(f"[Encoder] Head-skip compensation: +{_head:.3f}s video delay.")
         duration = video_delay + (self._frames_encoded / self.fps
                                   if self.fps > 0 else 0)
 

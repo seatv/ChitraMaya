@@ -48,3 +48,6 @@ Forum*
 .patch-cache/*
 GitShouldNotSee/*
 ChitraMaya-patch*
+det-dataset-seg/*
+det-dataset/*
+runs/*

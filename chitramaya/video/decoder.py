@@ -40,6 +40,14 @@ class VideoMetadata:
     duration: Optional[float]
     bitrate: Optional[float]
     codec_name: Optional[str]
+    # CM-120r2: the video stream's start_time (seconds) from ffprobe.
+    # Used to measure decoder HEAD SKIP: stream captures often start
+    # mid-GOP, and the hardware decode path silently discards the
+    # reference-broken head frames -- the first frame we ever see can be
+    # a second or more into the source. Comparing the first delivered
+    # frame's PTS against this start time quantifies the skip so the
+    # remux can re-delay the video to match the untouched audio.
+    start_time: Optional[float] = None
 
 
 class Decoder:
@@ -101,6 +109,22 @@ class Decoder:
         # [CHANGE 4] PTS tracking for prefetched frames
         self._prefetch_pts: List[Optional[int]] = []
 
+        # CM-120r3: MPEG-TS auto-remux. PyNvVideoCodec's own demuxer
+        # mishandles TS stream captures two ways (field-proven 2026-08-27
+        # on two files): it silently DROPS ~5s of frames (head + interior
+        # -- reference-broken frames at capture start and rip seams), and
+        # it SYNTHESIZES uniform frame timestamps, hiding the loss from
+        # every timestamp-based safety net. The same bitstreams remuxed
+        # losslessly into MP4 decode COMPLETELY (229,812/229,812) with
+        # REAL timestamps. So: when the NVDEC path is about to open an
+        # MPEG-TS container, stream-copy it to a temporary MP4 first
+        # (seconds, no quality change) and decode that instead. The
+        # original path still feeds the audio mux; the temp is deleted
+        # in close().
+        self._container_format: str = str(getattr(self, "_container_format", "") or "")
+        self._decode_path: str = self.input_path
+        self._ts_remux_path: Optional[str] = None
+
         # Init backend
         skip_nvdec, skip_reason = self._should_skip_nvdec_preflight()
 
@@ -120,13 +144,15 @@ class Decoder:
             self.backend = "ffmpeg-cpu"
             self._init_ffmpeg_cpu_backend()
         else:
+            if "mpegts" in (self._container_format or ""):
+                self._prepare_ts_remux()
             try:
                 out_color = nvc.OutputColorType.RGBP
                 if self.output_format == "RGB":
                     out_color = nvc.OutputColorType.RGB
 
                 self._decoder = nvc.ThreadedDecoder(
-                    enc_file_path=self.input_path,
+                    enc_file_path=self._decode_path,
                     buffer_size=self._threaded_buffer_size(),
                     gpu_id=self.gpu_id,
                     output_color_type=out_color,
@@ -178,6 +204,8 @@ class Decoder:
                     self.metadata.codec_name = pm.codec_name
                 if not self.metadata.num_frames:
                     self.metadata.num_frames = pm.num_frames
+                if self.metadata.start_time is None:
+                    self.metadata.start_time = pm.start_time
         else:
             # _init_ffmpeg_cpu_backend() fills self.metadata
             pass
@@ -346,6 +374,7 @@ class Decoder:
                         pass
             finally:
                 self._ffmpeg_proc = None
+            self._cleanup_ts_remux()
             return
 
         for attr in ("_decoder", "_demuxer", "_reader", "_ctx", "_stream"):
@@ -354,6 +383,7 @@ class Decoder:
                     setattr(self, attr, None)
                 except Exception:
                     pass
+        self._cleanup_ts_remux()
 
     def __del__(self) -> None:
         try:
@@ -386,15 +416,45 @@ class Decoder:
         )
 
     def _frame_pts(self, frame: Any) -> Optional[int]:
-        try:
-            p = frame.pts()
-            if p is None:
-                return None
-            if hasattr(p, "value"):
-                return int(p.value)
-            return int(p)
-        except Exception:
-            return None
+        """Per-frame presentation timestamp, across PyNvVideoCodec API
+        generations.
+
+        CM-120 (field, 2026-08-26): PyNvVideoCodec 2.2 renamed the decoded
+        frame's time accessor -- DecodedFrame now exposes a ``timestamp``
+        field (visible in its repr) and ``frame.pts()`` raises
+        AttributeError. Because this method swallowed every exception, the
+        2.2 wheel bump (v1.60) silently returned None for EVERY frame,
+        which blinded the whole PTS safety net downstream: no timecodes,
+        no VFR warning, no visibility when NVDEC dropped 150 frames of a
+        TS-flavored stream rip and the A/V sync shifted by 5 seconds.
+        Try the 2.2 name first, then the legacy ones; a float value that
+        looks like seconds is scaled to nanoseconds so the downstream
+        ns-based math (preroll trim, timecodes, gap detection) keeps
+        working whatever the wheel emits.
+        """
+        for name in ("timestamp", "pts"):
+            try:
+                v = getattr(frame, name)
+            except AttributeError:
+                continue
+            try:
+                if callable(v):
+                    v = v()
+                if v is None:
+                    continue
+                if hasattr(v, "value"):
+                    v = v.value
+                if isinstance(v, float):
+                    # Heuristic: a float under ~11.5 days is seconds, not
+                    # ns/ticks -- scale to the nanoseconds the pipeline
+                    # assumes. Integer values pass through untouched.
+                    if abs(v) < 1_000_000.0:
+                        return int(round(v * 1_000_000_000.0))
+                    return int(round(v))
+                return int(v)
+            except Exception:
+                continue
+        return None
 
     def _prime_to_first_nonneg_pts(self) -> None:
         if self._raw_num_frames <= 0:
@@ -437,14 +497,129 @@ class Decoder:
                 print(f"[Decoder] Trimmed {self._trim_prefix} negative-PTS preroll frames (presented={presented})")
             return
 
-    def _ffprobe(self) -> VideoMetadata:
+    def _prepare_ts_remux(self) -> None:
+        """CM-120r3: losslessly remux an MPEG-TS source to a temp MP4 and
+        decode that instead (see the field notes at the top of __init__).
+
+        Stream copy only -- video and audio bytes are untouched; the TS
+        packaging (which PyNvVideoCodec's demuxer mishandles) is replaced
+        with MP4. Cost: seconds at disk speed, ~source-sized temp file,
+        deleted in close(). On ANY failure the original file is decoded
+        as before -- the run must never break because a remux could not.
+        """
+        import tempfile
+        import time as _time
+
+        src = Path(self.input_path)
+        stem = src.stem
+        candidates = [src.parent, Path(tempfile.gettempdir())]
+        tmp_path: Optional[Path] = None
+        for d in candidates:
+            try:
+                probe = d / (stem + ".cm120-writetest.tmp")
+                with open(probe, "wb") as _f:
+                    _f.write(b"x")
+                probe.unlink()
+                tmp_path = d / (stem + ".cm120-tsremux.mp4")
+                break
+            except Exception:
+                continue
+        if tmp_path is None:
+            print("[Decoder] MPEG-TS remux skipped: no writable location; "
+                  "decoding the TS directly (frames may be dropped -- CM-120).")
+            return
+
+        # Reuse a fresh leftover (crashed prior run / repeated Test Frames).
+        try:
+            if (tmp_path.exists() and tmp_path.stat().st_size > 0
+                    and tmp_path.stat().st_mtime >= src.stat().st_mtime):
+                print(f"[Decoder] MPEG-TS remux: reusing {tmp_path.name}")
+                self._ts_remux_path = str(tmp_path)
+                self._decode_path = str(tmp_path)
+                try:
+                    self._probe_meta = self._ffprobe(str(tmp_path))
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+        print("[Decoder] MPEG-TS source detected: PyNvVideoCodec's demuxer "
+              "drops frames and synthesizes timestamps on TS captures "
+              "(CM-120). Losslessly remuxing to a temporary MP4 first "
+              "(stream copy; no quality change)...")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
+            "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy", "-movflags", "+faststart",
+            str(tmp_path),
+        ]
+        try:
+            sz = src.stat().st_size
+        except OSError:
+            sz = 0
+        timeout_s = max(300, int(sz / (25 * 1024 * 1024)) * 2 + 120)
+        t0 = _time.perf_counter()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=timeout_s, **NOWINDOW)
+            if r.returncode != 0:
+                tail = (r.stderr or "").strip().splitlines()[-3:]
+                print("[Decoder] MPEG-TS remux FAILED (decoding the TS "
+                      "directly; frames may be dropped -- CM-120):")
+                for ln in tail:
+                    print(f"  {ln}")
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+        except Exception as e:
+            print(f"[Decoder] MPEG-TS remux error ({e}); decoding the TS "
+                  f"directly (frames may be dropped -- CM-120).")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        dt = _time.perf_counter() - t0
+        try:
+            mb = tmp_path.stat().st_size / (1024 * 1024)
+        except OSError:
+            mb = 0.0
+        print(f"[Decoder] MPEG-TS remux ready: {tmp_path.name} "
+              f"({mb:.0f} MB in {dt:.1f}s); decoding the remux. The "
+              f"original file still supplies the audio at finalize.")
+        self._ts_remux_path = str(tmp_path)
+        self._decode_path = str(tmp_path)
+        # Re-probe the REMUX: its normalized timeline (start times shifted
+        # by the earliest stream) is what the decoder will see, so
+        # metadata.start_time and num_frames must describe THIS file for
+        # the CM-120r2 head-skip math to be consistent.
+        try:
+            self._probe_meta = self._ffprobe(str(tmp_path))
+        except Exception:
+            pass
+
+    def _cleanup_ts_remux(self) -> None:
+        if self._ts_remux_path:
+            try:
+                Path(self._ts_remux_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._ts_remux_path = None
+
+    def _ffprobe(self, path: Optional[str] = None) -> VideoMetadata:
         cmd = [
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,avg_frame_rate,codec_name,bit_rate,nb_frames",
-            "-show_entries", "format=duration",
+            "-show_entries", "stream=width,height,avg_frame_rate,codec_name,bit_rate,nb_frames,start_time",
+            "-show_entries", "format=duration,format_name",
             "-of", "json",
-            self.input_path,
+            str(path or self.input_path),
         ]
         # ffprobe -of json always emits UTF-8. Without encoding=, Python falls
         # back to the system codepage (cp1252 on Windows) which crashes on any
@@ -484,12 +659,29 @@ class Decoder:
         except Exception:
             duration = None
 
+        # CM-120r3: remember the container so __init__ can detect MPEG-TS
+        # stream captures (the PyNvVideoCodec failure class).
+        try:
+            self._container_format = str(f.get("format_name") or "")
+        except Exception:
+            self._container_format = ""
+
+
         num_frames = 0
         try:
             if s.get("nb_frames"):
                 num_frames = int(s["nb_frames"])
         except Exception:
             num_frames = 0
+
+        # CM-120r2: video stream start_time (seconds) for head-skip math.
+        start_time = None
+        try:
+            st = s.get("start_time")
+            if st is not None and str(st).upper() != "N/A":
+                start_time = float(st)
+        except Exception:
+            start_time = None
 
         if (not num_frames) and duration and fps:
             num_frames = int(round(duration * fps))
@@ -503,6 +695,7 @@ class Decoder:
             duration=duration,
             bitrate=bitrate,
             codec_name=codec,
+            start_time=start_time,
         )
 
     def _init_ffmpeg_cpu_backend(self) -> None:

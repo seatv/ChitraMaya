@@ -443,6 +443,87 @@ def _maybe_dump_preencode_frame(frame_num: int, frm_bgr: torch.Tensor, pts: Opti
         f.write(f"checksum32={checksum}\n")
         f.write(f"min={int(arr.min())} max={int(arr.max())}\n")
 
+class PtsGapFiller:
+    """CM-120: keep A/V sync when the decoder silently drops frames.
+
+    Field case (2026-08-26): NVDEC delivered 127,348 of a TS stream rip's
+    127,498 frames -- 150 frames (= 5.005 s) gone, while ffmpeg software
+    decode recovers every frame and the source PTS timeline is continuous
+    (packet-scanned, both directions). The remux stamps the encoded video
+    as continuous CFR, so the dropped span CLOSES and every frame after it
+    plays ~5 s early against the verbatim-copied audio ("a different
+    show"). This filler watches the true source PTS of each frame as it is
+    drained to the encoder IN DISPLAY ORDER, and when consecutive frames'
+    PTS jump by more than GAP_MIN_INTERVALS frame intervals it re-encodes
+    the PREVIOUS frame (freeze-frame -- the honest fill for content that
+    does not exist) enough times to keep the video timeline aligned with
+    the audio.
+
+    Unit-agnostic: the frame interval is the MEDIAN of the first
+    LEARN_DELTAS observed deltas, so ns / ticks / any time base works
+    without configuration. Requires working per-frame PTS (the CM-120
+    decoder fix); with PTS unavailable the filler stays inert.
+
+    Guards: no fill until the median is learned; a single gap larger than
+    MAX_FILL_PER_GAP duplicates (60 s @30fps) is NOT filled -- that is a
+    timeline discontinuity, not a drop, and freezing a minute of video is
+    worse than the desync -- it is loudly reported instead.
+    """
+
+    LEARN_DELTAS = 48
+    GAP_MIN_INTERVALS = 1.75
+    MAX_FILL_PER_GAP = 1800
+
+    def __init__(self) -> None:
+        self._deltas: List[int] = []
+        self._median: Optional[float] = None
+        self._last_pts: Optional[int] = None
+        self._last_bgra: Optional[torch.Tensor] = None
+        self.total_filled: int = 0
+        self.gaps: List[Tuple[int, int]] = []      # (frame_num, n_filled)
+        self.skipped_gaps: List[Tuple[int, float]] = []  # (frame_num, intervals)
+
+    def fills_before(self, frame_num: int, pts: Optional[int]) -> int:
+        """Number of duplicate frames to encode BEFORE this frame."""
+        if pts is None or self._last_pts is None:
+            return 0
+        delta = pts - self._last_pts
+        if delta <= 0:
+            return 0
+        if self._median is None:
+            self._deltas.append(delta)
+            if len(self._deltas) >= self.LEARN_DELTAS:
+                self._median = float(sorted(self._deltas)[len(self._deltas) // 2])
+            return 0
+        if delta <= self.GAP_MIN_INTERVALS * self._median:
+            return 0
+        n = int(round(delta / self._median)) - 1
+        if n <= 0:
+            return 0
+        if n > self.MAX_FILL_PER_GAP:
+            self.skipped_gaps.append((frame_num, delta / self._median))
+            print(f"[Pipeline] gap-fill: timeline jump of ~{delta / self._median:.0f} "
+                  f"frame intervals before frame {frame_num} exceeds the fill "
+                  f"limit ({self.MAX_FILL_PER_GAP}); NOT filled -- A/V sync will "
+                  f"shift at this point. Source timeline is likely discontinuous.")
+            return 0
+        self.total_filled += n
+        self.gaps.append((frame_num, n))
+        print(f"[Pipeline] gap-fill: {n} duplicate frame(s) inserted before "
+              f"frame {frame_num} (decoder skipped ~{n} source frames; "
+              f"freeze-fill keeps audio in sync)")
+        return n
+
+    def remember(self, pts: Optional[int], bgra: torch.Tensor) -> None:
+        if pts is not None:
+            self._last_pts = pts
+        self._last_bgra = bgra
+
+    @property
+    def last_bgra(self) -> Optional[torch.Tensor]:
+        return self._last_bgra
+
+
 def drain_store_to_encoder(
     *,
     store: FrameStore,
@@ -484,6 +565,15 @@ def drain_store_to_encoder(
             pts_log.append((k, pts))
 
         bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous()
+        # CM-120: fill decoder-dropped frames (freeze the previous frame)
+        # so the CFR-stamped video stays aligned with the verbatim audio.
+        filler: Optional[PtsGapFiller] = getattr(store, "gap_filler", None)
+        if filler is not None:
+            n_fill = filler.fills_before(k, pts)
+            if n_fill and filler.last_bgra is not None:
+                for _ in range(n_fill):
+                    encoder.encode_frame(filler.last_bgra)
+            filler.remember(pts, bgra)
         encoder.encode_frame(bgra)
         count += 1
 
@@ -658,82 +748,134 @@ def drain_store_to_async_encoder(
             pts_log.append((k, pts))
 
         bgra = bgr_u8_to_bgra_u8(frm_bgr).contiguous()
+        # CM-120: same gap-fill as the sync drain (see drain_store_to_encoder).
+        filler: Optional[PtsGapFiller] = getattr(store, "gap_filler", None)
+        if filler is not None:
+            n_fill = filler.fills_before(k, pts)
+            if n_fill and filler.last_bgra is not None:
+                for _ in range(n_fill):
+                    async_encoder.encode_frame(filler.last_bgra)
+            filler.remember(pts, bgra)
         async_encoder.encode_frame(bgra)
         count += 1
 
     return count
 
 
+def _pts_unit_scale(deltas: List[int], fps: float) -> Optional[float]:
+    """CM-120r2: seconds-per-PTS-unit, inferred instead of assumed.
+
+    PyNvVideoCodec generations emit frame timestamps in different units
+    (2.1-era code assumed nanoseconds; the 2.2 wrapper hands back stream
+    time-base ticks -- 90 kHz on MPEG-TS, field-verified: a 29.97 fps file
+    printed pts_fps=333000 when ticks were read as ns). Rather than keep a
+    unit table, derive the scale from the data: the MEDIAN inter-frame
+    delta corresponds to one frame interval (1/fps seconds), whatever the
+    unit. Returns None when there is not enough data or fps is unknown.
+    """
+    if not deltas or not fps or fps <= 0:
+        return None
+    med = sorted(deltas)[len(deltas) // 2]
+    if med <= 0:
+        return None
+    return (1.0 / float(fps)) / float(med)
+
+
+def pts_head_skip(
+    pts_log: List[Tuple[int, Optional[int]]],
+    fps: float,
+    stream_start_s: Optional[float],
+) -> Tuple[float, Optional[int], Optional[float]]:
+    """CM-120r2: measure decoder HEAD SKIP in seconds.
+
+    Stream captures often start mid-GOP; the hardware decode path silently
+    discards the reference-broken head frames (field case: output frame 0
+    showed source content from t=1.03s). No PTS *delta* can see that loss
+    -- it happens before the first delivered frame -- but the first frame's
+    ABSOLUTE timestamp can: first_pts (converted to seconds) minus the
+    stream's start_time is exactly the skipped head.
+
+    Returns (head_seconds, first_pts, unit_scale). head_seconds is 0.0
+    when it cannot be established or fails sanity ([0.2 s, 30 s]): the
+    unit inference and the shared-origin assumption (wrapper timestamps
+    on the container timeline) are field-verified per run by the log
+    line the caller prints, so out-of-range values are DROPPED rather
+    than trusted.
+    """
+    valid = [(fn, p) for fn, p in pts_log if p is not None]
+    if len(valid) < 10 or stream_start_s is None:
+        return 0.0, None, None
+    valid.sort(key=lambda x: x[0])
+    vals = [p for _, p in valid]
+    deltas = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
+    spu = _pts_unit_scale(deltas, fps)
+    first_pts = vals[0]
+    if spu is None:
+        return 0.0, first_pts, None
+    head = first_pts * spu - float(stream_start_s)
+    if 0.2 <= head <= 30.0:
+        return head, first_pts, spu
+    return 0.0, first_pts, spu
+
+
 def write_timecodes_v2(
     pts_log: List[Tuple[int, Optional[int]]],
     output_path: str,
     fps: float,
-    time_base_den: int = 1_000_000_000,   # NVDEC PTS are typically in nanoseconds
+    time_base_den: int = 1_000_000_000,   # legacy arg, unused (unit inferred)
 ) -> Optional[str]:
     """Write a Matroska-compatible 'timecodes v2' file from collected PTS data.
 
-    Returns the path to the timecodes file, or None if PTS data is unavailable/uniform.
-    The file format is:
-        # timecode format v2
-        0
-        33.333
-        66.667
-        ...
-    Each line is a timestamp in milliseconds for the corresponding frame.
+    CM-120r2: unit-agnostic. Timestamp units are inferred from the median
+    inter-frame delta vs the metadata fps (see _pts_unit_scale), so ns,
+    90 kHz ticks, or anything else produce correct millisecond timecodes.
+
+    Returns the path to the timecodes file, or None if PTS data is
+    unavailable.
     """
     if not pts_log:
         return None
 
-    # Check if we have usable PTS data
     valid_pts = [(fn, p) for fn, p in pts_log if p is not None]
     if len(valid_pts) < 2:
         return None
 
-    # Sort by frame number (should already be sorted, but be safe)
     valid_pts.sort(key=lambda x: x[0])
-
-    # Compute deltas to detect VFR
     pts_values = [p for _, p in valid_pts]
     deltas = [pts_values[i + 1] - pts_values[i] for i in range(len(pts_values) - 1)]
-
     if not deltas:
         return None
-
     median_delta = sorted(deltas)[len(deltas) // 2]
-
     if median_delta <= 0:
         return None
 
-    # Check if VFR: if max delta differs from median by >2%, it's VFR
+    spu = _pts_unit_scale(deltas, fps) or 1e-9   # last-resort: assume ns
+
+    # VFR flag: relative delta spread, unit-free.
     min_d = min(deltas)
     max_d = max(deltas)
     is_vfr = (max_d - min_d) / max(1, median_delta) > 0.02
 
-    # Compute PTS-derived FPS for informational purposes
-    total_time_ns = pts_values[-1] - pts_values[0]
-    if total_time_ns > 0:
-        pts_fps = (len(valid_pts) - 1) / (total_time_ns / 1_000_000_000.0)
-    else:
-        pts_fps = fps
+    total_s = (pts_values[-1] - pts_values[0]) * spu
+    pts_fps = ((len(valid_pts) - 1) / total_s) if total_s > 0 else fps
 
-    # Write the timecodes file
     tc_path = output_path + ".timecodes.txt"
     base_pts = pts_values[0]
 
     with open(tc_path, "w", encoding="utf-8") as f:
         f.write("# timecode format v2\n")
-        # For frames with PTS, use actual PTS; for gaps, interpolate
         all_frames = sorted(pts_log, key=lambda x: x[0])
         for fn, p in all_frames:
             if p is not None:
-                ms = (p - base_pts) / 1_000_000.0   # ns -> ms
+                ms = (p - base_pts) * spu * 1000.0
             else:
-                # Interpolate from frame number
                 ms = (fn - all_frames[0][0]) * (1000.0 / fps)
             f.write(f"{ms:.3f}\n")
 
     vfr_str = "VFR" if is_vfr else "CFR"
-    print(f"[PTS] Wrote timecodes: {tc_path} ({len(all_frames)} frames, {vfr_str}, pts_fps={pts_fps:.3f})")
+    print(f"[PTS] Wrote timecodes: {tc_path} ({len(all_frames)} frames, {vfr_str}, "
+          f"pts_fps={pts_fps:.3f}, unit={spu * 1e9:.1f} ns/tick, "
+          f"first_pts={pts_values[0]}, last_pts={pts_values[-1]})")
 
     return tc_path
 
@@ -742,10 +884,12 @@ def compute_pts_fps(
     pts_log: List[Tuple[int, Optional[int]]],
     fallback_fps: float,
 ) -> Tuple[float, bool]:
-    """Compute actual average FPS from PTS data.
+    """Compute actual average FPS from PTS data (unit-agnostic, CM-120r2).
 
-    Returns (fps, is_vfr).
-    If PTS data is insufficient, returns (fallback_fps, False).
+    Returns (fps, is_vfr). With units inferred from the median delta, a
+    uniform timeline reports ~= metadata fps by construction; a timeline
+    with interior holes reports LOWER than metadata fps -- the deviation
+    is the hole fraction, which is exactly the signal the caller warns on.
     """
     valid = [(fn, p) for fn, p in pts_log if p is not None]
     if len(valid) < 10:
@@ -753,18 +897,18 @@ def compute_pts_fps(
 
     valid.sort(key=lambda x: x[0])
     pts_vals = [p for _, p in valid]
-    total_ns = pts_vals[-1] - pts_vals[0]
-
-    if total_ns <= 0:
-        return fallback_fps, False
-
-    fps = (len(valid) - 1) / (total_ns / 1_000_000_000.0)
-
-    # VFR detection
     deltas = [pts_vals[i + 1] - pts_vals[i] for i in range(len(pts_vals) - 1)]
     median_d = sorted(deltas)[len(deltas) // 2]
     if median_d <= 0:
         return fallback_fps, False
+
+    spu = _pts_unit_scale(deltas, fallback_fps)
+    if spu is None:
+        return fallback_fps, False
+    total_s = (pts_vals[-1] - pts_vals[0]) * spu
+    if total_s <= 0:
+        return fallback_fps, False
+    fps = (len(valid) - 1) / total_s
 
     min_d = min(deltas)
     max_d = max(deltas)
