@@ -902,40 +902,165 @@ class Encoder:
             print(f"[Encoder] Done: {self.output_path}")
 
     def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg",
-                    timeout_s: int = 900) -> bool:
+                    timeout_s: int = 900,
+                    watch_path: Optional[str] = None,
+                    stall_s: int = 600) -> bool:
         """Run one ffmpeg command; return True on rc==0. Shared by both remux
         passes. UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames.
         ``timeout_s``: pass _finalize_timeout_s(...) for whole-file remux
         steps (v1.50.00, the 50GB Idol lesson); the 900s default suits
-        everything else."""
+        everything else.
+
+        ``watch_path`` (CM-124, field 2026-08-28): a wall-clock timeout,
+        however scaled, still killed a remux that was MAKING DISK PROGRESS
+        at ~4 MB/s (slow HDD pair + faststart second pass; a complete
+        229,812-frame bitstream lost its finalize at 59% written). When
+        watch_path is set, the command is instead supervised by progress:
+        the output's size (plus its ffmpeg faststart '.tmp' sibling) is
+        polled every 5s, and the process is killed only after ``stall_s``
+        seconds with NO byte growth -- a slow disk gets as long as it
+        needs, while a truly wedged ffmpeg still dies in minutes. The
+        scaled ``timeout_s`` becomes an estimate: passing it just logs a
+        courtesy note that the remux is slow but alive."""
         print(f"[Encoder] {label}: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout_s,
-                **NOWINDOW,
-            )
-            if result.returncode != 0:
-                print(f"[Encoder] {label} failed (rc={result.returncode})")
-                if result.stderr:
-                    for line in result.stderr.strip().split("\n")[-5:]:
-                        print(f"  {line}")
+        if watch_path is None:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=timeout_s,
+                    **NOWINDOW,
+                )
+                if result.returncode != 0:
+                    print(f"[Encoder] {label} failed (rc={result.returncode})")
+                    if result.stderr:
+                        for line in result.stderr.strip().split("\n")[-5:]:
+                            print(f"  {line}")
+                    return False
+                print(f"[Encoder] {label} OK")
+                return True
+            except subprocess.TimeoutExpired:
+                print(f"[Encoder] {label} TIMED OUT after {timeout_s}s with no "
+                      f"result. Every encoded frame is preserved in the raw "
+                      f"bitstream -- use the recovery command printed below, "
+                      f"ideally targeting a faster disk.")
                 return False
-            print(f"[Encoder] {label} OK")
+            except Exception as e:
+                print(f"[Encoder] {label} error: {e}")
+                return False
+
+        # Progress-supervised mode (CM-124).
+        import tempfile
+        import time as _time
+
+        def _progress() -> int:
+            total = 0
+            for p in (watch_path, watch_path + ".tmp"):
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+            return total
+
+        err_path = None
+        err_f = None
+        try:
+            err_f = tempfile.NamedTemporaryFile(
+                prefix="cm_ffmpeg_", suffix=".stderr", delete=False)
+            err_path = err_f.name
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=err_f, **NOWINDOW)
+            start = last_change = _time.monotonic()
+            last_bytes = _progress()
+            hard_cap_s = max(int(timeout_s) * 10, 6 * 3600)
+            slow_noted = False
+            while True:
+                rc = proc.poll()
+                if rc is not None:
+                    break
+                _time.sleep(5)
+                cur = _progress()
+                now = _time.monotonic()
+                if cur != last_bytes:
+                    last_bytes = cur
+                    last_change = now
+                if now - last_change > stall_s:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=30)
+                    except Exception:
+                        pass
+                    print(f"[Encoder] {label} KILLED: no disk progress for "
+                          f"{int(now - last_change)}s (output stuck at "
+                          f"{last_bytes / 1e6:.1f} MB). Every encoded frame "
+                          f"is preserved in the raw bitstream -- use the "
+                          f"recovery script.")
+                    return False
+                if now - start > hard_cap_s:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=30)
+                    except Exception:
+                        pass
+                    print(f"[Encoder] {label} KILLED after {int(now - start)}s "
+                          f"(absolute safety cap). Raw bitstream preserved -- "
+                          f"use the recovery script on a faster disk.")
+                    return False
+                if not slow_noted and now - start > timeout_s \
+                        and last_bytes > 0:
+                    slow_noted = True
+                    print(f"[Encoder] {label}: past the {int(timeout_s)}s "
+                          f"estimate but still making disk progress "
+                          f"({last_bytes / 1e6:.1f} MB written) -- letting it "
+                          f"finish (CM-124).")
+            err_f.close()
+            if rc != 0:
+                print(f"[Encoder] {label} failed (rc={rc})")
+                try:
+                    with open(err_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        for line in f.read().strip().split("\n")[-5:]:
+                            print(f"  {line}")
+                except Exception:
+                    pass
+                return False
+            elapsed = _time.monotonic() - start
+            print(f"[Encoder] {label} OK ({elapsed:.0f}s, "
+                  f"{last_bytes / 1e6:.1f} MB)")
             return True
-        except subprocess.TimeoutExpired:
-            print(f"[Encoder] {label} TIMED OUT after {timeout_s}s with no "
-                  f"result. Every encoded frame is preserved in the raw "
-                  f"bitstream -- use the recovery command printed below, "
-                  f"ideally targeting a faster disk.")
-            return False
         except Exception as e:
             print(f"[Encoder] {label} error: {e}")
             return False
+        finally:
+            if err_f is not None:
+                try:
+                    err_f.close()
+                except Exception:
+                    pass
+            if err_path:
+                try:
+                    os.unlink(err_path)
+                except Exception:
+                    pass
+
+    def _discard_partial_output(self) -> None:
+        """CM-124: a killed/failed final remux leaves a half-written output
+        that looks like a deliverable (field 2026-08-28: a 3.45GB partial
+        .mp4 sat next to the complete 5.79GB .hevc and read as 'the
+        result'). Delete it -- the raw bitstream + recovery script are the
+        salvage, and a missing file is clearer than a broken one."""
+        try:
+            p = Path(self.output_path)
+            if p.exists():
+                sz = p.stat().st_size
+                p.unlink()
+                print(f"[Encoder] Removed unplayable partial output "
+                      f"({sz / 1e6:.1f} MB): {self.output_path}")
+        except Exception as e:
+            print(f"[Encoder] Could not remove partial output: {e}")
 
     def _remux(self) -> bool:
         """Remux raw bitstream with audio from input using ffmpeg. Returns True on success."""
@@ -1146,8 +1271,12 @@ class Encoder:
                 step1 += color_args + tag_args + timescale_args + [str(temp_video)]
                 # v1.50.00: scale finalize timeouts with the bytes moved
                 # (the 50GB Idol lesson -- faststart = TWO passes of I/O).
+                # CM-124: supervised by disk progress; the scaled value is
+                # now just the "slow but alive" courtesy-note threshold.
                 _t_s = _finalize_timeout_s(raw_path)
-                if not self._run_ffmpeg(step1, "video-container", timeout_s=_t_s):
+                if not self._run_ffmpeg(step1, "video-container",
+                                        timeout_s=_t_s,
+                                        watch_path=str(temp_video)):
                     return False
 
                 # Mux with lada's input ordering: the un-delayed AUDIO source is
@@ -1167,8 +1296,17 @@ class Encoder:
                              "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
                              "-map", "0:v:0", "-c:v", "copy"] + tag_args
                 step2 += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
-                return self._run_ffmpeg(
-                    step2, "remux", timeout_s=_finalize_timeout_s(temp_video))
+                # CM-124: the remux also READS the audio source end to end,
+                # so its bytes belong in the estimate too.
+                ok = self._run_ffmpeg(
+                    step2, "remux",
+                    timeout_s=_finalize_timeout_s(
+                        temp_video,
+                        self.input_path if has_audio_source else None),
+                    watch_path=str(out_path))
+                if not ok:
+                    self._discard_partial_output()
+                return ok
 
             # No video delay: single pass raw -> final. audio_delay (rare: source
             # video led its audio) is applied on the audio CONTAINER input, which
@@ -1187,8 +1325,16 @@ class Encoder:
                 cmd += ["-map", "1:a?", "-c:a", "copy"]
             cmd += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
             # v1.50.00: size-scaled timeout (the 50GB Idol lesson).
-            return self._run_ffmpeg(
-                cmd, "remux", timeout_s=_finalize_timeout_s(raw_path))
+            # CM-124: progress-supervised; source audio bytes included.
+            ok = self._run_ffmpeg(
+                cmd, "remux",
+                timeout_s=_finalize_timeout_s(
+                    raw_path,
+                    self.input_path if has_audio_source else None),
+                watch_path=str(out_path))
+            if not ok:
+                self._discard_partial_output()
+            return ok
         finally:
             if temp_video is not None:
                 try:

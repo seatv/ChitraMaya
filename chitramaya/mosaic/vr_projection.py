@@ -306,8 +306,15 @@ class VRProjection:
                                 padding_mode="zeros", align_corners=False)
 
             # LADA-style blend into the store frame (original projection).
+            # CM-123: the store frame may live on CPU (HOST FrameStore --
+            # e.g. 8K H.264 exceeds NVDEC's 4096-px width on pre-Blackwell,
+            # forcing ffmpeg CPU decode). The projection math must run on
+            # the grid/canvas device, so lift the ROI there, blend, and
+            # copy the result back to wherever the store frame lives.
             roi = frame_bgr_u8[dt:db + 1, eye_off + dl:eye_off + dr + 1]
-            roi_f = roi.permute(2, 0, 1).unsqueeze(0).to(model_dtype)
+            work_dev = self._canvas_img.device
+            roi_f = roi.permute(2, 0, 1).unsqueeze(0).to(
+                device=work_dev, dtype=model_dtype)
             temp = w_img.to(model_dtype)
             am = w_a.to(model_dtype)
             temp.sub_(roi_f)
@@ -315,7 +322,10 @@ class VRProjection:
             temp.add_(roi_f)
             temp.round_()
             temp.clamp_(0, 255)
-            roi[:] = temp.squeeze(0).permute(1, 2, 0)
+            out = temp.squeeze(0).permute(1, 2, 0)
+            if out.device != roi.device:
+                out = out.to(roi.device)
+            roi[:] = out  # copy_ casts float -> uint8, same as the flat path
         finally:
             # Zero only the touched scratch region for reuse.
             self._canvas_img[0, :, lt:lb + 1, ll:lr + 1] = 0
