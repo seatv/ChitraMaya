@@ -234,6 +234,9 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
               Write-Host "and it extracts there -- same experience as the other editions." -ForegroundColor Cyan
             } catch {
               Write-Warning ("SFX assembly failed: {0}. Falling back to the plain archive." -f $_.Exception.Message)
+              # r8: delete the partially-written exe so a corpse never sits
+              # next to the good archive looking like a deliverable.
+              Remove-Item -Force -ErrorAction SilentlyContinue $outPath
               Write-Host ("SINGLE-FILE RELEASE: {0}  ({1} MB)" -f $single.Name, $mb) -ForegroundColor Green
             }
           } else {
@@ -269,6 +272,58 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
         else {
           $parts = @(Get-ChildItem "$installBase.7z.0*" | Sort-Object Name)
 
+          # r8 (CM-126, field 2026-08-28): the r7 raw-size shortcut assumed a
+          # large dist could not compress under the 2GB asset limit; the ROCm
+          # stack then landed in ONE under-limit volume, shipping a shepherd
+          # exe + one part where a single-file installer would do. A single
+          # volume IS the complete archive, so fold it back into the
+          # one-file installer instead of guessing better.
+          $foldedSingle = $false
+          if ($parts.Count -eq 1 -and
+              [math]::Round($parts[0].Length / 1MB) -le $limitMB) {
+            $soloMB = [math]::Round($parts[0].Length / 1MB)
+            Write-Host ("Split produced ONE volume ({0} MB <= {1} MB) -- folding back into the single-file installer (r8/CM-126)." -f $soloMB, $limitMB) -ForegroundColor Yellow
+            $sfxGui = $null
+            $sevenZCmd = Get-Command 7z -ErrorAction SilentlyContinue
+            if ($sevenZCmd) {
+              $cand = Join-Path (Split-Path $sevenZCmd.Source) "7z.sfx"
+              if (Test-Path $cand) { $sfxGui = $cand }
+            }
+            if ($sfxGui) {
+              $singleArc = "$installBase.7z"
+              try {
+                Move-Item -Force $parts[0].FullName $singleArc
+                $outPath = Join-Path (Get-Location) "$installBase.exe"
+                Remove-Item -Force -ErrorAction SilentlyContinue $outPath
+                $outFs = [IO.File]::Create($outPath)
+                try {
+                  foreach ($pf in @($sfxGui, $singleArc)) {
+                    $bytes = [IO.File]::ReadAllBytes((Resolve-Path $pf))
+                    $outFs.Write($bytes, 0, $bytes.Length)
+                  }
+                } finally { $outFs.Close() }
+                Remove-Item -Force $singleArc
+                $exeMb = [math]::Round((Get-Item $outPath).Length / 1MB)
+                Write-Host ""
+                Write-Host ("SINGLE-FILE INSTALLER: {0}  ({1} MB)" -f "$installBase.exe", $exeMb) -ForegroundColor Green
+                Write-Host "Release this ONE file. Users double-click it, pick a folder," -ForegroundColor Cyan
+                Write-Host "and it extracts there -- same experience as the other editions." -ForegroundColor Cyan
+                $foldedSingle = $true
+              } catch {
+                Write-Warning ("Fold-back failed: {0}. Shipping shepherd + volume instead." -f $_.Exception.Message)
+                # never leave a partially-written exe posing as a deliverable
+                Remove-Item -Force -ErrorAction SilentlyContinue "$installBase.exe"
+                if (Test-Path $singleArc) {
+                  Move-Item -Force $singleArc ($installBase + ".7z.001")
+                }
+                $parts = @(Get-ChildItem "$installBase.7z.0*" | Sort-Object Name)
+              }
+            } else {
+              Write-Warning "7z.sfx not found next to 7z.exe (full 7-Zip install ships it) -- keeping shepherd + volume."
+            }
+          }
+          if (-not $foldedSingle) {
+
           $stage = ".\build\installer_payload"
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -301,6 +356,8 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
               } finally { $outFs.Close() }
             } catch {
               Write-Warning ("SFX assembly failed: {0}" -f $_.Exception.Message)
+              # r8: remove the partial shepherd exe (same corpse rule).
+              Remove-Item -Force -ErrorAction SilentlyContinue $outPath
             }
           }
 
@@ -313,6 +370,7 @@ if (Get-Command 7z -ErrorAction SilentlyContinue) {
             Write-Host "Release ALL of the above together. The .exe verifies the volumes and names any missing file before extracting." -ForegroundColor Cyan
           } else {
             Write-Warning "Failed to assemble $installBase.exe."
+          }
           }
         }
       }
