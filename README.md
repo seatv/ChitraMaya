@@ -4,7 +4,7 @@ A TensorRT-accelerated mosaic restoration studio with a real-time visual editor.
 
 Built for NVIDIA RTX cards — with **experimental editions for AMD Radeon (ROCm)** and **Intel Arc** (see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Intel Arc edition](#intel-arc-xpu-edition--experimental)).
 
-![ChitraMaya — the mosaic input and the restored result, side by side](docs/InAction.png)
+![ChitraMaya — the mosaic input and the restored result, side by side](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction.png)
 
 ## Why ChitraMaya?
 
@@ -20,7 +20,7 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 - **Made for VR/SBS content.** Per-eye detection for side-by-side video, a runtime **Image Size** dial for dense high-resolution frames, **VR Projection** for studios whose mosaic arrives warped in the raw frame, and **SBS View**: a projected look-around preview (like a headset, on your desktop) with a draggable wipe to compare original vs restored inside the projection.
 - **Add Mosaic.** The inverse operation — pixelate regions to produce shareable SFW clips. Draw rectangles by hand (precise, reliable), or let the app auto-detect regions with a detection model (**experimental** — see the warning below).
 
-![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](docs/InAction-FramePreview.png)
+![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-FramePreview.png)
 
 ## Terms & Conditions
 
@@ -94,7 +94,7 @@ No models ship with the app — you add them once. Two ways, both from **Manage 
 
 > Hugging Face throttles anonymous downloads (~1,000 requests/hour per IP) and answers with a 403 once you cross it — easy to hit on a heavy day of testing across machines behind one home IP. If downloads start failing, drop a free "read" token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) into a one-line `hf-token.txt` next to the app (or set the `HF_TOKEN` environment variable) and retry. Failed downloads now name the cause and the fix in the log rather than showing a bare error.
 
-![Manage Models — download checkpoints, then compile TensorRT engines for your GPU](docs/ModelManagement.png)
+![Manage Models — download checkpoints, then compile TensorRT engines for your GPU](https://github.com/seatv/ChitraMaya/blob/main/docs/ModelManagement.png)
 
 **Manual:** drop any detection `.pt` and restoration `.pth` files straight into the `models\` folder.
 
@@ -159,9 +159,9 @@ A few more things worth knowing before a full run:
 - **The encoder cannot fail silently, and slow disks get their time (v1.61).** If the hardware encode session dies mid-run (it happens — drivers, power events), the app now aborts loudly within seconds instead of "encoding" nothing for hours; your already-encoded frames are preserved in a raw bitstream next to a ready-made `*-RECOVER.ps1` script, and the end-of-run log reports the bitstream size so a byteless success is impossible. The final packaging step is likewise now supervised by **disk progress** rather than a wall-clock timeout — a slow hard drive gets as long as it needs, a truly stuck process is still killed within minutes, and a failed finalize removes its half-written output (the raw bitstream + recovery script remain your salvage).
 - **The system stays awake during runs.** ChitraMaya holds off the idle-sleep timer while processing (the display may still turn off), then releases it — overnight runs no longer die to a power plan.
 
-![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
+![Restore & Save — the finished, restored output](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-RestoreAndSave.png)
 
-![Playing the restored result back in the built-in player](docs/InAction-RestoreAndSavePlaying.png)
+![Playing the restored result back in the built-in player](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-RestoreAndSavePlaying.png)
 
 ### 6. Process a whole folder
 
