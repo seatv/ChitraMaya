@@ -71,9 +71,12 @@ Run `ChitraMaya-install.exe` — it reassembles the parts and extracts automatic
 
 > [!TIP]
 > ### Already running ChitraMaya? Updates are small patches now.
-> From v1.60.00 on, each release page also carries a **patch zip** (e.g.
-> `ChitraMaya-patch-1.50.00-to-1.60.00.zip`, under 100 MB) so existing users
-> skip the multi-GB re-download. Extract the patch zip anywhere and run
+> From v1.60.00 on, each release page also carries **patch zips** (under
+> 100 MB) so existing users skip the multi-GB re-download. A release may
+> offer more than one patch — **pick the one whose "from" version matches
+> your install** (`VERSION.txt` next to the exe; e.g. a 1.60.01 install
+> takes `ChitraMaya-patch-1.60.01-to-1.61.00.zip`). Extract the patch zip
+> anywhere and run
 > `powershell -ExecutionPolicy Bypass -File .\Apply-Patch.ps1` — it finds
 > your install (or asks), verifies every file it would touch belongs to the
 > release the patch was built from (a mismatch refuses cleanly, changing
@@ -151,7 +154,9 @@ A few more things worth knowing before a full run:
 - **Output codec.** The Encoder panel offers **HEVC** (default), **H.264**, and **AV1** (RTX 40-series or newer). Your **QP** setting always uses the familiar HEVC 0–51 scale; for AV1 the app maps it internally to AV1's finer quantizer scale (the log shows the mapping), so QP 18 means the same quality intent regardless of codec. AV1 outputs are automatically post-processed so they seek correctly in every player (a hardware-encoder quirk ChitraMaya repairs at packaging time). The **Preset** dropdown offers the full P1 (fastest) to P7 (best) ladder — on 8 GB cards stay at **P5 or below**.
 - **Outputs never overwrite.** If the output name already exists, the new file gets a `-2`, `-3`, … suffix and the log says so.
 - **Stall protection.** A watchdog monitors long runs and calls out a stalled pipeline instead of letting it sit silently. On eGPU setups it also warns if the PCIe link is running below its trained speed *under load* — an early warning for VRAM-paging trouble — and (v1.60) summarizes benign link "flapping" into one line a minute instead of alarm storms, while a down-train that does *not* recover still alarms in full. The stall threshold is configurable: add `"watchdogStallSeconds": 300` to `ChitraMaya-config.json` (next to the exe) if the default 120 seconds is too eager for your hardware.
+- **Stream captures (MPEG-TS) are remuxed before decode (v1.61).** Files ripped from streaming sites are usually MPEG-TS streams (often named `.mkv`); the GPU decode path silently dropped ~5 seconds at the head of such files on earlier releases, producing a constant audio desync. ChitraMaya now detects TS sources and losslessly remuxes them to a temporary MP4 first (stream copy, no quality change). You'll see a `<name>.cm120-tsremux.mp4` appear next to the source (or in the system temp folder) while the run is active — it is roughly source-sized, is deleted when the run finishes, and is reused if you re-run the same file. **If a pre-1.61 output from a stream capture ever drifted out of sync, re-run the source file** — old outputs cannot be repaired after the fact.
 - **Failed runs report what survived (v1.60).** A hard mid-run error no longer masquerades as total loss: everything encoded before the failure is flushed and remuxed as always, and the app now says **"PARTIAL: encoded M of N frames"** — the output file is playable up to that point, and the console names it.
+- **The encoder cannot fail silently, and slow disks get their time (v1.61).** If the hardware encode session dies mid-run (it happens — drivers, power events), the app now aborts loudly within seconds instead of "encoding" nothing for hours; your already-encoded frames are preserved in a raw bitstream next to a ready-made `*-RECOVER.ps1` script, and the end-of-run log reports the bitstream size so a byteless success is impossible. The final packaging step is likewise now supervised by **disk progress** rather than a wall-clock timeout — a slow hard drive gets as long as it needs, a truly stuck process is still killed within minutes, and a failed finalize removes its half-written output (the raw bitstream + recovery script remain your salvage).
 - **The system stays awake during runs.** ChitraMaya holds off the idle-sleep timer while processing (the display may still turn off), then releases it — overnight runs no longer die to a power plan.
 
 ![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
@@ -186,6 +191,8 @@ For side-by-side (SBS) VR video, enable **Split SBS** in Detection so each eye i
 > On warped-mosaic content with projection Off, the run statistics can look perfect (every frame "detected and restored") while the output still shows mosaic — the models latch onto the warped blocks but cannot actually reconstruct them. **Judge quality with your eyes, not the stats:** use **Test Frame** on a mosaic-heavy frame with projection Off vs Fisheye and compare.
 
 > VR bonus: the RTX Super-Res secondary is at its most valuable on VR content — close-up regions there are routinely far larger than the restorer's native crop.
+
+**8K VR on cards before RTX 50-series (v1.61):** H.264 sources wider than 4096 px (8K VR is 4320) exceed NVDEC's decode limit on everything before Blackwell, so ChitraMaya automatically falls back to CPU decode for those files — the console says so at startup. From v1.61.00 the full VR pipeline (projection, restoration, paste-back) works correctly on that fallback path; expect it to be much slower than NVDEC, which is a hardware limit rather than a setting.
 
 ### 8. Compare in 3D — SBS View
 
@@ -260,11 +267,12 @@ The AMD edition is a **separate download** — a single **`ChitraMaya-rocm-insta
 ## Intel Arc (XPU) Edition — EXPERIMENTAL
 
 > [!CAUTION]
-> **Tested on exactly one machine and one card:** an Arc A580 8GB
-> (Alchemist) on Windows 11, without Resizable BAR. Every other Intel
-> GPU — A750/A770, B-series (Battlemage), iGPUs — is **untested**. It
-> may work; it may not. Use with caution, expect rough edges, and
-> please report what you find.
+> **Field-tested on two configurations:** a desktop **Arc A580 8GB**
+> (Alchemist) on Windows 11, and a **Core Ultra 7 256V laptop** (Lunar
+> Lake, **Arc 140V iGPU**, 16GB) — the full restore path validated on
+> both. Everything else — A750/A770, B-series (Battlemage), other
+> iGPUs — is **untested**. It may work; it may not. Use with caution,
+> expect rough edges, and please report what you find.
 
 The Arc edition is a **separate download** — a single `ChitraMaya-xpu-install` file (an `.exe` installer from v1.50.00 on: double-click, pick a folder; earlier releases were a plain `.7z` you extract yourself). Run `ChitraMaya.cmd` from the extracted folder. Do not mix it with the NVIDIA install.
 
@@ -272,12 +280,14 @@ The Arc edition is a **separate download** — a single `ChitraMaya-xpu-install`
 
 **What to expect:**
 
-- **It is slow.** On the same 4K test file, the A580 ran about **20× slower** than a comparable NVIDIA card (RTX 3060: 58 seconds; A580: 18 minutes). This is a software-maturity gap in PyTorch's Intel support, not a defect in your card or setup. Plan runs accordingly.
+- **Expect roughly 3× the runtime of an equivalent NVIDIA card — IF Resizable BAR is on.** On the same 4K test clip: RTX 3060 **58s**, A580 with ReBAR **2m37s**, Arc 140V laptop iGPU **2m41s**. **Without ReBAR the same A580 took 18 minutes (~20×)** — the 256MB BAR window strangles compute transfers, so ReBAR is *effectively required* on discrete Arc, exactly as Intel says. Integrated Arc (Lunar Lake-class iGPUs) is exempt: unified memory means there is no BAR bottleneck to remove.
 - **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch. Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step (and no `Compile-All-Engines.ps1`).
 - **NVIDIA-only features degrade gracefully and say so:** RTX Super-Res and the PCIe monitor are unavailable on Arc by design.
 - **8 GB Arc cards handle 4K flat video** with ~40% VRAM headroom. 5K/VR/SBS content is currently **not recommended** on 8 GB.
-- **Requirements:** Windows 10/11 and a current **Intel graphics driver** — nothing else; ffmpeg and all runtimes are bundled. Resizable BAR on is recommended (BIOS: CSM off, Above 4G Decoding on, ReBAR on), with the caveat that the test machine ran *without* it, so ReBAR configurations are themselves untested.
+- **Requirements:** Windows 10/11 and a current **Intel graphics driver** — nothing else; ffmpeg and all runtimes are bundled. **Discrete Arc: Resizable BAR ON is effectively required** (BIOS: CSM off, Above 4G Decoding on, ReBAR on; ReBAR alone was worth 7–9× in our A/B testing). Not applicable to iGPUs. Note: Intel's driver installer can stall when run unattended or over a remote session — run it at the machine and watch it finish.
+- **16GB machines (laptops):** on 4K content the host frame store may not fit and the **RAM guard** will engage ("pausing decode-ahead") — the run completes at reduced pace. This is expected on 16GB Lunar Lake-class machines; 1080p content fits comfortably.
 - **Troubleshooting:** add `"hwDecode": "off"` to `ChitraMaya-config.json` (next to the exe) to force CPU decode if you suspect a hardware-decode problem with a file. Valid values: `auto` (default), `qsv`, `d3d11va`, `off`.
+- **If self-check reports "device enumerates but kernels do not launch"** (`could not make an engine with allocator`), your Intel graphics driver is too old for the bundled PyTorch stack — the GPU is visible but compute fails. Update to a current Intel graphics driver and reboot; this was field-confirmed on a laptop whose factory driver was under two years old. Run `ChitraMaya-cli.exe -self-check` after any driver change — it tests exactly this.
 
 **Reporting problems:** please attach `ChitraMaya-console.log` (next to the exe) and the `*.misses.json` written beside your output — it contains the run settings, statistics, and the last console lines. State your GPU model, driver version, and whether Resizable BAR is enabled (GPU-Z shows this). No explicit content in issues, per the issue template.
 
@@ -433,12 +443,14 @@ Full restores stream the whole file through NVDEC for throughput; *Test Frame* a
 
 A few things are intentionally incomplete or have known limitations in this release:
 
-- **The Intel Arc and AMD ROCm editions are experimental with thin field coverage** — see the cautions in [the Arc section](#intel-arc-xpu-edition--experimental) and [the AMD section](#amd-radeon-rocm-edition--experimental). The Arc edition is also roughly 20× slower than an equivalent NVIDIA card on the current PyTorch Intel stack; that gap is expected to narrow as Intel's software matures, not something you can tune away.
+- **The Intel Arc and AMD ROCm editions are experimental with thin field coverage** — see the cautions in [the Arc section](#intel-arc-xpu-edition--experimental) and [the AMD section](#amd-radeon-rocm-edition--experimental). The Arc edition runs roughly 3× slower than an equivalent NVIDIA card on the current PyTorch Intel stack (with Resizable BAR on discrete cards — ~20× without it); the remaining gap is expected to narrow as Intel's software matures, not something you can tune away.
 - **Automatic mosaic detection is experimental — do not rely on it to censor.** The Auto-detect / censor mode depends on a third-party NSFW detection model that does not reliably detect all explicit content; it misses regions and whole frames and is not suitable for production censoring. Use the manual draw-rectangles Add Mosaic with the max-recall settings and two-pass leak check, and review every frame of any output yourself.
 - **Some users have reported blend artifacts with the Face Swap blend mask** on certain content — visible edge irregularities around restored regions. If you see them, set Blend Mask to **None** (the classic blend is unaffected). Under investigation.
 - **On warped-mosaic VR content, run statistics cannot detect a quality failure.** With VR Projection Off on such content, the stats can report full coverage while the output still shows mosaic (the models "restore" blocks they cannot parse). Use **Test Frame** to judge — see the VR section.
 - **VR Projection assumes FOV-180 content and requires Split SBS.** Fisheye-native sources with wider lenses (190/200) are handled with the same transform, which has been sufficient in testing; a per-title projection variant is a planned refinement if a title needs it.
 - **Detection FP16 applies only to the PyTorch path.** For a compiled TensorRT detection engine, precision is baked in at compile time, so the runtime **Detection FP16** toggle has no effect — the app grays it out when a compiled engine is selected. It still applies to `.pt` PyTorch detection runs.
+- **Very long filenames (v1.61).** Windows' 260-character path limit can make files with very long names fail to process ("No such file or directory" on the `.hevc` sidecar) and can silently skip the stream-capture remux ("remux skipped: no writable location"). Shorten the filename — keep the full output path under ~230 characters. Fix lands in the next patch.
+- **Interrupted stream-capture remux (v1.61).** If a run is interrupted (power loss, forced kill) *while* the console shows the "MPEG-TS... remuxing to a temporary MP4" message, delete the leftover `<name>.cm120-tsremux.mp4` next to the source before re-running that file — an incomplete cache from the interrupted run could otherwise be reused. A run that got past the remux message is not affected. Fix lands in the next patch.
 - **Detection debug dumps** — `--debug-save-detection-frames` and `--debug-save-detection-json` still don't write anything.
 - **SBS View assumes equirect-180 side-by-side (left|right)** content; fisheye layouts aren't projected correctly yet (a projection selector is planned). Playback in the viewer uses the app's embedded browser decoder, not NVDEC — a very large (8K) HEVC master may not play there even though it restores fine; a downscaled copy will.
 - **Add Mosaic rectangles are per-eye for SBS** and are clamped to the eye you drew them in — a rectangle can't span the eye seam. Both eyes receive the mosaic at the same per-eye position (no parallax offset), so pad rectangles generously on close subjects.
