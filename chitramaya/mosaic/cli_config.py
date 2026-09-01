@@ -241,7 +241,8 @@ def create_parser() -> argparse.ArgumentParser:
                         "(studios that mosaic in viewing space: square blocks in "
                         "the headset, warped in the raw frame) and inverse-warps "
                         "restored regions back. Requires --sbs.")
-    p.add_argument("--secondary-restoration", choices=["none", "rtx-2x", "rtx-4x"],
+    p.add_argument("--secondary-restoration",
+                   choices=["none", "rtx-2x", "rtx-4x", "esrgan-4x"],
                    default=None,
                    help="CM-077: upscale restored crops with NVIDIA Maxine RTX "
                         "Super-Res (2x or 4x) before paste-back, sharpening regions "

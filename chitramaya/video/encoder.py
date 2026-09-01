@@ -34,6 +34,37 @@ except Exception:
     nvc = None
 
 
+def _sidecar_stem(output_path: str) -> str:
+    """CM-127 (field 2026-08-29): directory-qualified stem that sidecar
+    files (.hevc/.av1 raw bitstream, .vtmp/.venc temps, -RECOVER.ps1,
+    -FIXED output) derive from.
+
+    Windows' classic 260-character path limit killed a batch file whose
+    output name was fine but whose .hevc sidecar was not ("No such file
+    or directory" on open). Sidecars add up to ~16 characters past the
+    output stem; when that budget would cross the limit, derive them
+    from a shortened stem + 8-hex hash of the full stem (deterministic,
+    collision-safe in practice) instead. The final OUTPUT keeps its own
+    name -- callers must ensure it fits (see the constructor check)."""
+    p = Path(str(output_path))
+    if len(str(output_path)) + 16 <= 259:
+        return str(p.with_suffix(""))
+    import hashlib
+    h = hashlib.md5(p.stem.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return str(p.with_name(p.stem[:40] + "~" + h))
+
+
+def _check_output_fits(output_path: str) -> None:
+    """CM-127: refuse an output path that cannot exist on Windows with a
+    CLEAR message, instead of the bare [Errno 2] users got mid-run."""
+    if len(str(output_path)) > 259:
+        raise RuntimeError(
+            f"Output path is {len(str(output_path))} characters -- beyond "
+            f"the Windows 260-character path limit. Shorten the file name "
+            f"(keep the full output path under ~240 characters) and re-run "
+            f"(CM-127).")
+
+
 # CM-122: consecutive empty Encode() returns that mean the NVENC session is
 # dead, not merely latent. Legit output latency (priming + bf + rc_lookahead)
 # is bounded by a few dozen frames; 600 (=10s @ 59.94) is far beyond any of
@@ -432,9 +463,19 @@ class Encoder:
             "mkv" if suffix == ".mkv" else None
         )
         self._needs_remux = self._container is not None
+        # CM-127: clear refusal if the output itself cannot exist; sidecar
+        # names shorten automatically when the budget is tight.
+        _check_output_fits(self.output_path)
+        self._stem = _sidecar_stem(self.output_path)
+        if self._stem != str(Path(self.output_path).with_suffix("")):
+            print(f"[Encoder] Long output name (CM-127): temp and recovery "
+                  f"files use the shortened base "
+                  f"'{Path(self._stem).name}' to fit the Windows path "
+                  f"limit.")
+
         self._raw_path = self.output_path
         if self._needs_remux:
-            self._raw_path = self.output_path + _raw_ext(self.codec)
+            self._raw_path = self._stem + _raw_ext(self.codec)
 
         self._file = open(self._raw_path, "wb")
         self._frames_encoded = 0
@@ -695,8 +736,7 @@ class Encoder:
         into a playable file (video only — the always-works paste-in
         fallback shown by the REMUX FAILED banner). The sidecar script goes
         further and re-adds audio automatically."""
-        fixed = str(Path(self.output_path).with_suffix("")) + "-FIXED" + \
-            Path(self.output_path).suffix
+        fixed = self._stem + "-FIXED" + Path(self.output_path).suffix
         fmt = _ffmpeg_input_fmt(self.codec)
         # For AV1 the bitstream may be IVF-wrapped (auto-probes); a plain -i
         # works for that, while HEVC/H.264 want the explicit demuxer. Use the
@@ -736,10 +776,9 @@ class Encoder:
         source has moved, with instructions to edit $source and re-run.
         Written as UTF-8 with BOM: Windows PowerShell 5.1 assumes ANSI for
         BOM-less scripts and would mangle non-ASCII paths."""
-        script_path = str(Path(self.output_path).with_suffix("")) + \
-            "-RECOVER.ps1"
+        script_path = self._stem + "-RECOVER.ps1"
         out = Path(self.output_path)
-        fixed = str(out.with_suffix("")) + "-FIXED" + out.suffix
+        fixed = self._stem + "-FIXED" + out.suffix
         vtmp = fixed + ".vtmp" + out.suffix
         fmt_args = "" if self.codec == "av1" else \
             f"-f {_ffmpeg_input_fmt(self.codec)} "
@@ -1260,7 +1299,8 @@ class Encoder:
                 # a temp CONTAINER (lossless copy) to give it real timestamps,
                 # then apply -itsoffset on that container in the audio-mux pass.
                 # -itsoffset on a container input is reliable (lada's pattern).
-                temp_video = Path(str(out_path) + ".vtmp" + out_path.suffix)
+                # CM-127: derive from the (possibly shortened) sidecar stem.
+                temp_video = Path(self._stem + ".vtmp" + out_path.suffix)
 
                 step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
                          "-fflags", "+genpts",
@@ -1467,8 +1507,18 @@ class FfmpegEncoder:
         if self.codec not in self._QSV:
             raise ValueError(f"FfmpegEncoder: unsupported codec {self.codec!r}")
 
-        self._venc_path = self.output_path + ".venc.mp4"
-        self._stderr_path = self.output_path + ".venc.stderr.log"
+        # CM-127: clear refusal + shortened sidecar base on long names
+        # (same treatment as the NVENC encoder).
+        _check_output_fits(self.output_path)
+        self._stem = _sidecar_stem(self.output_path)
+        if self._stem != str(Path(self.output_path).with_suffix("")):
+            print(f"[Encoder] Long output name (CM-127): temp and recovery "
+                  f"files use the shortened base "
+                  f"'{Path(self._stem).name}' to fit the Windows path "
+                  f"limit.")
+
+        self._venc_path = self._stem + ".venc.mp4"
+        self._stderr_path = self._stem + ".venc.stderr.log"
 
         # Pick the encoder: QSV -> AMF -> software (Batch 34 ladder). Each
         # rung is a real 2-frame init probe on THIS machine, so a missing
@@ -1567,10 +1617,9 @@ class FfmpegEncoder:
         -shortest trimming the audio to the partial video. Test-Path guard
         falls back to a video-only rewrap if the source moved. UTF-8 BOM
         for Windows PowerShell 5.1 (see the NVENC twin)."""
-        script_path = str(Path(self.output_path).with_suffix("")) + \
-            "-RECOVER.ps1"
+        script_path = self._stem + "-RECOVER.ps1"
         out = Path(self.output_path)
-        fixed = str(out.with_suffix("")) + "-FIXED" + out.suffix
+        fixed = self._stem + "-FIXED" + out.suffix
         tag_args = f"-tag:v {self._mp4_tag()} "
         ts_args = "-video_track_timescale 90000 "
         fs_args = "-movflags +faststart " if self.mp4_faststart else ""

@@ -40,7 +40,9 @@ import torch
 import torch.nn.functional as F
 
 # One dropdown value per mode; shared with pipeline/cli so lists cannot drift.
-SECONDARY_MODES = ("none", "rtx-2x", "rtx-4x")
+# Batch 68 (CM-139): esrgan-4x -- Real-ESRGAN compact scaler, all GPU vendors
+# (see esrgan_secondary.py; the rtx-* modes remain NVIDIA/Maxine).
+SECONDARY_MODES = ("none", "rtx-2x", "rtx-4x", "esrgan-4x")
 
 _QUALITY = "high"          # matches the field-validated probe configuration
 _INPUT_SIZE = 256          # must equal restoration clip_size; enforced by caller
@@ -165,7 +167,7 @@ def scale_for_mode(mode: str) -> int:
     m = str(mode or "none").lower()
     if m == "rtx-2x":
         return 2
-    if m == "rtx-4x":
+    if m in ("rtx-4x", "esrgan-4x"):
         return 4
     return 0
 

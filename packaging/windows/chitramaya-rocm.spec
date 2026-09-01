@@ -164,6 +164,43 @@ def _which(exe):
         return None
 
 
+def _gate_ffmpeg_version(path, what):
+    """r9 (CM-131, field 2026-08-30): the bundled ffmpeg is resolved from
+    the build process's PATH, which drifts (a freshly installed ffmpeg 9
+    won the race and shipped a bundle whose every decode invocation
+    failed in the field -- '-vsync' was removed in ffmpeg 9; Batch 64
+    moved the code to '-fps_mode passthrough', valid on both lines).
+    Print the exact bundled version, admit only known majors (8 and 9),
+    and require the same major for ffmpeg and ffprobe so a mixed pair
+    cannot ship. A future major is admitted deliberately with
+    CM_ALLOW_FFMPEG_MAJOR=<n> after its own validation pass."""
+    import os as _os
+    import re as _re
+    try:
+        _out = subprocess.run([path, "-version"], capture_output=True,
+                              text=True, timeout=15).stdout.splitlines()[0]
+    except Exception as _e:
+        raise SystemExit(f"[spec] FATAL: could not run {what} at {path} "
+                         f"({_e}) -- refusing to bundle an unrunnable binary.")
+    _m = _re.search(r"version\s+(\d+)", _out)
+    if not _m:
+        raise SystemExit(f"[spec] FATAL: could not parse {what} version "
+                         f"from: {_out}")
+    _major = int(_m.group(1))
+    _allowed = {8, 9}
+    _ov = _os.environ.get("CM_ALLOW_FFMPEG_MAJOR")
+    if _ov and _ov.isdigit():
+        _allowed.add(int(_ov))
+    print(f"[spec] {what}: {_out}  (from {path})")
+    if _major not in _allowed:
+        raise SystemExit(
+            f"[spec] FATAL: {what} at {path} is major version {_major}; "
+            f"allowed majors: {sorted(_allowed)}. Pass -FfmpegDir with a "
+            f"gyan FULL build of an allowed major, or set "
+            f"CM_ALLOW_FFMPEG_MAJOR={_major} to admit this one (CM-131).")
+    return _major
+
+
 if args.skip_ffmpeg:
     print("[spec] WARNING: --skip-ffmpeg on the ROCm build -- the packaged "
           "app will have NO decode or encode path unless the user installs "
@@ -178,6 +215,11 @@ else:
             "(Batch 34 AMF rung) -- put the gyan.dev 'full' build on PATH, "
             "or pass --skip-ffmpeg to build without it (not recommended)."
         )
+    _mf = _gate_ffmpeg_version(_ff, "bundled ffmpeg")
+    _mp = _gate_ffmpeg_version(_fp, "bundled ffprobe")
+    if _mf != _mp:
+        raise SystemExit(f"[spec] FATAL: ffmpeg (v{_mf}) and ffprobe "
+                         f"(v{_mp}) majors differ -- mixed pair refused (CM-131).")
     binaries += [(_ff, "bin"), (_fp, "bin")]
     # Capability probe of the EXACT binary being bundled: the AMF rungs
     # this edition encodes with, plus the software ladder. A gap here is
@@ -478,6 +520,12 @@ pyz = PYZ(a.pure)
 
 # Dual bootloaders, one payload (Batch 24 pattern): windowed UI exe +
 # console CLI exe for -restore / -self-check / headless workflows.
+# Batch 67 (branding): stamp the ChitraMaya icon into both exes so our
+# programs are distinguishable in Explorer and on the taskbar. A missing
+# icon file degrades to the default icon instead of failing the build.
+_ICON = project_root / "packaging" / "windows" / "chitramaya.ico"
+_ICON = str(_ICON) if _ICON.is_file() else None
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -491,6 +539,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    icon=_ICON,
 )
 
 exe_cli = EXE(
@@ -506,6 +555,7 @@ exe_cli = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    icon=_ICON,
 )
 
 coll = COLLECT(

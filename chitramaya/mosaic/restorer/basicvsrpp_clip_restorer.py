@@ -46,6 +46,31 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
         self.model_dtype = torch.float16 if self.fp16 else torch.float32
         self.max_frames = int(max_frames)
 
+        # CM-128 (field 2026-08-30): on unified-memory Intel GPUs the
+        # "VRAM" IS system RAM -- the host frame store, the OS, and every
+        # model allocation share one pool. A 13-hour run on a 16GB Lunar
+        # Lake laptop rode <1GB free the whole way and died at 77% with
+        # UR_RESULT_ERROR_OUT_OF_RESOURCES when a full MCL-300 restore
+        # window spiked past zero. Until the RAM planner is
+        # unified-memory aware, cap the restore window on small-RAM XPU
+        # machines when the user has not set an explicit cap. The config
+        # key restoreChunkFrames (or --restore-chunk-frames) overrides.
+        if self.max_frames <= 0 and self.device.type == "xpu":
+            _total_gb = None
+            try:
+                import psutil
+                _total_gb = psutil.virtual_memory().total / 2**30
+            except Exception:
+                pass
+            if _total_gb is not None and _total_gb < 20.0:
+                self.max_frames = 96
+                print(f"[Restorer] Unified-memory protection (CM-128): this "
+                      f"machine has {_total_gb:.0f}GB total RAM shared with "
+                      f"the GPU, so restoration runs in 96-frame windows to "
+                      f"leave the shared pool headroom. Set "
+                      f"restoreChunkFrames in ChitraMaya-config.json to "
+                      f"override.")
+
         # gRestorer load_model signature: (config, checkpoint_path, device, fp16=...)
         self.model = load_model(config=None, checkpoint_path=model_path, device=self.device, fp16=self.fp16)
 
@@ -133,8 +158,16 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
         # it (the low-VRAM safety valve). See class docstring.
         window = self.max_frames if self.max_frames > 0 else n
 
-        for start in range(0, n, window):
-            chunk = frames[start : start + window]
+        # CM-128: worklist of (start, frames) segments so a window whose
+        # forward exhausts device resources can be SPLIT IN HALF and
+        # retried instead of aborting the run. On unified-memory iGPUs a
+        # restore spike competes with the host store for one RAM pool; a
+        # spike that used to kill a 13-hour run at 77% now degrades to
+        # smaller windows with a warning. Order is preserved (halves are
+        # pushed back at the front, first half first).
+        segments = [(s, frames[s : s + window]) for s in range(0, n, window)]
+        while segments:
+            start, chunk = segments.pop(0)
 
             # TCHW uint8
             tchw_u8 = torch.stack([f.permute(2, 0, 1).contiguous() for f in chunk], dim=0)
@@ -147,7 +180,23 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
                       f"{'fp16' if dtype == torch.float16 else 'fp32'})", flush=True)
                 _t0 = _time.perf_counter()
 
-            out = self.model(inputs=btchw)  # -> BTCHW
+            try:
+                out = self.model(inputs=btchw)  # -> BTCHW
+            except RuntimeError as e:
+                if _is_resource_error(e) and len(chunk) >= 2:
+                    del btchw, tchw_u8
+                    from chitramaya.device import empty_cache as _empty_cache
+                    _empty_cache(self.device)
+                    half = len(chunk) // 2
+                    print(f"[Restorer] WARNING (CM-128): device out of "
+                          f"resources on a {len(chunk)}-frame window "
+                          f"({type(e).__name__}); cache cleared, retrying as "
+                          f"{half}+{len(chunk) - half} frames. The run "
+                          f"continues.", flush=True)
+                    segments.insert(0, (start + half, chunk[half:]))
+                    segments.insert(0, (start, chunk[:half]))
+                    continue
+                raise
             out_tchw = out.squeeze(0)
 
             if _hb:
@@ -170,6 +219,21 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
             out_frames.extend(list(torch.unbind(out_u8, dim=0)))
 
         return out_frames
+
+
+def _is_resource_error(e: BaseException) -> bool:
+    """CM-128: recognize device resource-exhaustion across backends.
+
+    Level Zero (Intel XPU) surfaces UR_RESULT_ERROR_OUT_OF_RESOURCES /
+    ..._OUT_OF_DEVICE_MEMORY through a plain RuntimeError; CUDA and HIP
+    say "out of memory". String matching is regrettable but is what the
+    stacks give us."""
+    s = str(e)
+    return ("OUT_OF_RESOURCES" in s
+            or "OUT_OF_DEVICE_MEMORY" in s
+            or "OUT_OF_HOST_MEMORY" in s
+            or "out of memory" in s
+            or "not enough memory" in s)
 
 
 __all__ = ["BasicVSRPPClipRestorer"]

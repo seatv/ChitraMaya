@@ -1051,8 +1051,32 @@ class Pipeline:
                 print("[Secondary] Note: secondary restoration applies only to real "
                       "restoration; ignored in preview/censor mode.")
             elif self.rest_clip_size != 256:
-                print(f"[Secondary] WARNING: RTX Super-Res requires clip size 256 "
-                      f"(configured: {self.rest_clip_size}); running without secondary.")
+                print(f"[Secondary] WARNING: secondary restoration requires clip "
+                      f"size 256 (configured: {self.rest_clip_size}); running "
+                      f"without secondary.")
+            elif self.secondary_restoration == "esrgan-4x":
+                # Batch 68 (CM-139): Real-ESRGAN compact scaler -- plain torch,
+                # so it runs on EVERY edition (CUDA, XPU, ROCm). Bundled
+                # weights; a copy in ./models overrides.
+                try:
+                    from chitramaya.mosaic.restorer.esrgan_secondary import (
+                        EsrganSecondaryRestorer,
+                    )
+                    self._secondary = EsrganSecondaryRestorer(
+                        device=self.device, scale=_sec_scale,
+                        input_size=self.rest_clip_size,
+                        user_weight_dirs=["models"],
+                    )
+                    print(f"[Secondary] Real-ESRGAN ACTIVE: {_sec_scale}x "
+                          f"(256 -> {256 * _sec_scale}, model "
+                          f"realesr-general-x4v3, all GPU vendors). Restored "
+                          f"regions larger than 256 px are upscaled before "
+                          f"paste-back; smaller regions keep the standard path.")
+                except Exception as _sec_err:
+                    print(f"[Secondary] WARNING: Real-ESRGAN secondary "
+                          f"unavailable ({_sec_err}); running without "
+                          f"secondary.")
+                    self._secondary = None
             else:
                 try:
                     from chitramaya.mosaic.restorer.rtx_secondary import (
@@ -1767,15 +1791,31 @@ class Pipeline:
             if progress_cb is not None:
                 _now = time.perf_counter()
                 _pf = int(metrics.processed_frames)
-                # windowed fps: frames since last emit / wall since last emit
+                # CM-135 (Batch 69): fps and ETA are computed over COMPLETED
+                # frames -- restored (clip closed + composited) plus legit
+                # passthrough -- not over ingested frames. The old counter
+                # measured the front of the pipeline (decode+detect racing
+                # ahead into the store), which on short clips reads near
+                # DOUBLE the delivered speed while restoration lags behind
+                # (field: the Codeberg "fake fps" report -- he was right).
+                # Frames sitting in open clips are backlog, not progress.
+                _done = (len(metrics.frames_restored)
+                         + int(metrics.early_passthrough_frames))
+                _done = min(_done, _pf)  # safety: never report ahead of ingest
+                # windowed fps: completed since last emit / wall since last emit
                 _prev_f = getattr(self, "_pcb_prev_frames", 0)
                 _prev_t = getattr(self, "_pcb_prev_time", t0_all)
                 _dt_win = _now - _prev_t
-                _fps_win = ((_pf - _prev_f) / _dt_win) if _dt_win > 1e-6 else 0.0
+                _fps_win = ((_done - _prev_f) / _dt_win) if _dt_win > 1e-6 else 0.0
                 _dt_all = _now - t0_all
-                _fps_avg = (_pf / _dt_all) if _dt_all > 1e-6 else 0.0
-                self._pcb_prev_frames = _pf
+                _fps_avg = (_done / _dt_all) if _dt_all > 1e-6 else 0.0
+                self._pcb_prev_frames = _done
                 self._pcb_prev_time = _now
+                # CM-135: finalize (video-container pass + remux) estimate for
+                # the ETA. Field data: SONE-174 (2h41m source) finalized in
+                # ~125s; short clips in ~5-10s -- ~1.3% of source duration
+                # with a 10s floor models both.
+                _fin_est = max(10.0, 0.013 * (float(total_frames) / max(fps, 1e-6)))
                 _mode = "detect-only" if (restorer is None and not self.analysis_use_synth_rois) else "restore"
                 try:
                     progress_cb(
@@ -1787,7 +1827,25 @@ class Pipeline:
                         fps_avg=float(_fps_avg),
                         buffered=int(len(store.frames_bgr_u8)),
                         mode=str(_mode),
+                        completed=int(_done),          # CM-135
+                        finalize_est_s=float(_fin_est),  # CM-135
                     )
+                except TypeError:
+                    # Older callback signature (no CM-135 kwargs) -- emit the
+                    # legacy shape so an out-of-step server still gets updates.
+                    try:
+                        progress_cb(
+                            frame_num=_pf,
+                            total_frames=int(total_frames),
+                            detections=int(metrics.det_stats.frames_with_det),
+                            restorations=int(len(metrics.frames_restored)),
+                            fps_win=float(_fps_win),
+                            fps_avg=float(_fps_avg),
+                            buffered=int(len(store.frames_bgr_u8)),
+                            mode=str(_mode),
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     # A misbehaving UI callback must never crash the pipeline.
                     pass
