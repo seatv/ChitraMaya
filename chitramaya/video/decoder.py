@@ -512,15 +512,28 @@ class Decoder:
 
         src = Path(self.input_path)
         stem = src.stem
+        # CM-127 (field 2026-08-29): the write probe used the full source
+        # stem, so a long filename pushed the probe path past Windows'
+        # 260-char limit and the remux was silently skipped ("no writable
+        # location") -- re-exposing the CM-120 head-drop on exactly the
+        # files streaming sites name most verbosely. The probe needs no
+        # stem at all, and the cache name shortens (stable hash suffix, so
+        # reuse still works) when the stem is long.
+        if len(stem) > 60:
+            import hashlib
+            _h = hashlib.md5(stem.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+            cache_stem = stem[:51] + "~" + _h
+        else:
+            cache_stem = stem
         candidates = [src.parent, Path(tempfile.gettempdir())]
         tmp_path: Optional[Path] = None
         for d in candidates:
             try:
-                probe = d / (stem + ".cm120-writetest.tmp")
+                probe = d / "cm120.writetest.tmp"
                 with open(probe, "wb") as _f:
                     _f.write(b"x")
                 probe.unlink()
-                tmp_path = d / (stem + ".cm120-tsremux.mp4")
+                tmp_path = d / (cache_stem + ".cm120-tsremux.mp4")
                 break
             except Exception:
                 continue
@@ -548,12 +561,25 @@ class Decoder:
               "drops frames and synthesizes timestamps on TS captures "
               "(CM-120). Losslessly remuxing to a temporary MP4 first "
               "(stream copy; no quality change)...")
+        # CM-125 (field 2026-08-28, Austin power blip): write to a .part
+        # name and atomic-rename on success. Writing the final name
+        # directly meant a power cut / hard kill mid-remux left a
+        # TRUNCATED file with a fresh mtime -- the reuse check above would
+        # adopt it, the re-probe below would report the truncated frame
+        # count as truth, and the next run would silently process a
+        # shortened movie. A .part never matches the reuse name, and
+        # os.replace is atomic on the same volume.
+        part_path = Path(str(tmp_path) + ".part")
+        try:
+            part_path.unlink(missing_ok=True)  # stale orphan from a crash
+        except Exception:
+            pass
         cmd = [
             "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
             "-i", str(src),
             "-map", "0:v:0", "-map", "0:a?",
             "-c", "copy", "-movflags", "+faststart",
-            str(tmp_path),
+            str(part_path),
         ]
         try:
             sz = src.stat().st_size
@@ -572,7 +598,7 @@ class Decoder:
                 for ln in tail:
                     print(f"  {ln}")
                 try:
-                    tmp_path.unlink(missing_ok=True)
+                    part_path.unlink(missing_ok=True)
                 except Exception:
                     pass
                 return
@@ -580,7 +606,20 @@ class Decoder:
             print(f"[Decoder] MPEG-TS remux error ({e}); decoding the TS "
                   f"directly (frames may be dropped -- CM-120).")
             try:
-                tmp_path.unlink(missing_ok=True)
+                part_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        # CM-125: publish the finished remux under its reusable name only
+        # now that ffmpeg exited cleanly.
+        try:
+            os.replace(str(part_path), str(tmp_path))
+        except Exception as e:
+            print(f"[Decoder] MPEG-TS remux rename failed ({e}); decoding "
+                  f"the TS directly (frames may be dropped -- CM-120).")
+            try:
+                part_path.unlink(missing_ok=True)
             except Exception:
                 pass
             return
@@ -749,7 +788,7 @@ class Decoder:
             *extra_tokens,
             "-i", self.input_path,
             "-an", "-sn", "-dn",
-            "-vsync", "0",
+            "-fps_mode", "passthrough",  # CM-131: -vsync removed in ffmpeg 9; fps_mode exists since 5.1
             "-f", "rawvideo",
             "-pix_fmt", self.ffmpeg_pix_fmt,
             "pipe:1",
@@ -818,7 +857,7 @@ class Decoder:
                 *tokens,
                 "-i", self.input_path,
                 "-an", "-sn", "-dn",
-                "-vsync", "0",
+                "-fps_mode", "passthrough",  # CM-131: -vsync removed in ffmpeg 9; fps_mode exists since 5.1
                 "-frames:v", "2",
                 "-f", "rawvideo",
                 "-pix_fmt", self.ffmpeg_pix_fmt,

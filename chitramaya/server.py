@@ -642,10 +642,20 @@ class SwapServer:
         return f"{s // 3600}h {(s % 3600) // 60:02d}m"
 
     def _mosaic_progress_cb(self, *, frame_num, total_frames, detections,
-                            restorations, fps_win, fps_avg, buffered, mode):
-        """Pipeline progress callback that writes into self._progress."""
+                            restorations, fps_win, fps_avg, buffered, mode,
+                            completed=None, finalize_est_s=0.0):
+        """Pipeline progress callback that writes into self._progress.
+
+        CM-135 (Batch 69): fps_win/fps_avg now measure COMPLETED frames
+        (restored + passthrough), not ingested ones -- see the pipeline's
+        emit block. `completed` drives the percent and the ETA numerator;
+        `frame_num` (ingested) is still reported as "ingested" for the
+        curious. The ETA also carries the finalize (remux) estimate so the
+        countdown ends when the FILE is done, not when the last frame
+        encodes."""
         if self._cancel_flag.is_set():
             return
+        done = int(completed) if completed is not None else int(frame_num)
         # CM-090 (Batch 50): blended-fps ETA. The window fps swings an
         # order of magnitude between passthrough (~70 it/s) and dense
         # restore sections (1-5 it/s), so a window-only ETA whipsaws from
@@ -658,10 +668,13 @@ class SwapServer:
             fps_eta = 0.6 * fps_avg + 0.4 * fps_win
         else:
             fps_eta = fps_avg if fps_avg > 0 else fps_win
-        remaining = (total_frames - frame_num) / fps_eta if fps_eta > 0 else 0
+        remaining = (total_frames - done) / fps_eta if fps_eta > 0 else 0
+        if remaining > 0:
+            remaining += float(finalize_est_s or 0.0)
         self._progress.update({
-            "frame": frame_num,
+            "frame": done,
             "total": total_frames,
+            "ingested": int(frame_num),
             "fps": round(fps_win, 1),
             "fps_avg": round(fps_avg, 1),
             "eta": self._format_eta(remaining),

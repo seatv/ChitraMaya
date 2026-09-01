@@ -299,11 +299,12 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Sharpens large restored regions. Restoration works on a 256-px crop; regions bigger than that get stretched at paste-back and look soft - worst on VR close-ups. RTX Super-Res (NVIDIA Maxine, the tech behind driver RTX VSR) upscales the restored crop 2x or 4x with real super-resolution first, so paste-back shrinks instead of stretching. Regions smaller than 256 px are untouched. Needs an RTX GPU and a recent driver; uses about 1.5 GB extra VRAM; applies only to real restoration (not Preview/Add Mosaic). If unavailable the run continues without it and says so in the log.">Secondary</span>
+                      title="Sharpens large restored regions. Restoration works on a 256-px crop; regions bigger than that get stretched at paste-back and look soft - worst on VR close-ups. A secondary scaler upscales the restored crop 2x or 4x with real super-resolution first, so paste-back shrinks instead of stretching. Regions smaller than 256 px are untouched. RTX Super-Res (NVIDIA Maxine) needs an RTX GPU and a recent driver and uses about 1.5 GB extra VRAM. Real-ESRGAN (bundled model, no downloads) works on every GPU - NVIDIA, Intel Arc, and AMD. Applies only to real restoration (not Preview/Add Mosaic). If unavailable the run continues without it and says so in the log.">Secondary</span>
                 <select class="ctrl-select" id="ctrlMosaicSecondary">
                   <option value="none" selected>Off</option>
                   <option value="rtx-2x">RTX Super-Res 2&times;</option>
                   <option value="rtx-4x">RTX Super-Res 4&times;</option>
+                  <option value="esrgan-4x">Real-ESRGAN 4&times; (all GPUs)</option>
                 </select>
               </div>
               <div class="ctrl-row">
@@ -570,6 +571,14 @@
      max-width beats width -- override BOTH or the modal only grows taller. */
   #batchModal .modal { width: min(1720px, 94vw); max-width: min(1720px, 94vw);
                        text-align: left; max-height: 92vh; overflow-y: auto; }
+  /* Batch 69 (field request): the progress modal wobbled -- every update
+     changes the text width of percent/fps/ETA, and at 500px the flex row
+     reflowed constantly. 50% wider (same max-width-beats-width rule as
+     23d above), tabular digits so numbers tick in place instead of
+     shifting their neighbors, and no wrapping. */
+  #progressModal .modal { width: min(750px, 92vw); max-width: min(750px, 92vw); }
+  #progressModal .progress-info { font-variant-numeric: tabular-nums;
+                                  white-space: nowrap; gap: 12px; }
   .bm-folder-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 6px; }
   /* 23d: .modal-btn carries margin-top:16px globally (meant for a modal's
      bottom button row). Inside the folder row and the move-button column it

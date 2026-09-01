@@ -1,6 +1,7 @@
 # chitramaya/self_check.py
 """
-ChitraMaya install self-check (Batch 34, CM-097 groundwork).
+ChitraMaya install self-check (Batch 34, CM-097 groundwork; Batch 66
+CM-132: honest GPU verdict).
 
 Answers ONE question: "is this install sound?" -- without starting the UI
 or touching any user file. Three consumers, in order of who asked for it:
@@ -18,10 +19,21 @@ Design rules:
   * ASCII-only output (survives every Windows codepage).
   * Never raises: every probe is guarded; the summary line + exit code
     carry the verdict. Exit 0 = PASS (warnings allowed), 1 = FAIL.
-  * A missing GPU is a WARNING, not a failure -- the install can be
-    perfectly sound on a machine whose driver is missing/wrong, and the
-    patch verifier must not be held hostage by the environment. Import
-    failures and missing/broken bundled binaries are FAILURES.
+  * A missing/unusable GPU is a WARNING, not a failure -- the install
+    can be perfectly sound on a machine whose driver is missing/wrong,
+    and the patch verifier must not be held hostage by the environment.
+    Import failures and missing/broken bundled binaries are FAILURES.
+  * CM-132 (field 2026-08-30): a WARNING must not be MISLEADING. On a
+    ThinkStation whose only GPU is a pre-Xe UHD P630, the old message
+    said "driver missing or too old" (implying fixable) and the verdict
+    said plain PASS. Now: when the GPU probe fails, the check enumerates
+    the machine's actual GPUs (WMI) and says which of two situations the
+    user is in -- (a) right GPU present, update the driver, or (b) this
+    hardware can NEVER run this edition (and which edition, if any,
+    matches what IS present) -- and the verdict banner becomes
+    "PASS (install intact) -- GPU NOT USABLE". Exit code stays 0 for
+    that case: Apply-Patch runs this check and must stay able to verify
+    an install on a GPU-less bench machine.
   * Edition-aware without hardcoding editions: a module that fails to
     import because it needs a stack this edition deliberately excludes
     (tensorrt on XPU/ROCm, PyNvVideoCodec on XPU/ROCm, ...) is reported
@@ -134,6 +146,13 @@ class _Tally:
         self.skip = 0
         self.warn = 0
         self.fail = 0
+        # CM-132: set when the GPU probe establishes that video
+        # processing will NOT run on this machine as it stands (driver
+        # problem or wrong/absent hardware). Does not affect the exit
+        # code -- the install itself can still be intact and Apply-Patch
+        # must remain able to verify it -- but the verdict banner and
+        # trailer say so in plain words instead of a bare PASS.
+        self.gpu_unusable = False
 
     def line(self, status: str, text: str) -> None:
         print(f"[SelfCheck] {status:5s} {text}")
@@ -258,6 +277,112 @@ def _spawn_devprobe() -> Tuple[Optional[int], str]:
         return None, f"{type(e).__name__}: {e}"
 
 
+def _windows_gpus() -> List[str]:
+    """CM-132: names of every display adapter Windows knows about, via
+    WMI (Win32_VideoController). Empty list on non-Windows, on timeout,
+    or on any failure -- callers fall back to generic advice."""
+    if os.name != "nt":
+        return []
+    try:
+        rc, out = _run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | "
+             "Select-Object -ExpandProperty Name"],
+            timeout=25)
+        if rc != 0:
+            return []
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    except BaseException:  # noqa: BLE001 -- advisory only, never die
+        return []
+
+
+def _point_to_matching_edition(t: _Tally, has_nvidia: bool,
+                               has_arc: bool, has_amd: bool) -> None:
+    """CM-132: when THIS edition can never run here, say which edition
+    (if any) matches the hardware that IS present."""
+    if has_nvidia:
+        t.info("      An NVIDIA GPU IS present -- the NVIDIA edition "
+               "matches this machine: github.com/seatv/ChitraMaya")
+    if has_arc:
+        t.info("      An Intel Arc GPU IS present -- the Intel Arc "
+               "edition matches this machine: "
+               "github.com/seatv/ChitraMaya-Intel-ARC")
+    if has_amd:
+        t.info("      An AMD GPU IS present -- the AMD edition may match "
+               "this machine (supported RDNA3/RDNA4 cards only): "
+               "github.com/seatv/ChitraMaya-AMD-ROCM")
+    if not (has_nvidia or has_arc or has_amd):
+        t.info("      No GPU any ChitraMaya edition supports (NVIDIA / "
+               "Intel Arc / supported AMD Radeon) is present on this "
+               "machine.")
+
+
+def _gpu_inventory_advice(t: _Tally, edition: str) -> None:
+    """CM-132 (field 2026-08-30): after a failed GPU probe, look at what
+    GPUs Windows actually reports and split two very different fates the
+    old message conflated: (a) the right GPU is present and a DRIVER
+    update fixes it, vs (b) this machine's hardware can NEVER run this
+    edition and no driver will change that. Field event: a ThinkStation
+    P340 whose only GPU is a pre-Xe UHD P630 was told 'driver missing or
+    too old' by the XPU edition -- advice that cannot work."""
+    names = _windows_gpus()
+    if not names:
+        hint = (" ROCm needs AMD Adrenalin 26.2.2+ and a supported "
+                "RDNA3/RDNA4 card." if edition == "rocm" else "")
+        t.info(f"      Could not enumerate this machine's GPUs. If the "
+               f"right GPU is installed, update its driver and re-run "
+               f"the self-check.{hint}")
+        return
+    t.info(f"      GPUs on this machine: {'; '.join(names)}")
+    low = " ; ".join(n.lower() for n in names)
+    has_nvidia = any(s in low for s in ("nvidia", "geforce", "quadro",
+                                        "rtx", "gtx"))
+    has_amd = ("amd" in low) or ("radeon" in low)
+    has_arc = "arc" in low  # discrete A/B-series and Arc-based iGPUs
+    has_pre_arc_intel = ("intel" in low) and not has_arc  # UHD/Iris/HD
+
+    if edition == "xpu":
+        if has_arc:
+            t.info("      An Intel Arc GPU is present -- this is a DRIVER "
+                   "problem, not a hardware problem. Install the current "
+                   "Intel graphics driver and re-run the self-check "
+                   "(old drivers enumerate the GPU but cannot launch "
+                   "compute kernels).")
+        else:
+            if has_pre_arc_intel:
+                t.info("      This Intel GPU is pre-Arc (UHD / Iris / HD "
+                       "Graphics). The XPU edition requires an Intel Arc "
+                       "GPU -- a discrete A- or B-series card, or an "
+                       "Arc-based Core Ultra iGPU. NO driver update will "
+                       "enable it on this GPU: this machine cannot run "
+                       "the XPU edition.")
+            else:
+                t.info("      No Intel GPU is present: this machine "
+                       "cannot run the XPU edition.")
+            _point_to_matching_edition(t, has_nvidia, False, has_amd)
+    elif edition == "rocm":
+        if has_amd:
+            t.info("      An AMD GPU is present. Two requirements, both "
+                   "mandatory: AMD Software Adrenalin 26.2.2 or newer, "
+                   "AND a card ROCm supports on Windows (RDNA3 / RDNA4 "
+                   "-- e.g. RX 7700 XT and up, RX 9060 XT and up). On an "
+                   "older or unsupported Radeon, NO driver version will "
+                   "make this edition work.")
+        else:
+            t.info("      No AMD GPU is present: this machine cannot run "
+                   "the ROCm edition.")
+            _point_to_matching_edition(t, has_nvidia, has_arc, False)
+    elif edition == "cuda":
+        if has_nvidia:
+            t.info("      An NVIDIA GPU is present -- this is a DRIVER "
+                   "problem, not a hardware problem. Install the current "
+                   "NVIDIA driver and re-run the self-check.")
+        else:
+            t.info("      No NVIDIA GPU is present: this machine cannot "
+                   "run the NVIDIA edition.")
+            _point_to_matching_edition(t, False, has_arc, has_amd)
+
+
 def _check_torch(t: _Tally) -> str:
     t.info("-- torch / GPU --")
     try:
@@ -289,22 +414,39 @@ def _check_torch(t: _Tally) -> str:
             t.line("OK", f"fp16 matmul 1024x1024 ({extra} ms)")
         elif status == "matmulfail":
             t.line("OK", f"device 0: {name}")
-            t.line("FAIL", f"fp16 matmul on {name} ({extra}) -- device "
-                           f"enumerates but kernels do not launch")
+            # CM-132: WARN, not FAIL -- the install is sound; the driver
+            # vintage is the problem (field: Lunar Lake factory driver).
+            # A FAIL here made Apply-Patch refuse a good patch on a
+            # machine whose only sin was an old driver.
+            t.line("WARN", f"fp16 matmul on {name} ({extra}) -- the "
+                           f"device enumerates but kernels do not "
+                           f"launch. This is a driver-vintage problem, "
+                           f"not a bad install: update the GPU driver "
+                           f"and re-run the self-check.")
+            t.gpu_unusable = True
         else:
-            t.line("WARN", f"no {edition} device visible -- install is "
-                           f"intact but the GPU driver is missing, wrong, "
-                           f"or the card is absent")
+            t.line("WARN", f"no {edition} device visible -- the install "
+                           f"is intact but the pipeline cannot run here "
+                           f"as things stand")
+            t.gpu_unusable = True
+            _gpu_inventory_advice(t, edition)
     elif rc is None:
         t.line("WARN", f"device probe did not finish ({out}) -- treat as "
                        f"no device visible")
+        t.gpu_unusable = True
+        _gpu_inventory_advice(t, edition)
     else:
-        hint = (" (ROCm needs AMD Adrenalin 26.2.2+)"
-                if edition == "rocm" else "")
-        t.line("WARN", f"device probe CRASHED (exit {rc}) -- the {edition} "
-                       f"runtime aborted during GPU enumeration. That "
-                       f"usually means the GPU driver is missing or too "
-                       f"old{hint}. The install itself is intact.")
+        # CM-132: state the fact (the runtime aborted), then let the GPU
+        # inventory say whether a driver update can fix it or the
+        # hardware itself is the limit -- the old text asserted "driver
+        # missing or too old" even on machines with no eligible GPU.
+        t.line("WARN", f"device probe CRASHED (exit {rc}) -- the "
+                       f"{edition} runtime aborted during GPU "
+                       f"enumeration. The install itself is intact; "
+                       f"whether this machine can run at all is "
+                       f"assessed below.")
+        t.gpu_unusable = True
+        _gpu_inventory_advice(t, edition)
     return edition
 
 
@@ -466,13 +608,30 @@ def main() -> int:
     _check_weights(t)
     _check_config(t)
 
-    verdict = "FAIL" if t.fail else "PASS"
+    # CM-132: three verdicts, not two. A machine whose GPU cannot run
+    # this edition used to get a bare PASS -- true for the INSTALL,
+    # false for the user's actual question ("will it work?").
+    if t.fail:
+        verdict = "FAIL"
+    elif t.gpu_unusable:
+        verdict = "PASS (install intact) -- GPU NOT USABLE"
+    else:
+        verdict = "PASS"
     t.info(f"==== {verdict}  ({t.ok} ok, {t.skip} skipped, {t.warn} "
            f"warnings, {t.fail} failures) ====")
     if t.fail:
         t.info("A FAIL above means this install is broken -- reinstall or "
                "re-apply the patch. Warnings are environmental (driver/"
                "GPU) and do not indicate a bad install.")
+    elif t.gpu_unusable:
+        t.info("The install itself is sound (patch verification can "
+               "trust it), but video processing will NOT run on this "
+               "machine as it stands. See the '-- torch / GPU --' "
+               "section above for whether a driver update fixes that "
+               "or the hardware itself is the limit.")
+    # Exit code stays 0 for the GPU-unusable case ON PURPOSE:
+    # Apply-Patch treats non-zero as a failed patch, and a bench machine
+    # without the target GPU must still be able to verify an install.
     return 1 if t.fail else 0
 
 

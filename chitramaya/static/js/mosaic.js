@@ -157,6 +157,29 @@ setInterval(checkSessionStatus, 60_000);
 // ═════════════════════════════════════════════════════════════════════
 
 
+// Batch 54 (field, 2026-08-23): restore a saved model selection by FILENAME
+// when the exact path is not among the options. A config carried from
+// another machine (or an install moved to a new drive) stores the OTHER
+// box's absolute model paths -- exact match failed and the model fields sat
+// empty on first run even though the same model files existed locally.
+// Same model, new home: match on basename (case-insensitive, / or \).
+// Saving afterwards writes the local path and exact matching takes over.
+// Returns true if a match was applied. Used by fill() in
+// populateMosaicModelDropdowns() and by applyConfig() in params.js
+// (guarded with typeof, so script/config load order does not matter).
+function matchModelOptionByName(select, wantedPath) {
+  if (!select || !wantedPath) return false;
+  const base = String(wantedPath).split(/[\\/]/).pop().toLowerCase();
+  if (!base) return false;
+  const opt = [...select.options].find(o =>
+    o.value && o.value.split(/[\\/]/).pop().toLowerCase() === base);
+  if (!opt) return false;
+  select.value = opt.value;
+  console.log('[ChitraMaya] model restored by filename match:', base,
+              '(saved path pointed at another location)');
+  return true;
+}
+
 // ── Compiled-engine awareness (Max Clip defaulting/constraint) ────────────
 // Compiled clip sizes per restoration model, keyed by model path:
 //   { "<path>": { fp16: [60], fp32: [] }, ... }
@@ -322,6 +345,7 @@ async function populateMosaicModelDropdowns() {
   const restSel = document.getElementById('ctrlMosaicRestModel');
 
   function fill(select, items, savedValue) {
+    // (matchModelOptionByName below handles the cross-machine case.)
     if (!select) return;
     const prev = savedValue || select.value;
     // CM-102 (v1.50.00): a fresh install has NO models yet, and a bare
@@ -343,6 +367,8 @@ async function populateMosaicModelDropdowns() {
     // Restore previously chosen value if still available
     if (prev && [...select.options].some(o => o.value === prev)) {
       select.value = prev;
+    } else if (prev) {
+      matchModelOptionByName(select, prev);
     }
   }
 
@@ -700,7 +726,15 @@ function _pollMosaicProgress({onComplete, onError}) {
     const pct = prog.total > 0 ? Math.round((prog.frame / prog.total) * 100) : 0;
     progressBar.style.width = pct + '%';
     progressPercent.textContent = `${pct}% (${prog.frame}/${prog.total})`;
-    progressFps.textContent = `${prog.fps || '—'} fps`;
+    // CM-135: current + average fps, both measured over COMPLETED frames
+    // (restored + passthrough), so the number is delivered speed, not the
+    // decode/detect front racing ahead of restoration. 0 renders as 0.0
+    // (a window with no completions is real on chunked backends), and a
+    // numeric-always display keeps the row width stable (Batch 69 wobble
+    // fix, together with the wider modal + tabular digits in ui.html).
+    const _fpsTxt = (v) => (v == null ? '—' : Number(v).toFixed(1));
+    progressFps.textContent =
+      `${_fpsTxt(prog.fps)} fps (avg ${_fpsTxt(prog.fps_avg)})`;
     const det = prog.detections || 0;
     const res = prog.restorations || 0;
     const buf = prog.buffered || 0;
