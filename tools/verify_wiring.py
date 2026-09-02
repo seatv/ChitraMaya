@@ -49,7 +49,8 @@ def main() -> int:
         mask_preview=False,
         det_imgsz=736,               # Batch 17 — runtime Image Size dial
         vr_projection="fisheye",     # Batch 19 (CM-045) — VR Projection mode
-        secondary_restoration="rtx-2x",  # Batch 20 (CM-077) — secondary upscale
+        secondary_restoration="rtx-2x",
+        secondary_denoise="high",        # Batch 74 (CM-146) -- the hop Batch 70 missed  # Batch 20 (CM-077) — secondary upscale
         temporal_stability=2,            # Batch 26 (CM-078) — temporal stabilizer
     )
 
@@ -80,6 +81,7 @@ def main() -> int:
         "det_imgsz (Image Size dial)": (host.det_imgsz, 736),
         "vr_projection (CM-045 fisheye)": (host.vr_projection, "fisheye"),
         "secondary_restoration (CM-077 rtx-2x)": (host.secondary_restoration, "rtx-2x"),
+        "secondary_denoise (CM-146 high)": (host.secondary_denoise, "high"),
         "temporal_stability (CM-078 strength 2)": (host.temporal_stability, 2),
     }
 

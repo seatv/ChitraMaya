@@ -559,6 +559,7 @@ class SwapServer:
             int(mosaic_cfg.mosaic_censor_block),                 # censor block
             str(mosaic_cfg.mosaic_vr_projection),                # CM-045 (Batch 19)
             str(mosaic_cfg.mosaic_secondary),                    # CM-077 (Batch 20)
+            str(mosaic_cfg.mosaic_secondary_denoise),            # CM-146 (Batch 70)
             str(mosaic_cfg.mosaic_temporal_stability),           # CM-078 (Batch 26)
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
@@ -643,7 +644,8 @@ class SwapServer:
 
     def _mosaic_progress_cb(self, *, frame_num, total_frames, detections,
                             restorations, fps_win, fps_avg, buffered, mode,
-                            completed=None, finalize_est_s=0.0):
+                            completed=None, finalize_est_s=0.0,
+                            fps_stale_s=0.0):
         """Pipeline progress callback that writes into self._progress.
 
         CM-135 (Batch 69): fps_win/fps_avg now measure COMPLETED frames
@@ -677,6 +679,10 @@ class SwapServer:
             "ingested": int(frame_num),
             "fps": round(fps_win, 1),
             "fps_avg": round(fps_avg, 1),
+            # Batch 77: seconds since the held window value last refreshed
+            # (the pipeline holds the per-delivery-cycle rate between clip
+            # deliveries). The UI shows a refreshing marker when it ages.
+            "fps_stale": round(float(fps_stale_s or 0.0), 1),
             "eta": self._format_eta(remaining),
             "detections": int(detections),
             "restorations": int(restorations),
@@ -1875,10 +1881,19 @@ def api_list_mosaic_models():
             ext = p.suffix.lower()
             if ext == ".pt":
                 eng = _detection_engine_path(str(p))
+                _has_eng = bool(eng and os.path.isfile(eng))
                 detection.append({
                     "path": str(p).replace("\\", "/"),
                     "label": p.stem,
-                    "has_engine": bool(eng and os.path.isfile(eng)),
+                    "has_engine": _has_eng,
+                    # CM-148 (Batch 76): the imgsz the engine was compiled at
+                    # (None = unknown). The submit-time gate warns when this
+                    # differs from the Image Size dial -- previously the run
+                    # silently fell back to PyTorch with only a console line
+                    # (field case 2026-09-01: a 2h45m 5060 benchmark spent
+                    # 57 min detecting on PyTorch, engine 800 vs dial 640).
+                    "engine_imgsz": (_detection_engine_imgsz(eng)
+                                     if _has_eng else None),
                 })
             elif ext == ".pth":
                 mp = str(p)
@@ -2499,6 +2514,7 @@ def api_default_config():
         "ctrlMosaicSegMasks": m.mosaic_use_seg_masks,
         "ctrlMosaicRestTrt": m.mosaic_restoration_trt,
         "ctrlMosaicSecondary": m.mosaic_secondary,
+        "ctrlMosaicSecondaryDenoise": m.mosaic_secondary_denoise,  # CM-146
         "ctrlMosaicTemporalFix": str(m.mosaic_temporal_stability),
 
         # Batch folder (CM-079) — modal defaults. (Batch 23: the skip-existing

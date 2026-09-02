@@ -48,8 +48,54 @@ def _print_usage() -> None:
     print(USAGE)
 
 
+def _apply_cuda_alloc_conf() -> None:
+    """Batch 78 (CM-149): "cudaExpandableSegments": true in
+    ChitraMaya-config.json sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+    before torch makes its first CUDA allocation.
+
+    Field basis: ProblemChild 4K60 on a 6GB card OOM'd at frame 197,368
+    from allocator fragmentation; with expandable_segments it reached
+    281,512 (+43%). Users should not have to remember a per-machine env
+    var -- user knobs live in the config file (env-var doctrine). An env
+    var the user DID set explicitly is respected and never clobbered.
+
+    Must run before any subcommand touches torch/CUDA -- call first in
+    main(). Config anchoring mirrors the server: exe dir when frozen,
+    cwd when running from source."""
+    import json
+    import os
+    from pathlib import Path
+    try:
+        base = (Path(sys.executable).parent
+                if getattr(sys, "frozen", False) else Path.cwd())
+        cfg_file = base / "ChitraMaya-config.json"
+        if not cfg_file.exists():
+            return
+        flat = json.loads(cfg_file.read_text(encoding="utf-8"))
+        if not isinstance(flat, dict) or not flat.get("cudaExpandableSegments"):
+            return
+        cur = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments" in cur:
+            print("[Alloc] PYTORCH_CUDA_ALLOC_CONF already configures "
+                  "expandable_segments; leaving the environment as-is.")
+            return
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            (cur + "," if cur else "") + "expandable_segments:True")
+        print("[Alloc] CUDA expandable_segments ENABLED "
+              "(cudaExpandableSegments in ChitraMaya-config.json) -- "
+              "reduces allocator fragmentation on long runs.")
+    except Exception:
+        # A malformed config must never block launch; self-check reports
+        # JSON validity separately.
+        pass
+
+
 def main() -> int:
     args = sys.argv[1:]
+
+    # Batch 78 (CM-149): allocator config BEFORE any torch/CUDA touch --
+    # applies to the UI server, -restore CLI, and both compile paths.
+    _apply_cuda_alloc_conf()
 
     # Subcommand dispatch first — help, restore, compile.
     if args and args[0] in ("-h", "--help", "help"):

@@ -76,6 +76,7 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicSbsSplit', 'ctrlMosaicVrProjection',
   'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
   'ctrlMosaicSecondary',
+  'ctrlMosaicSecondaryDenoise',  // Batch 74 (CM-146 fix): was missing -- Save/Load Settings silently reset denoise to none
   'ctrlMosaicTemporalFix',
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
   'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
@@ -190,6 +191,8 @@ let _mosaicRestEngines = {};
 //   { "<path>": true|false }  (true = models/engines/<stem>.engine exists)
 // Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
 let _mosaicDetEngines = {};
+// CM-148 (Batch 76): compiled imgsz per detection model (null = unknown).
+let _mosaicDetEngineImgsz = {};
 
 // Max Clip range when TRT is NOT constraining it. Batch 42: on the
 // PyTorch path the clip now feeds BasicVSR++ whole (lada semantics --
@@ -256,43 +259,75 @@ async function _refreshEngineCaches() {
     if (item.engines) _mosaicRestEngines[item.path] = item.engines;
   }
   _mosaicDetEngines = {};
+  _mosaicDetEngineImgsz = {};
   for (const item of data.detection || []) {
     _mosaicDetEngines[item.path] = !!item.has_engine;
+    _mosaicDetEngineImgsz[item.path] =
+      (item.engine_imgsz == null ? null : Number(item.engine_imgsz));
   }
 }
 
 // Custom in-app modal (no window.confirm — OS-inconsistent). Resolves to
 // 'continue' (run missing stages on PyTorch) or 'manage' (abort; opens Manage
 // Models). Dismiss via backdrop = 'manage' (safe: abort).
-function showTensorModal(missing) {
+function showTensorModal(missing, mismatch) {
   return new Promise((resolve) => {
     const overlay = document.getElementById('tensorModal');
+    const titleEl = document.getElementById('tensorModalTitle');
     const msgEl = document.getElementById('tensorModalMessage');
     const contBtn = document.getElementById('tensorModalContinue');
     const mngBtn = document.getElementById('tensorModalManage');
-    const stages = missing.map(k => k === 'det' ? 'detection' : 'restoration').join(' and ');
-    const slow = missing.includes('rest')
-      ? ' Restoration on PyTorch is much slower (it is the main bottleneck).'
-      : '';
-    msgEl.textContent =
-      'No compiled TensorRT engine was found for the ' + stages +
-      ' model at the current settings.\n\nContinue on PyTorch for the ' + stages +
-      ' stage, or open Manage Models to compile?' + slow;
+    const engBtn = document.getElementById('tensorModalEngineSize');
+
+    if (mismatch) {
+      // CM-148 (Batch 76): engine exists but was compiled at a different
+      // Image Size than the dial. Previously this ran the ENTIRE job on
+      // PyTorch detection with only a console line -- a 2h45m benchmark
+      // spent 57 min detecting on PyTorch before anyone noticed.
+      if (titleEl) titleEl.textContent = 'TensorRT engine size mismatch';
+      msgEl.textContent =
+        'The compiled detection engine was built at Image Size ' +
+        mismatch.have + ', but the dial is set to ' + mismatch.want +
+        '.\n\nUse engine size runs this job at ' + mismatch.have +
+        ' with TensorRT (fast; detection behavior matches the compiled ' +
+        'size). Continue on PyTorch keeps ' + mismatch.want +
+        ' but detection runs without TensorRT (slower). Manage Models ' +
+        'aborts so you can recompile at ' + mismatch.want + '.';
+      if (engBtn) {
+        engBtn.textContent = 'Use engine size (' + mismatch.have + ')';
+        engBtn.classList.remove('hidden');
+      }
+    } else {
+      if (titleEl) titleEl.textContent = 'TensorRT engine not found';
+      const stages = missing.map(k => k === 'det' ? 'detection' : 'restoration').join(' and ');
+      const slow = missing.includes('rest')
+        ? ' Restoration on PyTorch is much slower (it is the main bottleneck).'
+        : '';
+      msgEl.textContent =
+        'No compiled TensorRT engine was found for the ' + stages +
+        ' model at the current settings.\n\nContinue on PyTorch for the ' + stages +
+        ' stage, or open Manage Models to compile?' + slow;
+      if (engBtn) engBtn.classList.add('hidden');
+    }
     overlay.classList.remove('hidden');
 
     function cleanup(result) {
       overlay.classList.add('hidden');
+      if (engBtn) engBtn.classList.add('hidden');
       contBtn.removeEventListener('click', onCont);
       mngBtn.removeEventListener('click', onMng);
+      if (engBtn) engBtn.removeEventListener('click', onEng);
       overlay.removeEventListener('click', onBackdrop);
       resolve(result);
     }
     function onCont() { cleanup('continue'); }
     function onMng() { cleanup('manage'); }
+    function onEng() { cleanup('engine-size'); }
     function onBackdrop(e) { if (e.target === overlay) cleanup('manage'); }
 
     contBtn.addEventListener('click', onCont);
     mngBtn.addEventListener('click', onMng);
+    if (engBtn) engBtn.addEventListener('click', onEng);
     overlay.addEventListener('click', onBackdrop);
   });
 }
@@ -314,16 +349,56 @@ async function checkTensorBeforeRun() {
       && !_tensorEngineAvailable('rest')) {
     missing.push('rest');
   }
-  if (missing.length === 0) return { proceed: true, override: null };
+  // CM-148 (Batch 76): the engine may EXIST but be compiled at a different
+  // Image Size than the dial -- the server then silently runs detection on
+  // PyTorch. Surface it here, at submit time, like a missing engine.
+  let mismatch = null;
+  if (!missing.includes('det')
+      && document.getElementById('ctrlMosaicDetTrt').checked) {
+    const mv = document.getElementById('ctrlMosaicDetModel').value;
+    const dial = parseInt(
+      (document.getElementById('ctrlMosaicDetImgsz') || {}).value || '640', 10);
+    const eng = (mv && !/\.engine$/i.test(mv)) ? _mosaicDetEngineImgsz[mv] : null;
+    if (eng != null && Number.isFinite(dial) && eng !== dial) {
+      mismatch = { want: dial, have: eng };
+    }
+  }
 
-  const choice = await showTensorModal(missing);
-  if (choice === 'continue') {
+  if (missing.length === 0 && !mismatch) return { proceed: true, override: null };
+
+  if (missing.length > 0) {
+    const choice = await showTensorModal(missing);
+    if (choice !== 'continue') {
+      const b = document.getElementById('manageModelsBtn');
+      if (b) b.click();
+      return { proceed: false, override: null };
+    }
     return {
       proceed: true,
       override: { det: missing.includes('det'), rest: missing.includes('rest') },
     };
   }
-  // 'manage' -> abort now; Manage Models modal lands in a later increment.
+
+  // Pure imgsz mismatch (engine present, wrong size).
+  const choice = await showTensorModal([], mismatch);
+  if (choice === 'engine-size') {
+    // Snap the dial to the engine's compiled size so the run keeps TRT and
+    // the UI honestly shows the size that will execute.
+    const dialEl = document.getElementById('ctrlMosaicDetImgsz');
+    if (dialEl) {
+      dialEl.value = String(mismatch.have);
+      dialEl.dispatchEvent(new Event('input', { bubbles: true }));
+      dialEl.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    // Callers gathered params BEFORE this gate ran -- hand the size back so
+    // they can patch the already-built payload.
+    return { proceed: true, override: null, imgsz: mismatch.have };
+  }
+  if (choice === 'continue') {
+    // Keep the dial size; force detection onto PyTorch for this run so the
+    // outcome matches what the user just approved.
+    return { proceed: true, override: { det: true, rest: false } };
+  }
   const b = document.getElementById('manageModelsBtn');
   if (b) b.click();
   return { proceed: false, override: null };
@@ -380,8 +455,11 @@ async function populateMosaicModelDropdowns() {
 
   // Cache detection engine availability for the Use Tensor toggle.
   _mosaicDetEngines = {};
+  _mosaicDetEngineImgsz = {};  // CM-148 (Batch 76)
   for (const item of data.detection || []) {
     _mosaicDetEngines[item.path] = !!item.has_engine;
+    _mosaicDetEngineImgsz[item.path] =
+      (item.engine_imgsz == null ? null : Number(item.engine_imgsz));
   }
 
   // Restore the config's saved model selections (see applyConfig): stashed so
@@ -451,6 +529,8 @@ function gatherMosaicParams() {
       mosaic_restoration_trt: document.getElementById('ctrlMosaicRestTrt').checked,
       // CM-077: secondary restoration (RTX Super-Res upscale before paste-back)
       mosaic_secondary: ((document.getElementById('ctrlMosaicSecondary') || {}).value || 'none'),
+      // CM-146 (Batch 70): Maxine denoise pass chained after the RTX upscale
+      mosaic_secondary_denoise: ((document.getElementById('ctrlMosaicSecondaryDenoise') || {}).value || 'none'),
       mosaic_temporal_stability: parseInt((document.getElementById('ctrlMosaicTemporalFix') || {}).value || '0', 10) || 0,
       // CM-084 (Batch 38): FrameStore backend (auto | device | host)
       mosaic_store_backend: ((document.getElementById('ctrlStoreBackend') || {}).value || 'auto'),
@@ -479,6 +559,14 @@ function buildMosaicParamsSummary() {
     parts.push(`Clip: ${m.mosaic_max_clip_size}`);
     parts.push(m.mosaic_restoration_fp16 ? 'FP16' : 'FP32');
     parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
+    // Batch 73: surface the scaler + denoise in the progress-modal summary.
+    // Field case 2026-09-01: three denoise A/B runs went out with denoise
+    // silently defaulting to none and nothing on screen said so.
+    if (m.mosaic_secondary && m.mosaic_secondary !== 'none') {
+      parts.push(`Scaler:${m.mosaic_secondary}`
+        + ((m.mosaic_secondary_denoise && m.mosaic_secondary_denoise !== 'none')
+           ? `+dn:${m.mosaic_secondary_denoise}` : ''));
+    }
     if (m.mosaic_roi_dilate > 0) parts.push(`Dilate:${m.mosaic_roi_dilate}`);
     if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') parts.push(`Blend:${m.mosaic_blend_mask}`);
     // Feather only takes effect with the facefusion blend mask — only surface
@@ -733,8 +821,14 @@ function _pollMosaicProgress({onComplete, onError}) {
     // numeric-always display keeps the row width stable (Batch 69 wobble
     // fix, together with the wider modal + tabular digits in ui.html).
     const _fpsTxt = (v) => (v == null ? '—' : Number(v).toFixed(1));
+    // Batch 77: the current value is the last delivery-cycle rate, HELD
+    // between clip deliveries (chunked TRT delivers in bursts; a per-emit
+    // window read 0.0 almost always). When the held value is older than a
+    // few seconds, mark it as refreshing so a long clip in progress (or a
+    // genuine stall) is visible without lying about the number.
+    const _stale = Number(prog.fps_stale || 0) > 5 ? '…' : '';
     progressFps.textContent =
-      `${_fpsTxt(prog.fps)} fps (avg ${_fpsTxt(prog.fps_avg)})`;
+      `${_fpsTxt(prog.fps)}${_stale} fps (avg ${_fpsTxt(prog.fps_avg)})`;
     const det = prog.detections || 0;
     const res = prog.restorations || 0;
     const buf = prog.buffered || 0;
@@ -742,6 +836,17 @@ function _pollMosaicProgress({onComplete, onError}) {
       `ETA: ${prog.eta || '—'} | ${det} det, ${res} res, buf=${buf}`;
 
     if (prog.status === 'complete') {
+      // Batch 71: honest FINAL readout. The last live window is often
+      // legitimately 0.0 fps (the tail frames were delivered before the
+      // final poll), so the closing display substitutes the run average
+      // as the headline number when current is zero/absent. The ETA is
+      // meaningless on a finished run and was going stale ("ETA: 14s"
+      // on a done job, field 2026-09-01) -- replace it with the final
+      // counts only.
+      const _fin = (Number(prog.fps) > 0) ? prog.fps : prog.fps_avg;
+      progressFps.textContent =
+        `${_fpsTxt(_fin)} fps (avg ${_fpsTxt(prog.fps_avg)})`;
+      progressEta.textContent = `${det} det, ${res} res`;
       onComplete(prog);
     } else if (prog.status === 'error' || prog.status === 'cancelled' ||
                prog.status === 'partial') {
@@ -788,6 +893,9 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
     if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
     if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
   }
+  // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
+  // compiled Image Size (params were gathered before the gate snapped the dial).
+  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
 
   const result = await apiPost('/api/mosaic-segment', {
     params, start_time: startTime, end_time: endTime,
@@ -870,6 +978,9 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
     if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
     if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
   }
+  // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
+  // compiled Image Size (params were gathered before the gate snapped the dial).
+  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
 
   const result = await apiPost('/api/mosaic-full', { params });
   if (result.error) {
@@ -1084,6 +1195,8 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
       if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
       if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
     }
+    // CM-148 (Batch 76): honor "Use engine size" (see segment handler).
+    if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
 
     const result = await apiPost('/api/mosaic-folder', { params });
     if (result.error) { alert('Failed to start: ' + result.error); return; }
@@ -1605,7 +1718,9 @@ function _foiRunTag(params) {
   const parts = [];
   parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
   if (m.mosaic_secondary && m.mosaic_secondary !== 'none') {
-    parts.push('Scaler:' + m.mosaic_secondary);
+    parts.push('Scaler:' + m.mosaic_secondary
+      + ((m.mosaic_secondary_denoise && m.mosaic_secondary_denoise !== 'none')
+         ? ('+dn:' + m.mosaic_secondary_denoise) : ''));
   }
   if (m.mosaic_temporal_stability > 0) parts.push('TS:' + m.mosaic_temporal_stability);
   if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') {
@@ -1742,6 +1857,9 @@ async function runFoiPreview() {
     if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
     if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
   }
+  // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
+  // compiled Image Size (params were gathered before the gate snapped the dial).
+  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
 
   // The button itself is the working indicator — no modal, no poll — so the
   // images (strip + open enlarge) stay put and your eye keeps its reference for

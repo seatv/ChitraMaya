@@ -140,6 +140,10 @@ class MosaicConfig:
     # regions larger than the 256 clip size are downscaled into place instead
     # of stretched. Real restoration mode only; needs an RTX GPU + nvidia-vfx.
     mosaic_secondary: str = "none"
+    # Batch 70 (CM-146): Maxine denoise pass chained after the RTX
+    # secondary's upscale (none|low|medium|high|ultra). RTX modes only;
+    # ignored by the Real-ESRGAN secondary.
+    mosaic_secondary_denoise: str = "none"
 
     # CM-078: temporal stabilization of restored crops (vs_temporalfix).
     # 0 = off, 1..3 = strength (higher = more aggressive smoothing).
@@ -208,6 +212,7 @@ class MosaicConfig:
             sbs_det_split=bool(self.mosaic_sbs_split),
             vr_projection=str(self.mosaic_vr_projection or "none").lower(),
             secondary_restoration=str(self.mosaic_secondary or "none").lower(),
+            secondary_denoise=str(self.mosaic_secondary_denoise or "none").lower(),
             temporal_stability=int(self.mosaic_temporal_stability or 0),
             store_backend=str(self.mosaic_store_backend or "auto").lower(),
             codec=str(enc.get("codec", "hevc")),

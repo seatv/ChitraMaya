@@ -44,6 +44,16 @@ import torch.nn.functional as F
 # (see esrgan_secondary.py; the rtx-* modes remain NVIDIA/Maxine).
 SECONDARY_MODES = ("none", "rtx-2x", "rtx-4x", "esrgan-4x")
 
+# Batch 70 (CM-146): Maxine DENOISE pass chained after the upscale. Field
+# origin: Quest-3 side-by-side flips showed jasna's pasted regions cleaner
+# than ours on the SAME secondary; their source (jasna 0.10.0
+# rtx_superres_secondary_restorer.py, AGPL-3.0, Kruk2 -- approach ported
+# with credit, same basis as the CM-104 sub-engines) revealed why: nvvfx's
+# VideoSuperRes has DENOISE_LOW/MEDIUM/HIGH/ULTRA quality levels we never
+# used, and jasna chains a SECOND VideoSuperRes effect in DENOISE mode
+# (their default: medium) after the upscale, before paste-back.
+SECONDARY_DENOISE_MODES = ("none", "low", "medium", "high", "ultra")
+
 _QUALITY = "high"          # matches the field-validated probe configuration
 _INPUT_SIZE = 256          # must equal restoration clip_size; enforced by caller
 
@@ -181,7 +191,8 @@ class RtxSecondaryRestorer:
     """
 
     def __init__(self, *, device: torch.device, scale: int = 2,
-                 input_size: int = _INPUT_SIZE) -> None:
+                 input_size: int = _INPUT_SIZE,
+                 denoise: str = "none") -> None:
         if scale not in (2, 4):
             raise ValueError(f"scale must be 2 or 4, got {scale}")
         if int(input_size) != _INPUT_SIZE:
@@ -209,6 +220,31 @@ class RtxSecondaryRestorer:
         self._sr.output_width = self.out_size
         self._sr.output_height = self.out_size
         self._sr.load()
+
+        # Batch 70 (CM-146): optional Maxine DENOISE pass chained after the
+        # upscale (jasna's approach, ported with credit -- see the module
+        # comment above SECONDARY_DENOISE_MODES). A second VideoSuperRes
+        # effect running one of the DENOISE_x quality levels at out_size ->
+        # out_size. Costs a second loaded Maxine effect (~VRAM footprint of
+        # the first) -- on 6GB cards weigh it against the run's headroom.
+        self.denoise = str(denoise or "none").lower()
+        self._dn = None
+        if self.denoise != "none":
+            dmap = {
+                "low": VideoSuperRes.QualityLevel.DENOISE_LOW,
+                "medium": VideoSuperRes.QualityLevel.DENOISE_MEDIUM,
+                "high": VideoSuperRes.QualityLevel.DENOISE_HIGH,
+                "ultra": VideoSuperRes.QualityLevel.DENOISE_ULTRA,
+            }
+            if self.denoise not in dmap:
+                raise ValueError(f"unknown secondary denoise {self.denoise!r} "
+                                 f"(expected one of {SECONDARY_DENOISE_MODES})")
+            self._dn = VideoSuperRes(device=(self.device.index or 0),
+                                     quality=dmap[self.denoise])
+            self._dn.output_width = self.out_size
+            self._dn.output_height = self.out_size
+            self._dn.load()
+
         self._layout: Optional[str] = None  # resolved on first frame
         self.stats = SecondaryStats()  # CM-077b: run instrumentation
         _LIVE_SECONDARIES.add(self)  # released at exit (nanobind audit)
@@ -248,6 +284,12 @@ class RtxSecondaryRestorer:
         # BGR u8 HWC -> RGB float [0,1] HWC (Maxine is trained on RGB video)
         rgb = x[..., [2, 1, 0]].to(torch.float32).div_(255.0).contiguous()
         out = self._run(rgb)
+        # Batch 70 (CM-146): chained Maxine DENOISE pass on the upscaled
+        # crop, fed the effect output as-is (same layout in/out -- jasna's
+        # field-proven chaining, no relayout between effects).
+        if self._dn is not None:
+            out = torch.from_dlpack(
+                self._dn.run(out.contiguous(), stream_ptr=self._stream_ptr).image).clone()
         # Normalize output to HWC
         if out.ndim == 3 and out.shape[0] in (1, 3):
             out = out.permute(1, 2, 0)
@@ -264,6 +306,12 @@ class RtxSecondaryRestorer:
             except Exception:
                 pass
             self._sr = None
+        if getattr(self, "_dn", None) is not None:  # Batch 70 (CM-146)
+            try:
+                self._dn.close()
+            except Exception:
+                pass
+            self._dn = None
 
 
 class InterpSecondaryRestorer:
@@ -298,6 +346,7 @@ class InterpSecondaryRestorer:
 
 __all__ = [
     "SECONDARY_MODES",
+    "SECONDARY_DENOISE_MODES",
     "RtxSecondaryRestorer",
     "InterpSecondaryRestorer",
     "SecondaryStats",

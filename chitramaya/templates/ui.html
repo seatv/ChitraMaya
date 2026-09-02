@@ -309,6 +309,17 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
+                      title="Extra cleanup pass on upscaled regions (RTX Super-Res modes only; Real-ESRGAN is unaffected). Chains a second Maxine pass in DENOISE mode after the upscale, so pasted regions come back cleaner - most visible on large regions and in VR viewing. Loads a second Maxine effect (extra VRAM) - on 6 GB cards weigh it against the run's headroom. Approach ported from jasna (AGPL), with credit.">Scaler Denoise</span>
+                <select class="ctrl-select" id="ctrlMosaicSecondaryDenoise">
+                  <option value="none" selected>Off</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="ultra">Ultra</option>
+                </select>
+              </div>
+              <div class="ctrl-row">
+                <span class="ctrl-label"
                       title="Smooths per-frame restoration/upscale shimmer (fizzle, wiggly fine detail) by averaging each restored frame with its 6 temporal neighbors where the content agrees - real motion and lighting changes pass through untouched. Runs on restored regions only; the rest of the frame is never modified. Uses the vs_temporalfix model (tiny, ~2 MB); needs its .pth weights next to the restoration model or in models/. Higher strength = more aggressive smoothing; too high may soften very small movements. Real restoration only.">Temporal Fix</span>
                 <select class="ctrl-select" id="ctrlMosaicTemporalFix">
                   <option value="0" selected>Off</option>
@@ -709,6 +720,9 @@
     <div class="modal-message" id="tensorModalMessage"></div>
     <div class="modal-buttons">
       <button class="modal-btn modal-btn-cancel" id="tensorModalManage">Manage Models</button>
+      <!-- CM-148 (Batch 76): shown only on an imgsz mismatch -- runs this
+           job at the engine's compiled size so TRT detection is kept. -->
+      <button class="modal-btn modal-btn-confirm hidden" id="tensorModalEngineSize">Use engine size</button>
       <button class="modal-btn modal-btn-confirm" id="tensorModalContinue">Continue on PyTorch</button>
     </div>
   </div>

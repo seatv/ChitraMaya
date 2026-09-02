@@ -249,6 +249,13 @@ def create_parser() -> argparse.ArgumentParser:
                         "larger than the 256 clip size. Needs an RTX GPU, a recent "
                         "driver, and 'pip install nvidia-vfx'; ~1.5 GB extra VRAM. "
                         "Falls back gracefully if unavailable.")
+    p.add_argument("--secondary-denoise",
+                   choices=["none", "low", "medium", "high", "ultra"],
+                   default=None,
+                   help="CM-146: Maxine DENOISE pass chained after the RTX "
+                        "secondary's upscale (cleaner pasted regions; approach "
+                        "ported from jasna, AGPL). RTX modes only -- ignored by "
+                        "esrgan-4x. Loads a second Maxine effect (extra VRAM).")
     p.add_argument("--temporal-stability", type=int, choices=[0, 1, 2, 3], default=None,
                    help="CM-078: temporal stabilization of restored crops "
                         "(vs_temporalfix): 0=off (default), 1..3=strength. Needs the "
@@ -399,6 +406,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cfg.set("sbs_det_split", value=False)
     _set_if_not_none(cfg, ("vr_projection",), args.vr_projection)
     _set_if_not_none(cfg, ("secondary_restoration",), args.secondary_restoration)
+    _set_if_not_none(cfg, ("secondary_denoise",),
+                     getattr(args, "secondary_denoise", None))
     _set_if_not_none(cfg, ("temporal_stability",), args.temporal_stability)
 
     # Detector Switch (CLI overrides config/default)

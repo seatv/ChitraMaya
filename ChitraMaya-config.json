@@ -1,12 +1,12 @@
 {
-  "outputDir": "",
+  "outputDir": "D:\\Results\\DeNoise",
   "tempDir": "",
   "ctrlCodec": "hevc",
   "ctrlPreset": "P5",
   "ctrlQP": "18",
   "skipBackward": "5",
   "skipForward": "5",
-  "ctrlMosaicDetModel": "",
+  "ctrlMosaicDetModel": "D:/MyProjects/chitramaya/models/lada_mosaic_detection_model_v4_accurate.pt",
   "ctrlMosaicDetScore": "25",
   "ctrlMosaicDetIou": "70",
   "ctrlMosaicDetBatch": "4",
@@ -15,10 +15,10 @@
   "ctrlMosaicDetTrt": true,
   "ctrlMosaicSbsSplit": false,
   "ctrlMosaicVrProjection": "none",
-  "ctrlMosaicRestModel": "",
+  "ctrlMosaicRestModel": "D:/MyProjects/chitramaya/models/lada_mosaic_restoration_model_generic_v1.2.pth",
   "ctrlMosaicMaxClip": "90",
   "ctrlMosaicRestFp16": true,
-  "ctrlMosaicSecondary": "none",
+  "ctrlMosaicSecondary": "rtx-4x",
   "ctrlMosaicTemporalFix": "0",
   "ctrlMosaicRoiDilate": "0",
   "ctrlMosaicFeather": "0",
@@ -33,5 +33,7 @@
   "ctrlAsyncEncoder": false,
   "ctrlStoreBackend": "auto",
   "debug": false,
-  "perf_test": false
+  "perf_test": false,
+  "facesDir": "",
+  "ctrlMosaicSecondaryDenoise": "ultra"
 }
