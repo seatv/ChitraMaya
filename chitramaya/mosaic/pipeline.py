@@ -591,6 +591,12 @@ class Pipeline:
         self._stabilizer = None
 
         from chitramaya.mosaic.restorer.rtx_secondary import SECONDARY_MODES
+        # Batch 70 (CM-146): optional Maxine denoise pass chained after the
+        # RTX secondary's upscale (jasna-ported approach; no effect on the
+        # Real-ESRGAN secondary).
+        self.secondary_denoise: str = str(
+            self.cfg.get("secondary_denoise", default="none") or "none"
+        ).strip().lower()
         if self.secondary_restoration not in SECONDARY_MODES:
             raise ValueError(
                 f"Invalid secondary_restoration: {self.secondary_restoration!r} "
@@ -1085,9 +1091,11 @@ class Pipeline:
                     self._secondary = RtxSecondaryRestorer(
                         device=self.device, scale=_sec_scale,
                         input_size=self.rest_clip_size,
+                        denoise=self.secondary_denoise,  # Batch 70 (CM-146)
                     )
                     print(f"[Secondary] RTX Super-Res ACTIVE: {_sec_scale}x "
-                          f"(256 -> {256 * _sec_scale}, quality=high). Restored regions "
+                          f"(256 -> {256 * _sec_scale}, quality=high, "
+                          f"denoise={self.secondary_denoise}). Restored regions "
                           f"larger than 256 px are upscaled before paste-back; smaller "
                           f"regions keep the standard path.")
                 except Exception as _sec_err:
@@ -1802,15 +1810,29 @@ class Pipeline:
                 _done = (len(metrics.frames_restored)
                          + int(metrics.early_passthrough_frames))
                 _done = min(_done, _pf)  # safety: never report ahead of ingest
-                # windowed fps: completed since last emit / wall since last emit
+                # Batch 77: windowed fps is measured PER DELIVERY CYCLE, not
+                # per emit. The chunked TRT path delivers in bursts (a full
+                # MCL clip lands at once), so per-emit windows read 0.0 for
+                # ~seconds then a huge spike for one poll -- the user only
+                # ever sees the zero (field request 2026-09-01). Instead:
+                # when new completions land, compute delta/dt since the LAST
+                # delivery and hold that value between deliveries. The held
+                # value is the true recent delivered throughput (~steady at
+                # ~avg for long clips). fps_stale_s says how old the held
+                # value is -- the UI marks it as refreshing when it ages.
                 _prev_f = getattr(self, "_pcb_prev_frames", 0)
                 _prev_t = getattr(self, "_pcb_prev_time", t0_all)
-                _dt_win = _now - _prev_t
-                _fps_win = ((_done - _prev_f) / _dt_win) if _dt_win > 1e-6 else 0.0
+                if _done > _prev_f:
+                    _dt_win = _now - _prev_t
+                    _fps_win = ((_done - _prev_f) / _dt_win) if _dt_win > 1e-6 else 0.0
+                    self._pcb_last_fps_win = _fps_win
+                    self._pcb_prev_frames = _done
+                    self._pcb_prev_time = _now
+                else:
+                    _fps_win = float(getattr(self, "_pcb_last_fps_win", 0.0))
+                _fps_stale_s = _now - float(getattr(self, "_pcb_prev_time", t0_all))
                 _dt_all = _now - t0_all
                 _fps_avg = (_done / _dt_all) if _dt_all > 1e-6 else 0.0
-                self._pcb_prev_frames = _done
-                self._pcb_prev_time = _now
                 # CM-135: finalize (video-container pass + remux) estimate for
                 # the ETA. Field data: SONE-174 (2h41m source) finalized in
                 # ~125s; short clips in ~5-10s -- ~1.3% of source duration
@@ -1829,6 +1851,7 @@ class Pipeline:
                         mode=str(_mode),
                         completed=int(_done),          # CM-135
                         finalize_est_s=float(_fin_est),  # CM-135
+                        fps_stale_s=float(_fps_stale_s),  # Batch 77
                     )
                 except TypeError:
                     # Older callback signature (no CM-135 kwargs) -- emit the
@@ -2556,6 +2579,13 @@ class Pipeline:
                         "trk_crop_quant_px": int(self.trk_crop_quant_px),
                         "trk_crop_sticky": bool(self.trk_crop_sticky),
                         "trk_match_pad_px": int(self.trk_match_pad_px),
+                        # Batch 72: echo the scaler + denoise so a misses
+                        # JSON is self-describing for A/B runs (field case
+                        # 2026-09-01: a denoise A/B ran with esrgan-4x,
+                        # where denoise does not apply, and nothing in the
+                        # report said which denoise setting was requested).
+                        "secondary_restoration": str(self.secondary_restoration),
+                        "secondary_denoise": str(getattr(self, "secondary_denoise", "none")),
                     },
                     "summary": {
                         "restored": int(fr),
@@ -2748,6 +2778,9 @@ class MosaicPipelineConfig:
     # CM-077: "none" | "rtx-2x" | "rtx-4x" — RTX Super-Res upscale of restored
     # crops before paste-back (real restoration mode only; needs nvidia-vfx).
     secondary_restoration: str = "none"
+    # CM-146 (Batch 70): Maxine DENOISE pass chained after the RTX upscale
+    # ("none"|"low"|"medium"|"high"|"ultra"); ignored by esrgan-4x.
+    secondary_denoise: str = "none"
     # CM-078: 0 = off, 1..3 = vs_temporalfix strength — temporal stabilization
     # of restored crops (7-frame window; real restoration mode only).
     temporal_stability: int = 0
@@ -2781,6 +2814,7 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "codec", "preset", "qp", "async_encoder", "write_diagnostics",
     "sbs_enabled", "sbs_layout",
     "sbs_det_split", "vr_projection", "secondary_restoration",
+    "secondary_denoise",
     "temporal_stability",
     "store_max_frames", "store_backend", "det_imgsz", "det_iou", "roi_dilate",
     "use_seg_masks", "feather_radius", "blendmask",
@@ -2869,6 +2903,14 @@ class MosaicPipeline:
             "sbs_det_split": bool(getattr(c, "sbs_det_split", False)),
             "vr_projection": str(getattr(c, "vr_projection", "none") or "none"),
             "secondary_restoration": str(getattr(c, "secondary_restoration", "none") or "none"),
+            # Batch 74 (CM-146 fix): Batch 70 wired secondary_denoise through
+            # models.py -> to_pipeline_config -> MosaicPipelineConfig -> the
+            # consumed-keys allowlist, and missed THIS hop -- the one translation
+            # the pipeline actually reads. cfg.get("secondary_denoise") therefore
+            # always returned its default ("none") in every environment. Field
+            # case 2026-09-01: four denoise A/B runs on the 3060 Ti all ran
+            # denoise=none with Ultra selected in the UI.
+            "secondary_denoise": str(getattr(c, "secondary_denoise", "none") or "none"),
             "temporal_stability": int(getattr(c, "temporal_stability", 0) or 0),
             "roi_dilate": int(getattr(c, "roi_dilate", 0)),
             "use_seg_masks": bool(getattr(c, "use_seg_masks", True)),
