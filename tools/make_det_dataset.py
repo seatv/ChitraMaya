@@ -1,5 +1,5 @@
 # tools/make_det_dataset.py
-"""CM-112 Phase-A PoC: generate a mosaic-detector training dataset (Batch T1).
+r"""CM-112 Phase-A PoC: generate a mosaic-detector training dataset (Batch T1).
 
 The founding method of this field, automated: because WE place the mosaic,
 the ground-truth boxes are exact -- no manual annotation, ever. Point this
@@ -199,8 +199,9 @@ def main() -> int:
     print(f"[dataset] DONE: {n_img} images ({n_clean} clean negatives), "
           f"{n_boxes} mosaic boxes -> {out}")
     print(f"[dataset] data.yaml: {yaml_path}")
-    print("[dataset] next: python tools/train_det_poc.py --data "
-          f"{yaml_path}")
+    # Batch 81: speak the app's language -- frozen users have no python or
+    # tools/ tree; the subcommand works identically from source and exe.
+    print(f"[dataset] next: ChitraMaya -train-det --data {yaml_path}")
     return 0
 
 

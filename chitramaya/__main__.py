@@ -29,6 +29,10 @@ Usage:
   ChitraMaya -restore     [opts]   Run the mosaic-restoration CLI
   ChitraMaya -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
   ChitraMaya -compile-det  [opts]  Build/rebuild the YOLO detection engine
+  ChitraMaya -make-dataset [opts]  Build a mosaic-detector training dataset
+  ChitraMaya -train-det    [opts]  Train a mosaic detector on such a dataset
+  ChitraMaya -make-pairs   [opts]  Build restorer training pairs from pristine video
+  ChitraMaya -train-rest   [opts]  Fine-tune the BasicVSR++ restorer on such pairs
   ChitraMaya -self-check           Verify this install (imports, GPU, ffmpeg)
   ChitraMaya -h | --help           Show this help
 
@@ -97,6 +101,14 @@ def main() -> int:
     # applies to the UI server, -restore CLI, and both compile paths.
     _apply_cuda_alloc_conf()
 
+    # CM-141 (training sprint, Batch 79): ultralytics must NEVER self-install
+    # packages -- inside a frozen app it tries `ChitraMaya.exe -m pip`
+    # (witnessed in the field), which is nonsense and can wedge a run.
+    # Set unconditionally at entry: harmless from source, essential frozen.
+    # A user who explicitly set it keeps their value.
+    import os as _os
+    _os.environ.setdefault("YOLO_AUTOINSTALL", "false")
+
     # Subcommand dispatch first — help, restore, compile.
     if args and args[0] in ("-h", "--help", "help"):
         _print_usage()
@@ -130,6 +142,30 @@ def main() -> int:
         sys.argv = ["ChitraMaya -compile-det"] + args[1:]
         from tools.compile_yolo import main as compile_det_main
         return int(compile_det_main() or 0)
+
+    # CM-112 training subcommands (Batch 79): same shape as the compile
+    # paths -- thin dispatch onto the proven Phase-A tools, so the UI can
+    # run them as child processes exactly like -compile-det.
+    if args and args[0] in ("-make-dataset", "--make-dataset"):
+        sys.argv = ["ChitraMaya -make-dataset"] + args[1:]
+        from tools.make_det_dataset import main as make_dataset_main
+        return int(make_dataset_main() or 0)
+
+    if args and args[0] in ("-train-det", "--train-det"):
+        sys.argv = ["ChitraMaya -train-det"] + args[1:]
+        from tools.train_det_poc import main as train_det_main
+        return int(train_det_main() or 0)
+
+    # CM-112 Phase C (Batch T3): restorer pairs + fine-tune, same dispatch shape.
+    if args and args[0] in ("-make-pairs", "--make-pairs"):
+        sys.argv = ["ChitraMaya -make-pairs"] + args[1:]
+        from tools.make_rest_pairs import main as make_pairs_main
+        return int(make_pairs_main() or 0)
+
+    if args and args[0] in ("-train-rest", "--train-rest"):
+        sys.argv = ["ChitraMaya -train-rest"] + args[1:]
+        from tools.train_rest_poc import main as train_rest_main
+        return int(train_rest_main() or 0)
 
     if args and args[0] == "-self-check-devprobe":
         # Internal (Batch 34 r2): child-process half of the self-check's

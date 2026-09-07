@@ -966,6 +966,14 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 }
 .modal-overlay.hidden { display: none; }
 
+/* Batch 84b: GENERIC hidden utility. Until now .hidden only worked on the
+   handful of selectors above, so class="hidden" on anything else silently
+   did nothing (field find 2026-09-03: the training modal's custom-base
+   path input showed when it should not, and B76's "Use engine size"
+   button had the same latent bug). Every .hidden in the codebase means
+   "display: none" -- make the class say so everywhere. */
+.hidden { display: none !important; }
+
 .modal {
   background: var(--surface);
   border: 1px solid var(--border);

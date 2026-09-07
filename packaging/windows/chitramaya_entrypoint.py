@@ -8,6 +8,8 @@
 # package context intact.
 from __future__ import annotations
 
+import multiprocessing
+
 
 def main() -> int:
     from chitramaya.__main__ import main as _main
@@ -15,4 +17,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Batch 80 (CM-112 sprint): REQUIRED for ultralytics training in the
+    # frozen app. Windows multiprocessing spawns dataloader workers by
+    # re-executing this exe with "--multiprocessing-fork parent_pid=...";
+    # without freeze_support() that child falls into the normal argv
+    # dispatch and dies on the UI argparse (field: first frozen -train-det,
+    # 2026-09-02). freeze_support() intercepts the handshake and turns the
+    # child into a worker; it is a no-op in every other invocation.
+    multiprocessing.freeze_support()
     raise SystemExit(main())

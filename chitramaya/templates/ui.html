@@ -190,6 +190,9 @@
       <div class="controls-header"
            style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
         <span>Controls</span>
+        <button class="header-btn" id="trainingBtn"
+                title="Train your own mosaic detector on your videos (CM-112). Content never leaves this machine; only weights are shareable."
+                style="text-transform:none; letter-spacing:0; font-size:11px; padding:2px 8px;">Training</button>
         <button class="header-btn" id="manageModelsBtn"
                 title="Download and compile detection / restoration models (coming soon)"
                 style="text-transform:none; letter-spacing:0; font-size:11px; padding:2px 8px;">Manage Models</button>
@@ -941,12 +944,138 @@
   <pre id="cdBody"></pre>
 </div>
 
+<!-- ── CM-112 Training Modal (Batch 83): Dataset Builder + Train Detector ── -->
+<style>
+  #trainingModal .modal { width: min(980px, 94vw); max-width: min(980px, 94vw); }
+  #trainingModal .tr-section { border: 1px solid #333; border-radius: 6px;
+    padding: 10px 12px; margin-top: 10px; }
+  #trainingModal .tr-section-title { font-weight: 600; margin-bottom: 6px; }
+  #trainingModal .tr-note { opacity: 0.75; font-size: 11px; margin-top: 4px; }
+  #trainingModal .tr-row { display: flex; align-items: center; gap: 8px;
+    margin-top: 6px; }
+  #trainingModal .tr-row .ctrl-label { min-width: 130px; }
+  #trainingModal .tr-video-list { width: 100%; min-height: 72px;
+    background: #1b1b22; color: #ddd; border: 1px solid #333; }
+  #trainingModal #trLog { background: #14141a; color: #cfcfd6;
+    border: 1px solid #333; padding: 8px; height: 180px; overflow: auto;
+    font-family: Consolas, monospace; font-size: 11px; white-space: pre-wrap;
+    margin-top: 8px; user-select: text; }
+  #trainingModal .tr-bar-track { background: #2a2a33; border-radius: 4px;
+    height: 8px; margin-top: 8px; overflow: hidden; }
+  #trainingModal .tr-bar-fill { background: #8b5cf6; height: 100%;
+    width: 0%; transition: width 0.4s; }
+</style>
+<div class="modal-overlay hidden" id="trainingModal">
+  <div class="modal">
+    <div class="modal-title">Training — Detector (CM-112)</div>
+    <div class="modal-message">
+      Train a mosaic detector on <b>your</b> videos. Everything runs locally:
+      your content never leaves this machine. Only the trained WEIGHTS
+      (a .pt file) are ever shareable.
+    </div>
+
+    <div class="tr-section">
+      <div class="tr-section-title">1 &middot; Build Dataset</div>
+      <div class="tr-row">
+        <span class="ctrl-label">Source videos</span>
+        <button class="modal-btn" id="trAddVideoBtn"
+                title="Add a source video (repeat for more)">Add Video...</button>
+        <button class="modal-btn" id="trRemoveVideoBtn"
+                title="Remove the selected video from the list">Remove</button>
+      </div>
+      <select id="trVideoList" class="tr-video-list" multiple
+              title="Videos the dataset will be sampled from"></select>
+      <div class="tr-row">
+        <span class="ctrl-label" title="Frames sampled per video">Samples / video</span>
+        <input type="number" class="ctrl-input" id="trFrames" value="400"
+               min="20" max="5000" style="width:90px;">
+        <span class="ctrl-label" style="text-align:right;" title="Percent of frames kept clean (no mosaic) as negative samples">Negatives %</span>
+        <input type="number" class="ctrl-input" id="trNegPct" value="15"
+               min="0" max="60" style="width:70px;">
+      </div>
+      <div class="tr-row">
+        <span class="ctrl-label">Dataset folder</span>
+        <input type="text" class="ctrl-input" id="trOutDir" style="flex:1;"
+               placeholder="e.g. D:\Training\ds1">
+        <button class="modal-btn" id="trOutBrowseBtn">Browse...</button>
+      </div>
+      <div class="tr-note">Texture gate is always ON: flat regions (where
+        mosaic would be invisible) are rejected automatically -- this
+        protects label quality and has no off switch.</div>
+      <div class="tr-row" style="justify-content:flex-end;">
+        <button class="modal-btn modal-btn-confirm" id="trBuildBtn">Build Dataset</button>
+      </div>
+    </div>
+
+    <div class="tr-section">
+      <div class="tr-section-title">2 &middot; Train Detector</div>
+      <div class="tr-row">
+        <span class="ctrl-label" title="Path to the dataset's data.yaml (filled automatically after a build)">data.yaml</span>
+        <input type="text" class="ctrl-input" id="trDataYaml" style="flex:1;"
+               placeholder="filled after Build Dataset, or point at an existing dataset">
+        <button class="modal-btn" id="trDataYamlBrowseBtn"
+                title="Pick a data.yaml from an existing dataset">Browse...</button>
+      </div>
+      <div class="tr-row">
+        <span class="ctrl-label">Base model</span>
+        <select class="ctrl-input" id="trBase" style="width:220px;">
+          <option value="yolo11s.pt" selected>yolo11s (recommended)</option>
+          <option value="yolo11n.pt">yolo11n (smaller / faster)</option>
+          <option value="custom">Custom .pt path...</option>
+        </select>
+        <input type="text" class="ctrl-input hidden" id="trBaseCustom"
+               style="flex:1;" placeholder="full path to a .pt base model">
+      </div>
+      <div class="tr-row">
+        <span class="ctrl-label">Epochs</span>
+        <input type="number" class="ctrl-input" id="trEpochs" value="60"
+               min="1" max="1000" style="width:80px;">
+        <span class="ctrl-label" style="text-align:right;" title="Training resolution; 800 matches ChitraMaya's detection default">Image Size</span>
+        <input type="number" class="ctrl-input" id="trImgsz" value="800"
+               min="320" max="1280" step="32" style="width:90px;">
+        <span class="ctrl-label" style="text-align:right;">Run Name</span>
+        <input type="text" class="ctrl-input" id="trRunName" value="mosaic-det"
+               style="width:140px;">
+      </div>
+      <div class="tr-row">
+        <span class="ctrl-label" title="Training runs (weights, logs) land here -- never inside the ChitraMaya folder">Runs folder</span>
+        <input type="text" class="ctrl-input" id="trRunDir" style="flex:1;"
+               placeholder="e.g. D:\Training\runs">
+        <button class="modal-btn" id="trRunBrowseBtn">Browse...</button>
+      </div>
+      <div class="tr-note">First run downloads the COCO base weights (one
+        time, needs network). Batch size is chosen automatically to fit your
+        VRAM. A fine-tune of an AGPL base (e.g. a lada model) is a
+        derivative: share such weights under AGPL, with credit.</div>
+      <div class="tr-row" style="justify-content:flex-end;">
+        <button class="modal-btn modal-btn-confirm" id="trTrainBtn">Start Training</button>
+      </div>
+    </div>
+
+    <div class="tr-section">
+      <div class="tr-section-title" style="display:flex; justify-content:space-between; align-items:center;">
+        <span>Progress</span>
+        <button class="modal-btn" id="trLogCopy" style="font-size:11px; padding:2px 10px;"
+                title="Copy the training log to the clipboard">Copy</button>
+      </div>
+      <div id="trStatusLine" class="tr-note" style="font-size:12px;">Idle.</div>
+      <div class="tr-bar-track"><div class="tr-bar-fill" id="trBarFill"></div></div>
+      <div id="trLog"></div>
+    </div>
+
+    <div class="modal-buttons">
+      <button class="modal-btn modal-btn-cancel" id="trCloseBtn">Close</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/js/state.js?v={{ cachebust }}"></script>
 <script src="/static/js/api.js?v={{ cachebust }}"></script>
 <script src="/static/js/player.js?v={{ cachebust }}"></script>
 <script src="/static/js/params.js?v={{ cachebust }}"></script>
 <script src="/static/js/init.js?v={{ cachebust }}"></script>
 <script src="/static/js/mosaic.js?v={{ cachebust }}"></script>
+<script src="/static/js/training.js?v={{ cachebust }}"></script>
 <script type="module" src="/static/js/sbs_viewer.js?v={{ cachebust }}"></script>
 
 </body>

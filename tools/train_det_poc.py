@@ -41,6 +41,12 @@ def main() -> int:
     ap.add_argument("--device", default="0", help="CUDA device id, or 'cpu'")
     ap.add_argument("--project", default="det-poc-runs")
     ap.add_argument("--name", default="mosaic-det-poc")
+    # Batch 82: plots default OFF -- the ultralytics 8.4.120 polars bug
+    # spams warnings/errors rendering them (metrics unaffected), and the
+    # UI-driven runs never see the images anyway (CM-112 plan).
+    ap.add_argument("--plots", action="store_true",
+                    help="render ultralytics result plots (off by default; "
+                         "8.4.120 polars bug makes them noisy)")
     args = ap.parse_args()
 
     data = Path(args.data)
@@ -52,6 +58,47 @@ def main() -> int:
     print(f"[train] base={args.base} data={data} imgsz={args.imgsz} "
           f"epochs={args.epochs} batch={args.batch} device={args.device}")
     model = YOLO(str(args.base))
+
+    # Batch 82 (CM-112): machine-parsable progress lines for the Training
+    # UI. One line at epoch start, one at epoch end with wall time and the
+    # val metrics ultralytics just computed. The UI parses these the CM-135
+    # way (epochs are the "completed frames"; per-epoch t= drives the ETA).
+    # ASCII only; a callback failure must never take the training down.
+    import time as _time
+    _t0 = {"v": 0.0}
+
+    def _cb_epoch_start(trainer):
+        try:
+            _t0["v"] = _time.perf_counter()
+            e = int(getattr(trainer, "epoch", 0)) + 1
+            n = int(getattr(trainer, "epochs", 0) or args.epochs)
+            print(f"[train] epoch {e}/{n} start", flush=True)
+        except Exception:
+            pass
+
+    def _cb_fit_epoch_end(trainer):
+        try:
+            e = int(getattr(trainer, "epoch", 0)) + 1
+            n = int(getattr(trainer, "epochs", 0) or args.epochs)
+            dt = _time.perf_counter() - float(_t0["v"] or _time.perf_counter())
+            parts = [f"[train] epoch {e}/{n} done", f"t={dt:.1f}s"]
+            m = getattr(trainer, "metrics", None) or {}
+            v50 = m.get("metrics/mAP50(B)")
+            v95 = m.get("metrics/mAP50-95(B)")
+            if v50 is not None:
+                parts.append(f"mAP50={float(v50):.4f}")
+            if v95 is not None:
+                parts.append(f"mAP50-95={float(v95):.4f}")
+            print(" ".join(parts), flush=True)
+        except Exception:
+            pass
+
+    try:
+        model.add_callback("on_train_epoch_start", _cb_epoch_start)
+        model.add_callback("on_fit_epoch_end", _cb_fit_epoch_end)
+    except Exception:
+        pass  # older ultralytics without add_callback: train without emits
+
     results = model.train(
         data=str(data),
         imgsz=int(args.imgsz),
@@ -68,6 +115,7 @@ def main() -> int:
         # fliplr default).
         mosaic=0.0,
         flipud=0.0,
+        plots=bool(args.plots),  # Batch 82: off by default (polars bug)
     )
 
     best = Path(results.save_dir) / "weights" / "best.pt"

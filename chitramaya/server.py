@@ -2048,6 +2048,221 @@ def api_compile_log():
         })
 
 
+# ── CM-112 Training (Batch 83): Dataset Builder / Train Detector ──────────
+# Same shape as engine compilation: shell out to the app's own -make-dataset
+# and -train-det subcommands (proven inside the frozen build, Batches 79/80)
+# in a background thread, stream stdout into a buffer the client polls, and
+# parse the Batch 82 progress lines into an honest progress dict. Content
+# never leaves the machine; datasets and runs land in user-chosen folders
+# (never the install dir -- the plan's disk-hygiene rule).
+import re as _re
+
+_train_job = {"running": False, "log": "", "returncode": None,
+              "kind": None, "progress": {}}
+_train_lock = threading.Lock()
+
+_DS_RE_VIDEO = _re.compile(r"\[dataset\] (.+): (\d+) frames, sampling (\d+)")
+_DS_RE_FRAMES = _re.compile(r"\[dataset\]\s+(\d+)/(\d+) frames done")
+_DS_RE_DONE = _re.compile(
+    r"\[dataset\] DONE: (\d+) images \((\d+) clean negatives\), "
+    r"(\d+) mosaic boxes")
+_TR_RE_START = _re.compile(r"\[train\] epoch (\d+)/(\d+) start")
+_TR_RE_DONE = _re.compile(
+    r"\[train\] epoch (\d+)/(\d+) done t=([0-9.]+)s"
+    r"(?: mAP50=([0-9.]+))?(?: mAP50-95=([0-9.]+))?")
+
+
+def _training_busy_reason():
+    """One GPU job at a time (CM-112 plan: training shares the job lock).
+    Refuse while a compile, another training job, or a mosaic run (this
+    process or a CLI session) is active."""
+    with _compile_lock:
+        if _compile_job["running"]:
+            return "An engine compile is running -- wait for it to finish."
+    with _train_lock:
+        if _train_job["running"]:
+            return "A training job is already running."
+    try:
+        from chitramaya.mosaic.session import read_session
+        if read_session() is not None:
+            return ("A restore/mosaic job is running -- one GPU job at "
+                    "a time.")
+    except Exception:
+        pass
+    return None
+
+
+def _run_training(cmd, kind, videos_total):
+    """Child runner: stream + parse. A parse error must never kill the job."""
+    import subprocess
+    ep_times = []
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            **NOWINDOW,
+        )
+        for line in proc.stdout:
+            with _train_lock:
+                _train_job["log"] += line
+                p = _train_job["progress"]
+                try:
+                    if kind == "dataset":
+                        m = _DS_RE_VIDEO.match(line)
+                        if m:
+                            p["video"] = m.group(1)
+                            p["video_i"] = int(p.get("video_i", 0)) + 1
+                            p["videos"] = int(videos_total)
+                            p["frame"] = 0
+                            p["frames"] = int(m.group(3))
+                        m = _DS_RE_FRAMES.match(line)
+                        if m:
+                            p["frame"] = int(m.group(1))
+                            p["frames"] = int(m.group(2))
+                        m = _DS_RE_DONE.match(line)
+                        if m:
+                            p["images"] = int(m.group(1))
+                            p["negatives"] = int(m.group(2))
+                            p["boxes"] = int(m.group(3))
+                    else:  # train
+                        m = _TR_RE_START.match(line)
+                        if m:
+                            p["epoch"] = int(m.group(1))
+                            p["epochs"] = int(m.group(2))
+                        m = _TR_RE_DONE.match(line)
+                        if m:
+                            p["epoch"] = int(m.group(1))
+                            p["epochs"] = int(m.group(2))
+                            t = float(m.group(3))
+                            ep_times.append(t)
+                            p["epoch_t"] = t
+                            if m.group(4) is not None:
+                                p["map50"] = float(m.group(4))
+                            if m.group(5) is not None:
+                                p["map5095"] = float(m.group(5))
+                            avg = sum(ep_times) / max(1, len(ep_times))
+                            p["eta_s"] = max(
+                                0.0, (p["epochs"] - p["epoch"]) * avg)
+                except Exception:
+                    pass  # progress is advisory; the log is the truth
+        proc.wait()
+        rc = proc.returncode
+    except Exception as e:
+        logger.exception("training child failed")
+        with _train_lock:
+            _train_job["log"] += f"\n[training error] {e}\n"
+        rc = -1
+    with _train_lock:
+        _train_job["returncode"] = rc
+        _train_job["running"] = False
+        _train_job["log"] += ("\n=== Done ===\n" if rc == 0 else
+                              f"\n=== FAILED (exit {rc}) ===\n")
+
+
+def _start_training(cmd, kind, videos_total, header):
+    with _train_lock:
+        _train_job["running"] = True
+        _train_job["returncode"] = None
+        _train_job["kind"] = kind
+        _train_job["progress"] = {}
+        _train_job["log"] = header
+    threading.Thread(target=_run_training,
+                     args=(cmd, kind, videos_total), daemon=True).start()
+
+
+@app.route("/api/train/build-dataset", methods=["POST"])
+def api_train_build_dataset():
+    data = request.get_json(force=True) or {}
+    busy = _training_busy_reason()
+    if busy:
+        return jsonify({"error": busy})
+
+    inputs = []
+    for v in (data.get("inputs") or [])[:64]:
+        v = str(v).strip()
+        if v and os.path.isfile(v):
+            inputs.append(v)
+    if not inputs:
+        return jsonify({"error": "Add at least one source video "
+                                 "(files must exist on this machine)."})
+    out_dir = str(data.get("out_dir") or "").strip()
+    if not out_dir:
+        return jsonify({"error": "Choose an output folder for the dataset."})
+    try:
+        frames = max(20, min(5000, int(data.get("frames_per_video", 400))))
+        neg_pct = max(0, min(60, int(data.get("negatives_pct", 15))))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Samples and negatives must be integers."})
+
+    cmd = _compiler_prefix() + ["-make-dataset", "--out", out_dir,
+                                "--frames-per-video", str(frames),
+                                "--clean-fraction", str(neg_pct / 100.0)]
+    # Texture gate stays at the tool default (ON) on purpose -- the PoC bug
+    # that must never regress. No UI knob disables it.
+    for v in inputs:
+        cmd += ["--input", v]
+    _start_training(
+        cmd, "dataset", len(inputs),
+        f"Building dataset from {len(inputs)} video(s) -> {out_dir}\n"
+        f"(samples/video={frames}, negatives={neg_pct}%, texture gate ON)\n\n")
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/train/train-det", methods=["POST"])
+def api_train_train_det():
+    data = request.get_json(force=True) or {}
+    busy = _training_busy_reason()
+    if busy:
+        return jsonify({"error": busy})
+
+    data_yaml = str(data.get("data_yaml") or "").strip()
+    if not os.path.isfile(data_yaml):
+        return jsonify({"error": "data.yaml not found -- build a dataset "
+                                 "first (or point at an existing one)."})
+    run_dir = str(data.get("run_dir") or "").strip()
+    if not run_dir:
+        # Disk hygiene (CM-112 plan): runs never land in the install dir.
+        return jsonify({"error": "Choose an output folder for training runs."})
+    base = str(data.get("base") or "yolo11s.pt").strip()
+    if base not in ("yolo11s.pt", "yolo11n.pt"):
+        if not (base.lower().endswith(".pt") and os.path.isfile(base)):
+            return jsonify({"error": "Base model must be yolo11s.pt, "
+                                     "yolo11n.pt, or an existing .pt file."})
+    try:
+        epochs = max(1, min(1000, int(data.get("epochs", 60))))
+        imgsz = max(320, min(1280, int(data.get("imgsz", 800))))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Epochs and image size must be integers."})
+    name = _re.sub(r"[^A-Za-z0-9_.-]", "_",
+                   str(data.get("name") or "mosaic-det"))[:64] or "mosaic-det"
+
+    cmd = _compiler_prefix() + ["-train-det", "--data", data_yaml,
+                                "--base", base, "--epochs", str(epochs),
+                                "--imgsz", str(imgsz),
+                                "--project", run_dir, "--name", name]
+    _start_training(
+        cmd, "train", 0,
+        f"Training detector: base={base} epochs={epochs} imgsz={imgsz}\n"
+        f"data={data_yaml}\nruns -> {run_dir}\\{name}\n\n")
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/train/status", methods=["GET"])
+def api_train_status():
+    with _train_lock:
+        log = _train_job["log"]
+        # The client renders a tail; cap transfer, keep the file honest.
+        if len(log) > 60000:
+            log = log[-60000:]
+        return jsonify({
+            "running": _train_job["running"],
+            "kind": _train_job["kind"],
+            "returncode": _train_job["returncode"],
+            "progress": dict(_train_job["progress"]),
+            "log": log,
+        })
+
+
 # ── Model download (Manage Models / Download) ──────────────────────────────
 # Lists + downloads .pt/.pth from Hugging Face repos via the plain REST API
 # (no huggingface_hub dependency). Sources persist in model-sources.json,
@@ -2761,6 +2976,22 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
                     )
                 except AttributeError:
                     # Fallback for older pywebview
+                    result = webview.windows[0].create_file_dialog(
+                        webview.OPEN_DIALOG, file_types=types,
+                    )
+                if result and len(result) > 0:
+                    return str(result[0])
+                return None
+
+            @staticmethod
+            def select_yaml():
+                # Batch 85: data.yaml picker for the Training modal.
+                types = ('YAML (*.yaml;*.yml)', 'All files (*.*)')
+                try:
+                    result = webview.windows[0].create_file_dialog(
+                        webview.FileDialog.OPEN, file_types=types,
+                    )
+                except AttributeError:
                     result = webview.windows[0].create_file_dialog(
                         webview.OPEN_DIALOG, file_types=types,
                     )
