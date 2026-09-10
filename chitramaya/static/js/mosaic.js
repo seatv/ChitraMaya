@@ -685,9 +685,28 @@ function _updateControlEnableStates() {
   const detTrt = document.getElementById('ctrlMosaicDetTrt');
   const detModel = document.getElementById('ctrlMosaicDetModel');
   const detFp16 = document.getElementById('ctrlMosaicDetFp16');
+  // CM-164: keep the hidden TensorRT toggles unchecked off-CUDA even after a
+  // Load Settings that carried them checked from an NVIDIA machine.
+  const _edNow = document.documentElement.dataset.edition || '';
+  if (_edNow && _edNow !== 'cuda') {
+    if (detTrt) detTrt.checked = false;
+    const _rt = document.getElementById('ctrlMosaicRestTrt');
+    if (_rt) _rt.checked = false;
+  }
   const mv = detModel ? (detModel.value || '') : '';
   const detHasEngine = /\.engine$/i.test(mv) || _mosaicDetEngines[mv] === true;
-  const detFp16Inert = !!(detTrt && detTrt.checked && detHasEngine);
+  let detFp16Inert = !!(detTrt && detTrt.checked && detHasEngine);
+  // CM-169: on the AMD (ROCm) edition FP16 detection stops detecting after
+  // the first frames (measured on an RX 9060 XT, 2026-09-06); the pipeline
+  // forces FP32 regardless, so the toggle is shown off and greyed with the
+  // reason. Restoration FP16 stays a live choice (its output was clean).
+  if (document.documentElement.dataset.edition === 'rocm' && detFp16) {
+    detFp16.checked = false;
+    detFp16.title = 'Not available on the AMD (ROCm) edition: FP16 detection ' +
+      'stops finding anything after the first frames (measured on an RX 9060 XT, ' +
+      '2026-09-06). Detection runs in FP32 here; Restoration FP16 is unaffected.';
+    detFp16Inert = true;
+  }
   _setCtrlEnabled(detFp16, !detFp16Inert);
   // NOTE: Restoration FP16 is intentionally NOT grayed — it selects the
   // fp16-vs-fp32 engine SET (different compiled files), so it has a real
@@ -789,6 +808,22 @@ const _detTrtEl = document.getElementById('ctrlMosaicDetTrt');
 if (_detTrtEl) _detTrtEl.addEventListener('change', _updateRestorationButtonStates);
 const _restTrtEl = document.getElementById('ctrlMosaicRestTrt');
 if (_restTrtEl) _restTrtEl.addEventListener('change', updateMaxClipConstraints);
+
+// CM-164: TensorRT exists only on the NVIDIA edition. On AMD (ROCm) and
+// Intel (XPU) the two "Use Tensor" rows were shown checked and meant nothing
+// (the pipeline fell through to PyTorch and said so in the console). Hide the
+// rows and send them unchecked so the request line and the misses JSON tell
+// the truth. <html data-edition> is set by the server from torch.version.
+(function _hideTensorRtOffCuda() {
+  const ed = document.documentElement.dataset.edition || '';
+  if (!ed || ed === 'cuda') return;
+  [_detTrtEl, _restTrtEl].forEach(el => {
+    if (!el) return;
+    el.checked = false;
+    const row = el.closest('.ctrl-row');
+    if (row) row.style.display = 'none';
+  });
+})();
 
 
 // ── Action button handlers ────────────────────────────────

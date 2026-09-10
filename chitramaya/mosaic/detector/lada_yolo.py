@@ -20,6 +20,19 @@ from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import DEFAULT_CFG, nms, ops
 from ultralytics.utils.checks import check_imgsz
 
+# CM-170 (T9b): ultralytics ships with "sync" (usage analytics + crash reports
+# to Ultralytics HUB) enabled by default. A desktop tool restoring private
+# video must not phone home. Turn it off in the ultralytics settings file the
+# first time this module loads; the setting persists per user, so this is a
+# one-time write and a no-op afterwards. Never fatal.
+try:
+    from ultralytics import settings as _ul_settings
+    if _ul_settings.get("sync", False):
+        _ul_settings.update(sync=False)
+        print("[Detector] ultralytics analytics/crash sync disabled (CM-170).")
+except Exception:
+    pass
+
 # LADA v0.10.1 was developed against ultralytics==8.4.4. We do not enforce
 # this pin — newer versions are generally compatible. If detection behavior
 # diverges from Lada's reference, the ultralytics version is the first place

@@ -100,6 +100,9 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 }
 .config-menu-item:hover { background: var(--hover); }
 .config-menu-item:first-child { border-radius: var(--radius) var(--radius) 0 0; }
+.config-menu-sep { height: 1px; background: var(--border, #444); margin: 4px 0; }
+.config-menu-item.preset { padding-left: 22px; }
+.config-menu-item.preset.active { font-weight: 600; }
 .config-menu-item:last-child { border-radius: 0 0 var(--radius) var(--radius); }
 
 /* ── Main Content (three panels) ────────────────────────── */
@@ -965,6 +968,13 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   z-index: 100;
 }
 .modal-overlay.hidden { display: none; }
+/* T9g: the generic Yes/No confirm (showConfirm) must sit ABOVE every other
+   modal. All overlays share z-index 100, so DOM order decided -- and the
+   T9e presets modal is later in the page than #confirmModal, which put the
+   "Delete configuration?" question UNDER the presets dialog: dimmed and
+   unclickable, the Delete button looked dead. Any modal that asks a
+   confirm question from inside another modal needs this. */
+#confirmModal { z-index: 200; }
 
 /* Batch 84b: GENERIC hidden utility. Until now .hidden only worked on the
    handful of selectors above, so class="hidden" on anything else silently

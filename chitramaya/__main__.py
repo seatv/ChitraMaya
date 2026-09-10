@@ -23,17 +23,18 @@ from __future__ import annotations
 import sys
 
 
+# CM-112 (publish rule 2026-09-07): the training subcommands (-make-dataset,
+# -train-det, -make-pairs, -train-rest) still dispatch below but are not
+# listed here until the training UI ships -- WIP, undocumented on purpose.
 USAGE = """\
 Usage:
   ChitraMaya                       Launch the UI server
   ChitraMaya -restore     [opts]   Run the mosaic-restoration CLI
   ChitraMaya -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
   ChitraMaya -compile-det  [opts]  Build/rebuild the YOLO detection engine
-  ChitraMaya -make-dataset [opts]  Build a mosaic-detector training dataset
-  ChitraMaya -train-det    [opts]  Train a mosaic detector on such a dataset
-  ChitraMaya -make-pairs   [opts]  Build restorer training pairs from pristine video
-  ChitraMaya -train-rest   [opts]  Fine-tune the BasicVSR++ restorer on such pairs
   ChitraMaya -self-check           Verify this install (imports, GPU, ffmpeg)
+  ChitraMaya -verify-blend-mask    Diagnostic: blend-mask equivalence + timing (CM-172)
+  ChitraMaya -probe-decode         Diagnostic: decode-path layer timings (CM-171)
   ChitraMaya -h | --help           Show this help
 
 Forward all remaining arguments to the chosen CLI. For example:
@@ -94,12 +95,88 @@ def _apply_cuda_alloc_conf() -> None:
         pass
 
 
+def _looks_like_rocm_build() -> bool:
+    """True when the installed torch is a ROCm (HIP) build -- decided from the
+    files in torch/lib, WITHOUT importing torch (this runs before any GPU
+    touch). Frozen or from source. False on any doubt."""
+    try:
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.submodule_search_locations:
+            return False
+        lib = Path(list(spec.submodule_search_locations)[0]) / "lib"
+        if not lib.is_dir():
+            return False
+        for p in lib.iterdir():
+            n = p.name.lower()
+            if n.startswith("amdhip64") or n.startswith("miopen") or "hiprtc" in n:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _apply_rocm_env() -> None:
+    """CM-168 (AMD hold, T9b): MIOpen compiles a kernel the first time it meets
+    each (op, shape) and caches the result on disk. Two field findings from the
+    RX 9060 XT (2026-09-07/08):
+
+      * the cache was PER BUILD -- after every update the first run compiled
+        everything again (the first clip sat minutes with no progress);
+      * MIOpen's default find mode searches exhaustively for every new shape.
+
+    So, before torch loads: pin MIOpen's user DB + kernel cache to a stable
+    folder next to the exe (survives updates; one folder to delete if it ever
+    misbehaves), and honour an optional "miopenFindMode" key in
+    ChitraMaya-config.json (NORMAL | FAST | HYBRID | DYNAMIC_HYBRID, or the
+    numeric codes MIOpen accepts) for the A/B. Env vars the user set
+    explicitly are never clobbered. No-op on non-ROCm builds -- MIOpen is not
+    present there, so the variables would be ignored anyway; we still skip
+    them to keep NVIDIA/Intel environments untouched."""
+    import json
+    import os
+    from pathlib import Path
+    if not _looks_like_rocm_build():
+        return
+    try:
+        base = (Path(sys.executable).parent
+                if getattr(sys, "frozen", False) else Path.cwd())
+        cache_dir = base / "miopen-cache"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            cache_dir = None
+        if cache_dir is not None:
+            os.environ.setdefault("MIOPEN_USER_DB_PATH", str(cache_dir))
+            os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", str(cache_dir))
+            print(f"[ROCm] MIOpen kernel cache: {os.environ['MIOPEN_CUSTOM_CACHE_DIR']} "
+                  f"(persists across updates; first run after install still compiles once)")
+        cfg_file = base / "ChitraMaya-config.json"
+        if cfg_file.exists():
+            flat = json.loads(cfg_file.read_text(encoding="utf-8"))
+            mode = flat.get("miopenFindMode") if isinstance(flat, dict) else None
+            if mode not in (None, "", False):
+                mode_s = str(mode).strip().upper()
+                if "MIOPEN_FIND_MODE" in os.environ:
+                    print(f"[ROCm] MIOPEN_FIND_MODE already set to "
+                          f"{os.environ['MIOPEN_FIND_MODE']}; config miopenFindMode ignored.")
+                else:
+                    os.environ["MIOPEN_FIND_MODE"] = mode_s
+                    print(f"[ROCm] MIOPEN_FIND_MODE={mode_s} (miopenFindMode in ChitraMaya-config.json)")
+    except Exception:
+        # A malformed config or an unwritable folder must never block launch.
+        pass
+
+
 def main() -> int:
     args = sys.argv[1:]
 
     # Batch 78 (CM-149): allocator config BEFORE any torch/CUDA touch --
     # applies to the UI server, -restore CLI, and both compile paths.
     _apply_cuda_alloc_conf()
+    # CM-168 (T9b): MIOpen cache folder + optional find mode, ROCm builds only.
+    _apply_rocm_env()
 
     # CM-141 (training sprint, Batch 79): ultralytics must NEVER self-install
     # packages -- inside a frozen app it tries `ChitraMaya.exe -m pip`
@@ -142,6 +219,20 @@ def main() -> int:
         sys.argv = ["ChitraMaya -compile-det"] + args[1:]
         from tools.compile_yolo import main as compile_det_main
         return int(compile_det_main() or 0)
+
+    # T9 diagnostics (AMD hold): the same tools/ scripts, runnable from an
+    # INSTALLED build -- the AMD and Intel boxes have no source tree or venv.
+    # tools/ is collected into every edition's bundle (collect_submodules),
+    # and the runtime hook puts the bundled ffmpeg/ffprobe on PATH.
+    if args and args[0] in ("-verify-blend-mask", "--verify-blend-mask"):
+        sys.argv = ["ChitraMaya -verify-blend-mask"] + args[1:]
+        from tools.verify_blend_mask_cm172 import main as verify_bm_main
+        return int(verify_bm_main() or 0)
+
+    if args and args[0] in ("-probe-decode", "--probe-decode"):
+        sys.argv = ["ChitraMaya -probe-decode"] + args[1:]
+        from tools.probe_decode_path import main as probe_decode_main
+        return int(probe_decode_main() or 0)
 
     # CM-112 training subcommands (Batch 79): same shape as the compile
     # paths -- thin dispatch onto the proven Phase-A tools, so the UI can
@@ -193,13 +284,15 @@ def main() -> int:
     parsed = p.parse_args(args)
 
     from chitramaya.server import run
-    run(
+    rc = run(
         models_dir=parsed.models_dir,
         gpu_id=parsed.gpu,
         debug=parsed.debug,
         console=parsed.console,
     )
-    return 0
+    # CM-163: run() returns 3 when the GPU gate stopped startup; the .cmd
+    # launcher pauses on any non-zero code (CM-165). None = normal exit.
+    return int(rc) if isinstance(rc, int) else 0
 
 
 if __name__ == "__main__":

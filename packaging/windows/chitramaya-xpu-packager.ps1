@@ -100,6 +100,18 @@ $cmdPath = Join-Path $distDir "$Name.cmd"
 setlocal
 cd /d %~dp0
 "%~dp0$Name.exe" %*
+set CM_EXIT=%ERRORLEVEL%
+if not "%CM_EXIT%"=="0" (
+  echo.
+  echo ChitraMaya exited with code %CM_EXIT%.
+  echo If the window closed at once with no message, this is almost always one of:
+  echo   - the wrong edition for this GPU ^(NVIDIA, AMD and Intel Arc are SEPARATE downloads^)
+  echo   - a GPU driver that is missing or too old
+  echo Run  %~dp0$Name-cli.exe -self-check  for the exact reason. Details: ChitraMaya-console.log
+  echo.
+  pause
+)
+exit /b %CM_EXIT%
 "@ | Set-Content -Encoding ASCII $cmdPath
 
 # ── ChitraMaya-config.json is NEVER shipped (Batch 53, field-caught) ─────

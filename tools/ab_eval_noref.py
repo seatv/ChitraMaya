@@ -434,6 +434,10 @@ def main() -> int:
     ap.add_argument("--src-offset", default="auto",
                     help="source frame = output frame + offset; 'auto' picks from -8..8 "
                          "by background match (stream-copy cuts with gap-fill need this)")
+    ap.add_argument("--stop-if-untouched", type=int, default=100, metavar="N",
+                    help="stop early when the first N analysed frames show no touched "
+                         "region at all (the range has no mosaic; a 1,000-frame range with "
+                         "touched=0 cost 20 min of decode on 09-07). 0 disables.")
     ap.add_argument("--pitch-max", type=int, default=64,
                     help="largest plausible mosaic pitch in px (default 64); "
                          "peaks beyond it are region-scale, not grid, and the "
@@ -585,6 +589,12 @@ def main() -> int:
             rows.append(row)
             prev = (mask, src_g, a_g, b_g, k)
             n_done += 1
+            if (args.stop_if_untouched > 0 and n_done == args.stop_if_untouched
+                    and not any(r.get("region_px", 0) > 0 for r in rows)):
+                print(f"[ab-noref] STOP: the first {n_done} analysed frames have no touched region "
+                      f"(nothing was restored in {start}..{k}). Pick a range from the misses JSON "
+                      f"or pass --stop-if-untouched 0 to force the full range.")
+                break
             if n_done % 50 == 0:
                 el = time.time() - t0
                 print(f"[ab-noref] frame {k}/{end} ({n_done} analysed, {n_done / max(el, 1e-6):.1f} fps)")

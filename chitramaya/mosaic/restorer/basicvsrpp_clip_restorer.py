@@ -153,6 +153,12 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
         # (a "chunk start" with no matching "done"). Silent on CUDA.
         _hb = self.device.type != "cuda"
         import time as _time
+        # T9b: on XPU the heartbeat printed two lines per chunk for the whole
+        # title (thousands of lines on SONE-174). Keep the first 20 chunks
+        # verbatim (that is where a fresh stack compiles), then only chunks
+        # that take longer than 10 s (slow-but-alive is the point of the
+        # heartbeat) and every 200th chunk as a pulse.
+        self._hb_count = int(getattr(self, "_hb_count", 0))
 
         # Batch 42: window = whole clip unless a positive max_frames caps
         # it (the low-VRAM safety valve). See class docstring.
@@ -175,9 +181,12 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
             btchw = tchw_u8.to(device=self.device, dtype=dtype).div_(255.0).unsqueeze(0)
 
             if _hb:
-                print(f"[Restorer] chunk start: frames {start}..{start + len(chunk) - 1} "
-                      f"of {n} ({self.device.type}, "
-                      f"{'fp16' if dtype == torch.float16 else 'fp32'})", flush=True)
+                self._hb_count += 1
+                _hb_verbose = (self._hb_count <= 20) or (self._hb_count % 200 == 0)
+                if _hb_verbose:
+                    print(f"[Restorer] chunk start: frames {start}..{start + len(chunk) - 1} "
+                          f"of {n} ({self.device.type}, "
+                          f"{'fp16' if dtype == torch.float16 else 'fp32'})", flush=True)
                 _t0 = _time.perf_counter()
 
             try:
@@ -204,8 +213,12 @@ class BasicVSRPPClipRestorer(BaseClipRestorer):
                 # is honest (async dispatch would otherwise report ~0s).
                 from chitramaya.device import sync as _dev_sync
                 _dev_sync(self.device)
-                print(f"[Restorer] chunk done in {_time.perf_counter() - _t0:.1f}s "
-                      f"({len(chunk)} frames)", flush=True)
+                _hb_dt = _time.perf_counter() - _t0
+                if _hb_verbose or _hb_dt > 10.0:
+                    print(f"[Restorer] chunk done in {_hb_dt:.1f}s "
+                          f"({len(chunk)} frames"
+                          f"{'' if _hb_verbose else ', slow chunk -- reported because > 10 s'})",
+                          flush=True)
 
             # Back to uint8 HWC, with LADA's rounding+clamp
             out_u8 = (

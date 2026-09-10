@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-edition="{{ edition }}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -39,6 +39,12 @@
         <button class="config-menu-item" id="cfgSave">💾 Save Settings</button>
         <button class="config-menu-item" id="cfgLoad">📂 Load Settings</button>
         <button class="config-menu-item" id="cfgReset">🔄 Reset Defaults</button>
+        <!-- CM-173: saved configurations. One click on a name loads it and
+             makes it the active config. The list is filled from /api/presets
+             each time the menu opens. -->
+        <div class="config-menu-sep" id="cfgPresetSep"></div>
+        <div id="cfgPresetList"></div>
+        <button class="config-menu-item" id="cfgPresets" title="Save the current configuration under a name, or delete saved ones (CM-173)">🗂️ Save / manage configurations…</button>
       </div>
     </div>
   </div>
@@ -190,9 +196,11 @@
       <div class="controls-header"
            style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
         <span>Controls</span>
+        {% if training_ui %}
         <button class="header-btn" id="trainingBtn"
                 title="Train your own mosaic detector on your videos (CM-112). Content never leaves this machine; only weights are shareable."
                 style="text-transform:none; letter-spacing:0; font-size:11px; padding:2px 8px;">Training</button>
+        {% endif %}
         <button class="header-btn" id="manageModelsBtn"
                 title="Download and compile detection / restoration models (coming soon)"
                 style="text-transform:none; letter-spacing:0; font-size:11px; padding:2px 8px;">Manage Models</button>
@@ -717,6 +725,38 @@
   </div>
 </div>
 
+<!-- ── CM-173: Presets Modal ─────────────────────────────── -->
+<style>
+  #presetModal .modal { width: min(460px, 92vw); text-align: left; }
+  #presetModal .preset-row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
+  #presetModal .preset-row label { min-width: 84px; color: var(--text-dim, #9a9a9a); font-size: 12px; }
+  #presetModal select, #presetModal input[type=text] {
+    flex: 1; min-width: 0; padding: 6px 8px; border-radius: var(--radius, 6px);
+    border: 1px solid var(--border, #444); background: var(--bg-elev, #1e1e1e); color: inherit; }
+  #presetModal .preset-hint { font-size: 11px; color: var(--text-dim, #9a9a9a); margin-top: 6px; }
+</style>
+<div class="modal-overlay hidden" id="presetModal">
+  <div class="modal">
+    <div class="modal-title">Saved configurations</div>
+    <div class="modal-message">
+      <div class="preset-row">
+        <label for="presetName">Save current as</label>
+        <input type="text" id="presetName" maxlength="60" placeholder="e.g. segB baseline, SONE-174 AMD, 4K VR fast" spellcheck="false">
+        <button class="modal-btn modal-btn-confirm" id="presetSave" title="Save the whole current configuration (controls and folders) under this name">Save</button>
+      </div>
+      <div class="preset-row">
+        <label for="presetSelect">Delete</label>
+        <select id="presetSelect"></select>
+        <button class="modal-btn modal-btn-cancel" id="presetDelete" title="Delete this saved configuration file">Delete</button>
+      </div>
+      <div class="preset-hint" id="presetHint">A saved configuration is the complete settings file — every control plus the output and temp folders. To load one, pick its name from the ⚙️ menu: one click applies it and makes it the active configuration. Files live in the <code>presets</code> folder next to the app and can be copied between machines.</div>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-btn modal-btn-cancel" id="presetClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay hidden" id="tensorModal">
   <div class="modal">
     <div class="modal-title" id="tensorModalTitle">TensorRT engine not found</div>
@@ -944,6 +984,7 @@
   <pre id="cdBody"></pre>
 </div>
 
+{% if training_ui %}
 <!-- ── CM-112 Training Modal (Batch 83): Dataset Builder + Train Detector ── -->
 <style>
   #trainingModal .modal { width: min(980px, 94vw); max-width: min(980px, 94vw); }
@@ -1069,13 +1110,15 @@
   </div>
 </div>
 
+{% endif %}
+
 <script src="/static/js/state.js?v={{ cachebust }}"></script>
 <script src="/static/js/api.js?v={{ cachebust }}"></script>
 <script src="/static/js/player.js?v={{ cachebust }}"></script>
 <script src="/static/js/params.js?v={{ cachebust }}"></script>
 <script src="/static/js/init.js?v={{ cachebust }}"></script>
 <script src="/static/js/mosaic.js?v={{ cachebust }}"></script>
-<script src="/static/js/training.js?v={{ cachebust }}"></script>
+{% if training_ui %}<script src="/static/js/training.js?v={{ cachebust }}"></script>{% endif %}
 <script type="module" src="/static/js/sbs_viewer.js?v={{ cachebust }}"></script>
 
 </body>

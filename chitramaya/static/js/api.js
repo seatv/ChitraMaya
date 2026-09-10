@@ -28,6 +28,17 @@ async function apiGet(endpoint) {
   }
 }
 
+async function apiDelete(endpoint) {
+  // CM-173 (presets). Same error shape as apiGet/apiPost.
+  try {
+    const resp = await fetch(endpoint, { method: 'DELETE', cache: 'no-store' });
+    return await resp.json();
+  } catch (err) {
+    console.error(`API fetch failed (${endpoint}):`, err);
+    return { error: err.message };
+  }
+}
+
 // ── PyWebView Bridge ─────────────────────────────────────
 
 function getPyWebViewApi() {

@@ -525,7 +525,25 @@ class Decoder:
             cache_stem = stem[:51] + "~" + _h
         else:
             cache_stem = stem
-        candidates = [src.parent, Path(tempfile.gettempdir())]
+        # T9b (misc bucket, from the Dell/OCuLink batch 09-02..07): write the
+        # remux to the system Temp folder FIRST, beside the source only as a
+        # fallback. Beside-the-source put a source-sized file on whatever
+        # drive the library lives on -- a network share, or the mini PC's
+        # internal NVMe that drops offline under sustained reads -- and left
+        # litter in the user's library when a run died. Temp is local and
+        # ours to clean. Temp is skipped when it lacks room for the remux
+        # (1.5x the source, so a 10 GB TS cannot fill the system drive).
+        try:
+            import shutil as _shutil
+            _need = int(src.stat().st_size * 1.5)
+            _tmp_dir = Path(tempfile.gettempdir())
+            _tmp_ok = _shutil.disk_usage(str(_tmp_dir)).free > _need
+        except Exception:
+            _tmp_dir, _tmp_ok = Path(tempfile.gettempdir()), True
+        candidates = ([_tmp_dir, src.parent] if _tmp_ok else [src.parent, _tmp_dir])
+        if not _tmp_ok:
+            print(f"[Decoder] MPEG-TS remux: Temp lacks room for a {src.stat().st_size / 2**30:.1f} GB "
+                  f"remux; writing beside the source instead.")
         tmp_path: Optional[Path] = None
         for d in candidates:
             try:

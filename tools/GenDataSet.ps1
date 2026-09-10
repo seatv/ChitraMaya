@@ -43,9 +43,14 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "chitramaya\__main__.py"))
     exit 1
 }
 
-# Prefer the repo venv python; fall back to python on PATH.
-$Python = Join-Path $RepoRoot "venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $Python)) { $Python = "python" }
+# Python: the ACTIVE venv first ($env:VIRTUAL_ENV -- three venvs share this
+# tree: venv, venv-rocm, venv-xpu), then the repo's default venv, then PATH.
+$Python = "python"
+if ($env:VIRTUAL_ENV -and (Test-Path -LiteralPath (Join-Path $env:VIRTUAL_ENV "Scripts\python.exe"))) {
+    $Python = Join-Path $env:VIRTUAL_ENV "Scripts\python.exe"
+} elseif (Test-Path -LiteralPath (Join-Path $RepoRoot "venv\Scripts\python.exe")) {
+    $Python = Join-Path $RepoRoot "venv\Scripts\python.exe"
+}
 
 # Resolve the detector path against the repo root when it is relative.
 if (-not [System.IO.Path]::IsPathRooted($DetModel)) {

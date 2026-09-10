@@ -1703,17 +1703,47 @@ class FfmpegEncoder:
     # -- probe --------------------------------------------------------------
 
     def _probe_encoder(self, enc_name: str) -> bool:
-        """2-frame null encode: proves the encoder initializes on THIS
-        machine (presence in -encoders does not imply a working driver)."""
+        """3-frame null encode: proves the encoder initializes on THIS
+        machine (presence in -encoders does not imply a working driver).
+
+        CM-167 (field 2026-09-07, RX 9060 XT, Adrenalin 26.9.1): the probe
+        used a 256x128 frame. hevc_amf rejects that with
+        "encoder->Init() failed with error 5" (AMF_OUT_OF_RANGE: below the
+        encoder's minimum resolution) while a 1920x1080 nv12 encode on the
+        same machine works -- so EVERY AMD machine since Batch 34 was
+        judged "no hardware encoder" and fell back to libx265 on the CPU
+        (segB 1080p60: t_encode 541 s of a 1,664 s run; the CPU pinned at
+        95% while the GPU idled at 13%). QSV happened to accept 256x128,
+        which is why the Arc machines never showed it. The probe now uses
+        640x360 nv12 -- the geometry and pixel format the real encode
+        feeds these encoders -- and the failing probe's last stderr line
+        is printed once, so the next mismatch names itself instead of
+        "check the driver".
+        """
         try:
             r = subprocess.run(
                 [self.ffmpeg_path, "-hide_banner", "-v", "error",
-                 "-f", "lavfi", "-i", "color=c=black:s=256x128:r=30:d=0.1",
+                 "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=0.1",
+                 "-pix_fmt", "nv12",
                  "-c:v", enc_name, "-f", "null", "-"],
                 capture_output=True, timeout=30, **NOWINDOW,
             )
-            return r.returncode == 0
-        except Exception:
+            if r.returncode == 0:
+                return True
+            tail = ""
+            try:
+                lines = [ln.strip() for ln in
+                         (r.stderr or b"").decode("utf-8", "replace").splitlines()
+                         if ln.strip()]
+                # The AMF/QSV init error is the first line ffmpeg prints;
+                # the "Error while opening encoder" boilerplate follows it.
+                tail = lines[0] if lines else f"rc={r.returncode}"
+            except Exception:
+                tail = f"rc={r.returncode}"
+            print(f"[Encoder] probe {enc_name}: not usable here ({tail})")
+            return False
+        except Exception as e:
+            print(f"[Encoder] probe {enc_name}: not usable here ({type(e).__name__}: {e})")
             return False
 
     # -- streaming ----------------------------------------------------------

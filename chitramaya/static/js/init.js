@@ -706,6 +706,151 @@ cfgSave.addEventListener('click', saveConfig);
 cfgLoad.addEventListener('click', loadConfig);
 cfgReset.addEventListener('click', resetDefaults);
 
+// ── CM-173: saved configurations ─────────────────────────
+// A saved configuration is a SNAPSHOT of the whole UI config (exactly what
+// Save Settings writes: every control + output/temp folders + dev flags),
+// stored as presets/<name>.json beside the app. The names are listed in the
+// gear menu; ONE CLICK on a name applies it through applyConfig(), pushes the
+// folders to the server, and writes it as the active ChitraMaya-config.json
+// -- it is a config swap, so the state survives a restart and the misses JSON
+// of the next run matches the name you clicked. The modal only saves/deletes.
+const cfgPresets = document.getElementById('cfgPresets');
+const cfgPresetList = document.getElementById('cfgPresetList');
+const cfgPresetSep = document.getElementById('cfgPresetSep');
+const presetModal = document.getElementById('presetModal');
+const presetSelect = document.getElementById('presetSelect');
+const presetName = document.getElementById('presetName');
+const presetHint = document.getElementById('presetHint');
+let _presetActive = '';
+
+async function _presetNames() {
+  const r = await apiGet('/api/presets');
+  return (r && r.presets) || [];
+}
+
+async function _presetRefreshMenu() {
+  if (!cfgPresetList) return;
+  const names = await _presetNames();
+  cfgPresetList.innerHTML = '';
+  if (cfgPresetSep) cfgPresetSep.style.display = names.length ? '' : 'none';
+  for (const n of names) {
+    const b = document.createElement('button');
+    b.className = 'config-menu-item preset' + (n === _presetActive ? ' active' : '');
+    b.textContent = (n === _presetActive ? '\u2713 ' : '\u2022 ') + n;
+    b.title = `Load configuration "${n}" and make it the active settings`;
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      configMenu.classList.add('hidden');
+      await _presetApply(n);
+    });
+    cfgPresetList.appendChild(b);
+  }
+}
+
+async function _presetRefreshSelect() {
+  const names = await _presetNames();
+  presetSelect.innerHTML = '';
+  if (names.length === 0) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = '\u2014 none saved yet \u2014';
+    presetSelect.appendChild(o);
+  }
+  for (const n of names) {
+    const o = document.createElement('option');
+    o.value = n; o.textContent = n;
+    presetSelect.appendChild(o);
+  }
+}
+
+function _presetMsg(text, isError) {
+  presetHint.textContent = text;
+  presetHint.style.color = isError ? 'var(--danger, #e06c75)' : '';
+}
+
+async function _presetApply(name) {
+  const cfg = await apiGet('/api/presets/' + encodeURIComponent(name));
+  if (!cfg || cfg.error) {
+    alert('Could not load configuration "' + name + '": ' + ((cfg && cfg.error) || 'unknown error'));
+    return;
+  }
+  applyConfig(cfg);
+  if (cfg.outputDir !== undefined) {
+    state.outputDir = cfg.outputDir;
+    await apiPost('/api/set-output-dir', { path: cfg.outputDir });
+  }
+  if (cfg.tempDir !== undefined) {
+    await apiPost('/api/set-temp-dir', { path: cfg.tempDir });
+  }
+  if (typeof _updateControlEnableStates === 'function') _updateControlEnableStates();
+  // Make it the active configuration (same call Save Settings makes).
+  await apiPost('/api/save-config', gatherFullConfig());
+  _presetActive = name;
+  console.log(`[ChitraMaya] Configuration "${name}" loaded and saved as active`);
+}
+
+if (cfgPresets) {
+  // Fill the menu list every time the gear opens (cheap; keeps it honest).
+  configBtn.addEventListener('click', () => { _presetRefreshMenu(); });
+  _presetRefreshMenu();
+
+  cfgPresets.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    configMenu.classList.add('hidden');
+    await _presetRefreshSelect();
+    _presetMsg('A saved configuration is the complete settings file \u2014 every control plus the output and temp folders. To load one, pick its name from the \u2699 menu: one click applies it and makes it the active configuration. Files live in the presets folder next to the app and can be copied between machines.', false);
+    presetModal.classList.remove('hidden');
+    presetName.focus();
+  });
+  document.getElementById('presetClose').addEventListener('click', () => presetModal.classList.add('hidden'));
+  // T9g: Enter in the name field saves; Esc closes the dialog (when no
+  // confirm question is up -- the console drawer's Esc handler is separate).
+  presetName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('presetSave').click(); }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !presetModal.classList.contains('hidden') &&
+        confirmModal.classList.contains('hidden')) presetModal.classList.add('hidden');
+  });
+
+  document.getElementById('presetSave').addEventListener('click', async () => {
+    const name = (presetName.value || '').trim();
+    if (!name) { _presetMsg('Type a name first.', true); return; }
+    const r = await apiPost('/api/presets/' + encodeURIComponent(name), gatherFullConfig());
+    if (r && !r.error) {
+      _presetActive = r.name;
+      await _presetRefreshSelect();
+      await _presetRefreshMenu();
+      _presetMsg(`Saved "${r.name}" (${r.keys} settings). It is now listed in the \u2699 menu.`, false);
+      presetName.value = '';
+    } else {
+      _presetMsg('Save failed: ' + ((r && r.error) || 'unknown error'), true);
+    }
+  });
+
+  document.getElementById('presetDelete').addEventListener('click', async () => {
+    const name = presetSelect.value;
+    if (!name) return;
+    const ok = await showConfirm('Delete configuration', `Delete the saved configuration "${name}"? The file is removed; the current settings are not changed.`);
+    if (!ok) return;
+    const r = await apiDelete('/api/presets/' + encodeURIComponent(name));
+    if (r && !r.error) {
+      if (_presetActive === name) _presetActive = '';
+      await _presetRefreshSelect();
+      await _presetRefreshMenu();
+      _presetMsg(`Deleted "${name}".`, false);
+    } else {
+      _presetMsg('Delete failed: ' + ((r && r.error) || 'unknown error'), true);
+    }
+  });
+}
+
+// Save / Load / Reset Settings. Function DECLARATIONS (hoisted) -- the
+// listeners above are attached by name before this point in the file.
+// T9e (48d246f) deleted these three by mistake, so cfgSave.addEventListener
+// threw ReferenceError at load and every statement after it (the saved-
+// configurations block, Save The Children) never ran: the gear menu opened
+// and nothing in it worked. tools/verify_ui_js.py now checks that every
+// identifier handed to addEventListener is declared somewhere in the bundle.
 async function saveConfig() {
   const cfg = gatherFullConfig();
   const result = await apiPost('/api/save-config', cfg);

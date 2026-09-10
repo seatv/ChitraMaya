@@ -534,7 +534,7 @@ def _check_config(t: _Tally) -> None:
     base = Path(os.environ.get("CHITRAMAYA_HOME") or Path.cwd())
     cfg = base / "ChitraMaya-config.json"
     if not cfg.is_file():
-        t.line("OK", "no ChitraMaya-config.json yet (created on first run)")
+        t.line("OK", "no ChitraMaya-config.json yet (created the first time you press Save Settings)")
         return
     try:
         json.loads(cfg.read_text(encoding="utf-8"))

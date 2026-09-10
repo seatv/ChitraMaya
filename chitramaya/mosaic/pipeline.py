@@ -34,6 +34,17 @@ from chitramaya.mosaic.utils.config_util import Config
 from chitramaya.video.decoder import Decoder
 from chitramaya.video.encoder import Encoder, FfmpegEncoder, nvenc_available
 
+def _fmt_hms(seconds: float) -> str:
+    """0:12:34 style for console checkpoints (T9b)."""
+    try:
+        s = max(0, int(round(float(seconds))))
+    except Exception:
+        return "?"
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}"
+
+
 from .pipeline_utils import (
     Box,
     FrameStore,
@@ -700,6 +711,23 @@ class Pipeline:
             raise FileNotFoundError("Detector model path is empty (check config.json or --det-model)")
 
         det_type = str(self.cfg.get("detection", "det_type", default="yolo") or "yolo").lower()
+        # CM-169 (measured 2026-09-06, RX 9060 XT, Adrenalin 26.9.1, ROCm
+        # 7.2): FP16 detection on ROCm returns detections for the first
+        # few frames and then nothing -- PurpleRain 810 -> 18 boxes
+        # (6/270 frames), Test Frame 3/167 -- the signature of the FP16
+        # kernel path going bad after warm-up (NaN/garbage below the
+        # confidence threshold), with t_det 5x SLOWER than FP32 on top.
+        # Two field reports said the same before we owned the hardware.
+        # Detection runs in FP32 on this edition regardless of the toggle;
+        # the request line and the misses JSON echo the effective value.
+        # Restoration FP16 is NOT fenced: its output was clean (810/810).
+        from chitramaya.device import is_rocm as _is_rocm
+        if self.det_fp16 and _is_rocm():
+            self.det_fp16 = False
+            print("[Detector] FP16 detection is disabled on the AMD (ROCm) "
+                  "edition: measured on an RX 9060 XT (2026-09-06), FP16 "
+                  "detection stops finding anything after the first frames. "
+                  "Detection runs in FP32 here; restoration FP16 is unaffected.")
         print(
             f"[Detector] type={det_type} imgsz={self.det_imgsz} "
             f"conf={self.det_conf} iou={self.det_iou} fp16={self.det_fp16}"
@@ -1794,6 +1822,39 @@ class Pipeline:
             )
             metrics.t_encode += (time.perf_counter() - t0)
 
+            # T9b: honest console checkpoint. tqdm's it/s is the INSTANTANEOUS
+            # rate between clip flushes; on a full title it read "29 it/s,
+            # ETA 5h" while the true average was 14 fps and 22 h (9060 XT,
+            # 2026-09-08). The UI modal has had completed-frame fps/ETA since
+            # CM-135; the console log never did. Every 500 completed frames
+            # print the average over completed frames and the ETA from it --
+            # this line also survives into the log file, which tqdm's
+            # in-place redraws do not.
+            try:
+                _ck_done = min(len(metrics.frames_restored)
+                               + int(metrics.early_passthrough_frames),
+                               int(metrics.processed_frames))
+                _ck_last = int(getattr(self, "_ck_last_done", 0))
+                if _ck_done // 500 > _ck_last // 500:
+                    self._ck_last_done = _ck_done
+                    _ck_el = time.perf_counter() - t0_all
+                    _ck_fps = (_ck_done / _ck_el) if _ck_el > 1e-6 else 0.0
+                    _ck_tot = int(total_frames) if total_frames and total_frames > 0 else 0
+                    if _ck_tot > 0 and _ck_fps > 1e-6:
+                        _ck_eta = (_ck_tot - _ck_done) / _ck_fps
+                        _ck_line = (f"[Pipeline] frame {_ck_done}/{_ck_tot}  "
+                                    f"avg {_ck_fps:.1f} fps  elapsed {_fmt_hms(_ck_el)}  "
+                                    f"ETA {_fmt_hms(_ck_eta)}")
+                    else:
+                        _ck_line = (f"[Pipeline] frame {_ck_done}  avg {_ck_fps:.1f} fps  "
+                                    f"elapsed {_fmt_hms(_ck_el)}")
+                    try:
+                        pbar.write(_ck_line)
+                    except Exception:
+                        print(_ck_line, flush=True)
+            except Exception:
+                pass
+
             # Progress emit (additive): once per batch, only if a callback was
             # provided. Reads existing metrics/state; does not affect behavior.
             if progress_cb is not None:
@@ -1879,8 +1940,20 @@ class Pipeline:
         # flush of a final long clip happens after stop(). stall_seconds<=0
         # disables it (config: monitoring.watchdog_stall_seconds).
         from chitramaya.mosaic.watchdog import StallWatchdog
+        from chitramaya.device import is_rocm as _is_rocm_wd
+        # CM-168 (T9b): on ROCm the first clip of a run legitimately sits for
+        # minutes while MIOpen compiles kernels for shapes it has not seen
+        # (first run after install/update; first time a clip size or model is
+        # used). A 120 s threshold dumped stacks at every such compile and read
+        # as a hang to users. Default 300 s there; the config key still wins.
+        _wd_default = 300 if _is_rocm_wd() else 120
         _wd_stall = float(self.cfg.get("monitoring", "watchdog_stall_seconds",
-                                       default=120))
+                                       default=_wd_default))
+        if _is_rocm_wd():
+            print("[ROCm] First run after install or update compiles GPU kernels: the first "
+                  "clip can take several minutes with no visible progress (a stack dump from "
+                  "the watchdog during that wait is a diagnosis, not a crash). Later runs, "
+                  "and later clips of the same size, start immediately.")
         _watchdog = StallWatchdog(
             lambda: int(metrics.processed_frames),
             stall_seconds=_wd_stall,

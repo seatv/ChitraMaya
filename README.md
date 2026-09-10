@@ -4,7 +4,18 @@ A TensorRT-accelerated mosaic restoration studio with a real-time visual editor.
 
 Built for NVIDIA RTX cards — with **experimental editions for AMD Radeon (ROCm)** and **Intel Arc** (see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Intel Arc edition](#intel-arc-xpu-edition--experimental)).
 
-![ChitraMaya — the mosaic input and the restored result, side by side](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction.png)
+> [!IMPORTANT]
+> ### Which edition do I need? One per GPU vendor — they are separate downloads.
+>
+> | Your GPU | Download from | Installer |
+> |---|---|---|
+> | **NVIDIA** GeForce RTX (30/40/50-series) | this repository — [Releases](https://github.com/seatv/ChitraMaya/releases) | `ChitraMaya-install.exe` + `.7z.001` + `.7z.002` (all three) |
+> | **AMD** Radeon RX 7000 / 9000 (RDNA 3 / 4) | [ChitraMaya-AMD-ROCM](https://github.com/seatv/ChitraMaya-AMD-ROCM/releases) | `ChitraMaya-rocm-install.exe` (one file) |
+> | **Intel** Arc (A/B-series, Core Ultra iGPU) | [ChitraMaya-Intel-ARC](https://github.com/seatv/ChitraMaya-Intel-ARC/releases) | `ChitraMaya-xpu-install.exe` (one file) |
+>
+> From v1.70.00 the wrong edition tells you so: a startup check probes the GPU before anything else loads and, if this edition cannot run here, shows a message naming the GPUs Windows reports and the edition that matches them (and `ChitraMaya.cmd` pauses with the same advice instead of vanishing). `ChitraMaya-cli.exe -self-check` gives the full verdict. The title bar also says which edition is running.
+
+![ChitraMaya — the mosaic input and the restored result, side by side](docs/InAction.png)
 
 ## Why ChitraMaya?
 
@@ -12,15 +23,15 @@ Some restoration tools are batch processors: set parameters, run a full pass, lo
 
 - **Test a single frame instantly.** Park the playhead on any frame and *Test Frame* restores a short window around it, showing each detected region as **Mosaic → Restored** side by side. Dial a setting, test again, watch it change — the loop is seconds, not a full encode. The enlarged view keeps your **last 5 attempts on that frame**, so you can flip between settings variants with one click and pick the winner by eye.
 - **Process a whole folder.** *Process Folder* queues every video in a folder with your current settings — models load once, each file runs isolated (one failure can't kill the batch), finished outputs are skipped on re-run, and existing files are never overwritten.
-- **Two-stage restoration quality.** An optional **RTX Super-Res** second stage upscales restored regions before paste-back so large close-up regions stop going soft, and a **Temporal Stability** stage removes frame-to-frame shimmer from restored regions — both recommended, both a single dropdown.
+- **Two-stage restoration quality.** An optional second stage — **RTX Super-Res** (NVIDIA) or **Real-ESRGAN 4×** (every edition) — upscales restored regions before paste-back so large close-up regions stop going soft, and a **Temporal Stability** stage removes frame-to-frame shimmer from restored regions — both recommended, both a single dropdown.
 - **Live segment preview.** Mark a segment, preview just that range, and decide whether to commit to a full run before encoding the whole video.
-- **Hardware-accelerated throughout.** NVDEC decode, TensorRT-accelerated BasicVSR++ restoration, and NVENC encode — to **HEVC, H.264, or AV1** — keep frames on the GPU end to end. (On Intel Arc: Quick Sync decode and encode, with PyTorch restoration — see the Arc section.)
+- **Hardware-accelerated throughout.** NVDEC decode, TensorRT-accelerated BasicVSR++ restoration, and NVENC encode — to **HEVC, H.264, or AV1** — keep frames on the GPU end to end. (On AMD Radeon: hardware decode and AMF encode with PyTorch restoration; on Intel Arc: Quick Sync decode and encode with PyTorch restoration — see the edition sections.)
 - **A clean windowed app.** No terminal window: console output lives in an in-app Console panel and in `ChitraMaya-console.log` next to the exe. (Terminal fans: `ChitraMaya-cli.exe` is the same app with live console output for headless runs and compiles.)
 - **Compiles for your GPU.** No models are shipped. You download the model checkpoints and compile TensorRT engines *for your specific card* — all from inside the app.
 - **Made for VR/SBS content.** Per-eye detection for side-by-side video, a runtime **Image Size** dial for dense high-resolution frames, **VR Projection** for studios whose mosaic arrives warped in the raw frame, and **SBS View**: a projected look-around preview (like a headset, on your desktop) with a draggable wipe to compare original vs restored inside the projection.
 - **Add Mosaic.** The inverse operation — pixelate regions to produce shareable SFW clips. Draw rectangles by hand (precise, reliable), or let the app auto-detect regions with a detection model (**experimental** — see the warning below).
 
-![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-FramePreview.png)
+![Test Frame — every detected region shown as Mosaic then Restored, without a full encode](docs/InAction-FramePreview.png)
 
 ## Terms & Conditions
 
@@ -46,7 +57,7 @@ You are solely responsible for what you create with it and for complying with al
 
 ### 1. Requirements
 
-- **GPU:** NVIDIA RTX card. Native TensorRT builders ship for **RTX 50-series (Blackwell), 40-series (Ada), and 30-series (Ampere)**. Other cards still work via a slower PTX fallback for the first compile. **AV1 output** additionally requires an RTX 40-series or newer (older cards can decode AV1, but only Ada/Blackwell NVENC can encode it — the app checks and tells you). The optional **RTX Super-Res** second stage needs an RTX card with a recent NVIDIA driver. *(AMD Radeon and Intel Arc cards: see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Arc edition](#intel-arc-xpu-edition--experimental) — each is a separate download.)*
+- **GPU:** NVIDIA RTX card. Native TensorRT builders ship for **RTX 50-series (Blackwell), 40-series (Ada), and 30-series (Ampere)**. Other cards still work via a slower PTX fallback for the first compile. **AV1 output** additionally requires an RTX 40-series or newer (older cards can decode AV1, but only Ada/Blackwell NVENC can encode it — the app checks and tells you). The optional second-stage upscaler is either **RTX Super-Res** (needs an RTX card with a recent NVIDIA driver) or **Real-ESRGAN 4×** (any GPU, any edition). *(AMD Radeon and Intel Arc cards: see [the AMD edition](#amd-radeon-rocm-edition--experimental) and [the Arc edition](#intel-arc-xpu-edition--experimental) — each is a separate download.)*
 - **OS:** Windows 10/11 with an up-to-date NVIDIA driver.
 - Nothing else — CUDA, TensorRT, ffmpeg, and Python are all bundled in the installer.
 
@@ -74,8 +85,8 @@ Run `ChitraMaya-install.exe` — it reassembles the parts and extracts automatic
 > From v1.60.00 on, each release page also carries **patch zips** (under
 > 100 MB) so existing users skip the multi-GB re-download. A release may
 > offer more than one patch — **pick the one whose "from" version matches
-> your install** (`VERSION.txt` next to the exe; e.g. a 1.60.01 install
-> takes `ChitraMaya-patch-1.60.01-to-1.61.00.zip`). Extract the patch zip
+> your install** (`VERSION.txt` next to the exe; e.g. a 1.61.00 install
+> takes `ChitraMaya-patch-1.61.00-to-1.70.00.zip`). Extract the patch zip
 > anywhere and run
 > `powershell -ExecutionPolicy Bypass -File .\Apply-Patch.ps1` — it finds
 > your install (or asks), verifies every file it would touch belongs to the
@@ -94,7 +105,7 @@ No models ship with the app — you add them once. Two ways, both from **Manage 
 
 > Hugging Face throttles anonymous downloads (~1,000 requests/hour per IP) and answers with a 403 once you cross it — easy to hit on a heavy day of testing across machines behind one home IP. If downloads start failing, drop a free "read" token from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) into a one-line `hf-token.txt` next to the app (or set the `HF_TOKEN` environment variable) and retry. Failed downloads now name the cause and the fix in the log rather than showing a bare error.
 
-![Manage Models — download checkpoints, then compile TensorRT engines for your GPU](https://github.com/seatv/ChitraMaya/blob/main/docs/ModelManagement.png)
+![Manage Models — download checkpoints, then compile TensorRT engines for your GPU](docs/ModelManagement.png)
 
 **Manual:** drop any detection `.pt` and restoration `.pth` files straight into the `models\` folder.
 
@@ -122,7 +133,7 @@ When it finishes, the badges flip to **Compiled** and the models are ready to us
 
 **The two quality dials worth turning on (Restoration panel):**
 
-- **Secondary → RTX Super-Res 2× / 4× (recommended).** The restorer works on a fixed-size crop; regions *larger* than that used to be stretched at paste-back and went soft — worst on close-ups and VR. With Super-Res on, the restored crop is upscaled first so the final resize shrinks instead of stretching. Costs ~4% run time; small regions automatically keep the untouched path. Needs an RTX card and a recent driver (bundled runtime; the app tells you if it's unavailable and runs as before).
+- **Secondary → RTX Super-Res 2× / 4× or Real-ESRGAN 4×.** The restorer works on a fixed-size crop; regions *larger* than that used to be stretched at paste-back and went soft — worst on close-ups and VR. With a secondary on, the restored crop is upscaled first so the final resize shrinks instead of stretching; small regions automatically keep the untouched path. Two upscalers are offered, and they produce two different **looks**: measured on the same real clip with the same restoration, the **RTX Super-Res** result is smoother (about half the fine texture of the other path in every frame measured, with the same residual mosaic and flicker), while **Real-ESRGAN 4×** keeps the restorer's texture. Neither is more correct; pick by eye. RTX Super-Res needs an RTX card and a recent driver (bundled runtime; the app says so if unavailable); Real-ESRGAN runs on every edition. Cost is similar — a few percent of run time. *(The denoise option after RTX Super-Res is under review: in our measurements it changed nothing visible at ~60% more restore time; leave it at none.)*
 - **Temporal Stability → 2 (recommended).** Removes the frame-to-frame shimmer restoration models produce, smoothing each restored region across a 7-frame window only where content agrees — real motion passes through. Only restored pixels are touched. Weights are bundled; there's nothing to download. Especially worthwhile on 8 GB cards, where shorter clip lengths make shimmer more visible.
 
 > [!IMPORTANT]
@@ -157,11 +168,13 @@ A few more things worth knowing before a full run:
 - **Stream captures (MPEG-TS) are remuxed before decode (v1.61).** Files ripped from streaming sites are usually MPEG-TS streams (often named `.mkv`); the GPU decode path silently dropped ~5 seconds at the head of such files on earlier releases, producing a constant audio desync. ChitraMaya now detects TS sources and losslessly remuxes them to a temporary MP4 first (stream copy, no quality change). You'll see a `<name>.cm120-tsremux.mp4` appear next to the source (or in the system temp folder) while the run is active — it is roughly source-sized, is deleted when the run finishes, and is reused if you re-run the same file. **If a pre-1.61 output from a stream capture ever drifted out of sync, re-run the source file** — old outputs cannot be repaired after the fact.
 - **Failed runs report what survived (v1.60).** A hard mid-run error no longer masquerades as total loss: everything encoded before the failure is flushed and remuxed as always, and the app now says **"PARTIAL: encoded M of N frames"** — the output file is playable up to that point, and the console names it.
 - **The encoder cannot fail silently, and slow disks get their time (v1.61).** If the hardware encode session dies mid-run (it happens — drivers, power events), the app now aborts loudly within seconds instead of "encoding" nothing for hours; your already-encoded frames are preserved in a raw bitstream next to a ready-made `*-RECOVER.ps1` script, and the end-of-run log reports the bitstream size so a byteless success is impossible. The final packaging step is likewise now supervised by **disk progress** rather than a wall-clock timeout — a slow hard drive gets as long as it needs, a truly stuck process is still killed within minutes, and a failed finalize removes its half-written output (the raw bitstream + recovery script remain your salvage).
+- **Saved configurations (v1.70.00).** The ⚙️ menu's **Save / manage configurations…** stores the complete current settings — every control plus the output and temp folders — under a name; the names then appear in the ⚙️ menu and one click loads one and makes it the active configuration (it survives a restart). Files live in `presets\` next to the exe and can be copied between machines. Save Settings / Load Settings / Reset Defaults still work on the single active configuration.
+- **Honest progress in the console (v1.70.00).** Every 500 completed frames the console prints `[Pipeline] frame N/M  avg X fps  elapsed  ETA` — the true average since the start, not the instantaneous rate the progress bar shows between clip flushes — so a log tells you how a long run really went.
 - **The system stays awake during runs.** ChitraMaya holds off the idle-sleep timer while processing (the display may still turn off), then releases it — overnight runs no longer die to a power plan.
 
-![Restore & Save — the finished, restored output](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-RestoreAndSave.png)
+![Restore & Save — the finished, restored output](docs/InAction-RestoreAndSave.png)
 
-![Playing the restored result back in the built-in player](https://github.com/seatv/ChitraMaya/blob/main/docs/InAction-RestoreAndSavePlaying.png)
+![Playing the restored result back in the built-in player](docs/InAction-RestoreAndSavePlaying.png)
 
 ### 6. Process a whole folder
 
@@ -243,24 +256,38 @@ Auto mode reuses the detection pipeline: pick a detection model (e.g. an NSFW de
 ## AMD Radeon (ROCm) Edition — EXPERIMENTAL
 
 > [!CAUTION]
-> **Very early field coverage.** The AMD edition has so far been validated
-> on a small number of machines (first field card: an RX 9060 XT — clean
-> self-check and the app runs; broader restore mileage is still
-> accumulating). It may work well on your card; it may not. Use with
-> caution and please report what you find.
+> **Early field coverage, now with in-house hardware.** From v1.70.00 the
+> AMD edition is tested on our own **RX 9060 XT 16 GB** (RDNA 4) before
+> release; field reports cover a small number of other machines. It may
+> work well on your card; it may not. Use with caution and please report
+> what you find.
 
-The AMD edition is a **separate download** — a single **`ChitraMaya-rocm-install.exe`**: double-click, pick a folder, and run `ChitraMaya.cmd` from the extracted folder. Do not mix it with the NVIDIA install.
+The AMD edition is a **separate download** — a single **`ChitraMaya-rocm-install.exe`** from **[ChitraMaya-AMD-ROCM](https://github.com/seatv/ChitraMaya-AMD-ROCM/releases)**: double-click, pick a **new** folder, and run `ChitraMaya.cmd` from the extracted folder. Do not mix it with the NVIDIA install, and do not extract a new version over an old one.
+
+> [!IMPORTANT]
+> ### v1.70.00 fixes CPU encoding on every previous AMD release.
+> The start-of-run check for the Radeon's hardware encoder (AMF) used a
+> test frame smaller than the encoder's minimum, so every earlier AMD
+> build concluded "no hardware encoder" and encoded on the CPU — with
+> the CPU pinned at ~95% and the GPU idling. Console line on v1.70.00:
+> `[Encoder] ffmpeg backend: hevc_amf (AMD AMF hardware)`. On the 9060 XT
+> a 185-second 1080p60 clip went from 27m44s to 10m25s.
 
 **How it differs from the NVIDIA edition:**
 
-- **Requires Adrenalin driver 26.2.2 or newer.** Earlier drivers lack the runtime the bundled PyTorch ROCm stack needs.
-- **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch (and from v1.50.00, with the full-clip temporal window: the biggest quality change this edition has received). Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step.
+- **Driver: AMD Software Adrenalin 26.2.2 or newer.** Check with GPU-Z or AMD Software. If Windows installed only a basic display adapter, install Adrenalin from amd.com (Windows Update sometimes delivers the full package by itself, sometimes not). Earlier drivers lack the runtime the bundled PyTorch ROCm stack needs.
+- **Supported cards: RDNA 3 and RDNA 4** (RX 7000 / RX 9000 series) — ROCm on Windows does not support older Radeons, and no driver version changes that.
+- **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch (with the full-clip temporal window). Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step.
+- **The first run after installing into a new folder is slow, once.** The ROCm math library compiles GPU kernels the first time it meets each model and clip size and caches them in `miopen-cache` next to the exe (v1.70.00 pins the cache there so it survives updates; copy that folder from an old install into a new one to skip the wait). The first clip of the first run can sit for a few minutes with no visible progress — the console says so at start — and the stall watchdog may print a stack dump while it waits: a diagnosis, not a crash. Later runs, and later clips of the same size, start immediately.
+- **Detection FP16 is off on this edition, deliberately.** Measured on the 9060 XT: FP16 detection finds mosaic in the first few frames and then nothing. The pipeline runs detection in FP32 regardless of the toggle (the checkbox is greyed with the reason); Restoration FP16 works and is your choice.
 - **Which files to download:** in Manage Models, fetch one detection model (a `.pt` file — `lada_mosaic_detection_model_v2.pt` is the proven starting point) and one restoration model (a `.pth` file — `lada_mosaic_restoration_model_generic_v1.2.pth`). Those two are all a basic restore needs.
-- **ffmpeg does decode and encode** (AMD AMF hardware encoders where available).
-- **NVIDIA-only features say so and step aside:** RTX Super-Res and the PCIe monitor are unavailable by design. Temporal Stability works fully.
+- **ffmpeg does decode and encode:** D3D11VA hardware decode and AMF hardware encode (HEVC, H.264, AV1 on RDNA 3+). Decoded frames travel back to the app through a pipe that caps at roughly 35 fps at 1080p and 10 fps at 4K on this edition — the slowest stage now, see Known Issues. `ChitraMaya-cli.exe -probe-decode --input <clip>` measures the layers of that path on your machine.
+- **Secondary upscaler: Real-ESRGAN 4×** (new in v1.70.00). RTX Super-Res and the PCIe monitor are NVIDIA-only and say so. Temporal Stability works fully.
 - Everything else — the editor, Test Frame, Process Folder, Add Mosaic, SBS View, the watchdog, keep-awake, crash hardening — is the same product.
 
-**Reporting problems:** attach `ChitraMaya-console.log` and the `*.misses.json` beside your output, and state your GPU model, driver version, and Resizable BAR state. Run `ChitraMaya-cli.exe -self-check` and include its output — from v1.50.00 it reports your card's VRAM too. No explicit content in issues, per the issue template.
+**What to expect (RX 9060 XT 16 GB, Adrenalin 26.9.1, ROCm 7.2, measured on full titles):** a 2h41m 1080p60 feature (the same title as every row in our NVIDIA benchmarks) restored in **6h51m–7h06m = 0.38–0.39× realtime** (detection v2 @640, Max Clip 90, FP32, HEVC via AMF). Put plainly: **in PyTorch a 9060 XT runs like an RTX 4060 in PyTorch** (6h44m on that title); the NVIDIA edition's TensorRT path is 2–3× faster than any PyTorch path, ours included (a 3060 12 GB: 3h11m; a 5060 Ti: 2h31m). A dense 1080p60 clip: 10m25s (was 27m44s on the CPU-encode builds). Detection decisions matched the NVIDIA fleet to within 16 frames in 578,704. About 63% of the wall clock is the decode transport; that is the next fix, and it is identified. Real-ESRGAN with Max Clip 180 and Restoration FP16 — the configuration that took a projected 22 hours on the previous build — runs in the same class as the numbers above on this one.
+
+**Reporting problems:** attach `ChitraMaya-console.log` and the `*.misses.json` beside your output, and state your GPU model, driver version, and Resizable BAR state. Run `ChitraMaya-cli.exe -self-check` and include its output — it reports your card, its VRAM, and whether the ROCm runtime launched a kernel. No explicit content in issues, per the issue template.
 
 ---
 
@@ -280,13 +307,13 @@ The Arc edition is a **separate download** — a single `ChitraMaya-xpu-install`
 
 **What to expect:**
 
-- **Expect roughly 3× the runtime of an equivalent NVIDIA card — IF Resizable BAR is on.** On the same 4K test clip: RTX 3060 **58s**, A580 with ReBAR **2m37s**, Arc 140V laptop iGPU **2m41s**. **Without ReBAR the same A580 took 18 minutes (~20×)** — the 256MB BAR window strangles compute transfers, so ReBAR is *effectively required* on discrete Arc, exactly as Intel says. Integrated Arc (Lunar Lake-class iGPUs) is exempt: unified memory means there is no BAR bottleneck to remove.
+- **Expect several times the runtime of an equivalent NVIDIA card — IF Resizable BAR is on.** Measured on a full title: a 2h41m 1080p60 feature took **14h14m = 0.19× realtime** on the Arc 140V laptop iGPU (Max Clip 180, FP16, Real-ESRGAN, AV1 via Quick Sync) — a start-it-before-bed machine, roughly 2× an RTX 3060 Mobile in PyTorch and 4–5× a desktop 3060 on TensorRT. About 60% of that wall clock is the decode transport (frames reach the app through a pipe capped near 19 fps on this laptop); the fix is identified and in progress, and `ChitraMaya-cli.exe -probe-decode --input <clip> --hwaccel qsv` measures it on your machine. On the 4K test clip: RTX 3060 **58s**, A580 with ReBAR **2m37s**, Arc 140V **2m41s**. **Without ReBAR the same A580 took 18 minutes (~20×)** — the 256MB BAR window strangles compute transfers, so ReBAR is *effectively required* on discrete Arc, exactly as Intel says. Integrated Arc (Lunar Lake-class iGPUs) is exempt: unified memory means there is no BAR bottleneck to remove.
 - **No engine compiling.** TensorRT does not exist here — models run directly in PyTorch. Manage Models still downloads the `.pt`/`.pth` checkpoints; there is simply no compile step (and no `Compile-All-Engines.ps1`).
-- **NVIDIA-only features degrade gracefully and say so:** RTX Super-Res and the PCIe monitor are unavailable on Arc by design.
+- **Secondary upscaler: Real-ESRGAN 4×** (new in v1.70.00) — the Arc edition's first second-stage upscaler. RTX Super-Res and the PCIe monitor are NVIDIA-only and say so.
 - **8 GB Arc cards handle 4K flat video** with ~40% VRAM headroom. 5K/VR/SBS content is currently **not recommended** on 8 GB.
 - **Requirements:** Windows 10/11 and a current **Intel graphics driver** — nothing else; ffmpeg and all runtimes are bundled. **Discrete Arc: Resizable BAR ON is effectively required** (BIOS: CSM off, Above 4G Decoding on, ReBAR on; ReBAR alone was worth 7–9× in our A/B testing). Not applicable to iGPUs. Note: Intel's driver installer can stall when run unattended or over a remote session — run it at the machine and watch it finish.
 - **16GB machines (laptops):** on 4K content the host frame store may not fit and the **RAM guard** will engage ("pausing decode-ahead") — the run completes at reduced pace. This is expected on 16GB Lunar Lake-class machines; 1080p content fits comfortably.
-- **Troubleshooting:** add `"hwDecode": "off"` to `ChitraMaya-config.json` (next to the exe) to force CPU decode if you suspect a hardware-decode problem with a file. Valid values: `auto` (default), `qsv`, `d3d11va`, `off`.
+- **Troubleshooting:** to force CPU decode when you suspect a hardware-decode problem with a file, start the app from a command window with the environment variable set: `set CM_HW_DECODE=off` then `ChitraMaya.cmd` (values: `auto` — the default, `qsv`, `d3d11va`, `off`). The console then prints `hw decode: disabled (CM_HW_DECODE)`. Earlier READMEs described a `hwDecode` config key; it did not exist — a config key is planned.
 - **If self-check reports "device enumerates but kernels do not launch"** (`could not make an engine with allocator`), your Intel graphics driver is too old for the bundled PyTorch stack — the GPU is visible but compute fails. Update to a current Intel graphics driver and reboot; this was field-confirmed on a laptop whose factory driver was under two years old. Run `ChitraMaya-cli.exe -self-check` after any driver change — it tests exactly this.
 
 **Reporting problems:** please attach `ChitraMaya-console.log` (next to the exe) and the `*.misses.json` written beside your output — it contains the run settings, statistics, and the last console lines. State your GPU model, driver version, and whether Resizable BAR is enabled (GPU-Z shows this). No explicit content in issues, per the issue template.
@@ -443,14 +470,17 @@ Full restores stream the whole file through NVDEC for throughput; *Test Frame* a
 
 A few things are intentionally incomplete or have known limitations in this release:
 
-- **The Intel Arc and AMD ROCm editions are experimental with thin field coverage** — see the cautions in [the Arc section](#intel-arc-xpu-edition--experimental) and [the AMD section](#amd-radeon-rocm-edition--experimental). The Arc edition runs roughly 3× slower than an equivalent NVIDIA card on the current PyTorch Intel stack (with Resizable BAR on discrete cards — ~20× without it); the remaining gap is expected to narrow as Intel's software matures, not something you can tune away.
+- **The Intel Arc and AMD ROCm editions are experimental** — see the cautions in [the Arc section](#intel-arc-xpu-edition--experimental) and [the AMD section](#amd-radeon-rocm-edition--experimental). Both run in plain PyTorch (no TensorRT), so expect an RTX-4060-class result on a 9060 XT and a several-times-slower result on Arc; with Resizable BAR off, discrete Arc is ~20× slower.
 - **Automatic mosaic detection is experimental — do not rely on it to censor.** The Auto-detect / censor mode depends on a third-party NSFW detection model that does not reliably detect all explicit content; it misses regions and whole frames and is not suitable for production censoring. Use the manual draw-rectangles Add Mosaic with the max-recall settings and two-pass leak check, and review every frame of any output yourself.
 - **Some users have reported blend artifacts with the Face Swap blend mask** on certain content — visible edge irregularities around restored regions. If you see them, set Blend Mask to **None** (the classic blend is unaffected). Under investigation.
 - **On warped-mosaic VR content, run statistics cannot detect a quality failure.** With VR Projection Off on such content, the stats can report full coverage while the output still shows mosaic (the models "restore" blocks they cannot parse). Use **Test Frame** to judge — see the VR section.
 - **VR Projection assumes FOV-180 content and requires Split SBS.** Fisheye-native sources with wider lenses (190/200) are handled with the same transform, which has been sufficient in testing; a per-title projection variant is a planned refinement if a title needs it.
 - **Detection FP16 applies only to the PyTorch path.** For a compiled TensorRT detection engine, precision is baked in at compile time, so the runtime **Detection FP16** toggle has no effect — the app grays it out when a compiled engine is selected. It still applies to `.pt` PyTorch detection runs.
-- **Very long filenames (v1.61).** Windows' 260-character path limit can make files with very long names fail to process ("No such file or directory" on the `.hevc` sidecar) and can silently skip the stream-capture remux ("remux skipped: no writable location"). Shorten the filename — keep the full output path under ~230 characters. Fix lands in the next patch.
-- **Interrupted stream-capture remux (v1.61).** If a run is interrupted (power loss, forced kill) *while* the console shows the "MPEG-TS... remuxing to a temporary MP4" message, delete the leftover `<name>.cm120-tsremux.mp4` next to the source before re-running that file — an incomplete cache from the interrupted run could otherwise be reused. A run that got past the remux message is not affected. Fix lands in the next patch.
+- **HEVC sources may show a black in-app player.** The player uses the Windows media stack, not the pipeline's decoder. Machines without the **HEVC Video Extensions** (Microsoft Store; free from some OEMs, otherwise $0.99) load and process HEVC fine but show nothing in the player. Install the extension. In-app detection of this case is planned.
+- **AMD and Intel editions: the decode transport is the slow stage.** Frames are decoded by the GPU but reach the app through a pipe that caps near 35 fps at 1080p / 10 fps at 4K on an RX 9060 XT and near 19 fps at 1080p on an Arc 140V — 60% or more of the wall clock on a full title. The cause is identified (the transport, not the decoder: measured with `-probe-decode`) and the fix is in progress. GPU temperature and clocks also read N/A in the bundled monitor on AMD and Intel (load and VRAM work on AMD).
+- **8 GB cards at 4K: set Store backend to `host`, or keep Max Clip at or below ~60.** The automatic store placement measures free VRAM after the models load but not the decoder buffers, encoder surfaces and the transients that scale with mosaic-region size; at 4K it can choose VRAM with too little headroom, and the run then pages and dies with an NVENC session error (code 8) in a dense section. With the store in system RAM (`Store backend: host` in the controls; `[FrameStore] backend: HOST` in the console) a 3h55m 4K30 title completed on an 8 GB RTX 3060 Ti over a ×4 link in 4h26m — with very slow stretches where mosaic regions are enormous (3,000 px). An automatic fix is planned.
+- **The denoise option after RTX Super-Res is under review.** Measured on two clips, "ultra" produced output indistinguishable from none at ~60% more restore time. Leave it at none until we understand why.
+- **Very large outputs (roughly 20 GB and up) can lose the final remux to the progress watchdog.** The watchdog that guards the remux measures the output file's growth; ffmpeg's `faststart` pass rewrites the file in place without growing it, and on a slow drive that pass can exceed the 600-second limit, so the console reports `remux KILLED`. Nothing is lost: every frame is in the `.hevc` next to the output, and the `-RECOVER.ps1` script beside it rebuilds the playable file with audio (delete `-movflags +faststart` from its ffmpeg line to make it fast). Fixed in the next release.
 - **Detection debug dumps** — `--debug-save-detection-frames` and `--debug-save-detection-json` still don't write anything.
 - **SBS View assumes equirect-180 side-by-side (left|right)** content; fisheye layouts aren't projected correctly yet (a projection selector is planned). Playback in the viewer uses the app's embedded browser decoder, not NVDEC — a very large (8K) HEVC master may not play there even though it restores fine; a downscaled copy will.
 - **Add Mosaic rectangles are per-eye for SBS** and are clamped to the eye you drew them in — a rectangle can't span the eye seam. Both eyes receive the mosaic at the same per-eye position (no parallax offset), so pad rectangles generously on close subjects.

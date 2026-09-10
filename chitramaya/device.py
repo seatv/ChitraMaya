@@ -30,6 +30,13 @@ def xpu_available() -> bool:
                         lambda: False)())
 
 
+def is_rocm() -> bool:
+    """True on the AMD (ROCm) edition. HIP presents itself as the ``cuda``
+    device type in torch, so ``device.type`` cannot tell the editions
+    apart; ``torch.version.hip`` can (None on CUDA/XPU/CPU builds)."""
+    return bool(getattr(getattr(torch, "version", None), "hip", None))
+
+
 def pick_device(gpu_id: int = 0) -> torch.device:
     """cuda -> xpu -> cpu, mirroring the pipelines' _pick_device."""
     if torch.cuda.is_available():

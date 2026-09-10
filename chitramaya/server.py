@@ -1575,9 +1575,56 @@ def _get_server() -> SwapServer:
 _CACHEBUST = str(int(time.time()))
 
 
+def _ui_edition() -> str:
+    """cuda | rocm | xpu | cpu -- which torch build this process runs.
+    Read from torch.version only (no device touch); mirrors
+    self_check._torch_edition. The page uses it to grey controls that have
+    no meaning on an edition (CM-169: Detection FP16 on ROCm)."""
+    try:
+        import torch
+        if getattr(getattr(torch, "version", None), "hip", None):
+            return "rocm"
+        if "+xpu" in str(getattr(torch, "__version__", "")):
+            return "xpu"
+        if getattr(getattr(torch, "version", None), "cuda", None):
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+_EDITION_LABEL = {"cuda": "NVIDIA", "rocm": "AMD", "xpu": "Intel Arc", "cpu": "CPU-only"}
+
+
+def _edition_label() -> str:
+    """CM-161: human label for the running edition -- title bar, banner,
+    self-check -- so a screenshot or a pasted console says which download
+    the user is on (the wrong-edition trap, 2026-09-06)."""
+    return _EDITION_LABEL.get(_ui_edition(), "unknown")
+
+
+def _training_ui_enabled() -> bool:
+    """CM-112 gate (publish rule 2026-09-07): the Training modal ships in
+    the build but is HIDDEN until the training UI is finished. Opt in with
+    "trainingUI": true in ChitraMaya-config.json (flat key, same style as
+    cudaExpandableSegments). The /api/train/* endpoints and the CLI
+    subcommands stay live and undocumented -- WIP, not ready for use."""
+    try:
+        import json
+        cfg_file = _config_file_path()
+        if not cfg_file.exists():
+            return False
+        flat = json.loads(cfg_file.read_text(encoding="utf-8"))
+        return bool(isinstance(flat, dict) and flat.get("trainingUI"))
+    except Exception:
+        return False
+
+
 @app.route("/")
 def index():
-    return render_template("ui.html", cachebust=_CACHEBUST)
+    return render_template("ui.html", cachebust=_CACHEBUST,
+                           edition=_ui_edition(),
+                           training_ui=_training_ui_enabled())
 
 
 # ── Video ──
@@ -2675,6 +2722,93 @@ def api_save_config():
         return jsonify({"error": str(e)}), 500
 
 
+# ── CM-173: named configurations ─────────────────────────────────────────
+# One JSON file per name under <app base>/presets/. A preset is a SNAPSHOT OF
+# THE WHOLE UI CONFIG -- exactly the keys Save Settings writes (controls,
+# output/temp folders, dev flags) -- so a benchmark machine returns to the
+# precise state a run was made in with one click. Loading a preset applies it
+# AND writes it as the active ChitraMaya-config.json (it is a config swap,
+# not a temporary tweak). Names are restricted to a safe character set and
+# used verbatim as the file stem; the files copy between machines by hand.
+_PRESET_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,59}$")
+_PRESET_KEY_PREFIXES = ("ctrl", "skip", "facesDir", "outputDir", "tempDir")
+_PRESET_KEY_EXACT = {"debug", "perf_test"}
+
+
+def _presets_dir() -> Path:
+    return _app_base_dir() / "presets"
+
+
+def _preset_path(name: str) -> Path | None:
+    name = (name or "").strip()
+    if not _PRESET_NAME_RE.match(name) or name.endswith("."):
+        return None
+    return _presets_dir() / f"{name}.json"
+
+
+def _preset_filter(data: dict) -> dict:
+    """Same key set api_load_config exposes to the UI: the full UI config."""
+    return {k: v for k, v in (data or {}).items()
+            if isinstance(k, str) and (k.startswith(_PRESET_KEY_PREFIXES) or k in _PRESET_KEY_EXACT)}
+
+
+@app.route("/api/presets", methods=["GET"])
+def api_presets_list():
+    try:
+        d = _presets_dir()
+        names = sorted((p.stem for p in d.glob("*.json")), key=str.lower) if d.is_dir() else []
+        return jsonify({"presets": names, "dir": str(d)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/presets/<name>", methods=["GET"])
+def api_presets_get(name: str):
+    path = _preset_path(name)
+    if path is None:
+        return jsonify({"error": "invalid preset name"}), 400
+    if not path.exists():
+        return jsonify({"error": "no such preset"}), 404
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return jsonify(_preset_filter(data) if isinstance(data, dict) else {})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/presets/<name>", methods=["POST"])
+def api_presets_save(name: str):
+    path = _preset_path(name)
+    if path is None:
+        return jsonify({"error": "Preset names: letters, digits, space, _ . - (max 60), "
+                                 "starting with a letter or digit."}), 400
+    try:
+        data = _preset_filter(request.get_json(force=True) or {})
+        if not data:
+            return jsonify({"error": "nothing to save"}), 400
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import datetime as _dtm
+        payload = {"_preset": path.stem, "_saved": _dtm.datetime.now().isoformat(timespec="seconds"),
+                   "_chitramaya": _CM_VERSION, **data}
+        path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+        return jsonify({"ok": True, "name": path.stem, "path": str(path), "keys": len(data)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/presets/<name>", methods=["DELETE"])
+def api_presets_delete(name: str):
+    path = _preset_path(name)
+    if path is None:
+        return jsonify({"error": "invalid preset name"}), 400
+    try:
+        if path.exists():
+            path.unlink()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/load-config", methods=["GET"])
 def api_load_config():
     """Load UI config. Filters to known UI keys only."""
@@ -2911,6 +3045,27 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
         print(f"[ChitraMaya] Instance {_instance_n}: port 5100 busy; "
               f"running on port {port} (console log: {_log_name})")
 
+    # CM-163: GPU gate. Probe the device in a child process BEFORE this
+    # process touches torch; on the wrong edition / missing driver show the
+    # gentle message and exit 3 instead of vanishing (field 2026-09-06).
+    # "gpuGate": false in ChitraMaya-config.json disables it.
+    try:
+        from chitramaya.gpu_gate import run_gate as _run_gate
+        _gate_on = True
+        try:
+            _cfgp = _config_file_path()
+            if _cfgp.exists():
+                _flat = json.loads(_cfgp.read_text(encoding="utf-8"))
+                if isinstance(_flat, dict) and _flat.get("gpuGate") is False:
+                    _gate_on = False
+        except Exception:
+            pass
+        _gate_rc = _run_gate(_app_base_dir(), _CM_VERSION, enabled=_gate_on)
+        if _gate_rc is not None:
+            return int(_gate_rc)
+    except Exception as _ge:  # noqa: BLE001 -- the gate must never block a working machine
+        print(f"[GPU gate] skipped ({type(_ge).__name__}: {_ge})")
+
     global _server
     _server = SwapServer(models_dir=models_dir, gpu_id=gpu_id)
 
@@ -2925,6 +3080,7 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
     time.sleep(0.5)
 
     print(f"[ChitraMaya] Server running at {url}")
+    print(f"[ChitraMaya] {_CM_VERSION} -- {_edition_label()} edition")  # CM-161
 
     # X1b: ffmpeg/ffprobe preflight. They are required for video load
     # metadata, Test Frame extraction, CPU decode, and remux -- but a
@@ -3015,7 +3171,7 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
 
         api = Api()
         window = webview.create_window(
-            f"ChitraMaya {_CM_VERSION}",
+            f"ChitraMaya {_CM_VERSION} -- {_edition_label()} edition",  # CM-161
             url,
             js_api=api,
             width=1600,

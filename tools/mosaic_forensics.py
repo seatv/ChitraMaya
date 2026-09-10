@@ -264,6 +264,9 @@ def main() -> int:
     ap.add_argument("--thresh", type=float, default=8.0, help="ROI difference threshold (gray levels)")
     ap.add_argument("--pitch-min", type=int, default=4)
     ap.add_argument("--pitch-max", type=int, default=96)
+    ap.add_argument("--max-frame-cover", type=float, default=0.6,
+                    help="skip frames whose pristine/censored difference covers more than this "
+                         "fraction of the picture (scene cut, tail-frame mismatch); default 0.6")
     ap.add_argument("--min-snr", type=float, default=3.0)
     ap.add_argument("--min-region-px", type=int, default=2000)
     ap.add_argument("--det-model", default=None, help="lada_nsfw .pt for the anatomy/margin measurement")
@@ -334,6 +337,18 @@ def main() -> int:
             rows.append({"frame": fi, "region": -1, "note": "no mosaic"})
             frames_done += 1
             continue
+        # T9b nit (first run 09-07): a pristine/censored pair can differ over
+        # the WHOLE frame at a scene boundary or from two extra tail frames
+        # (frame 2900 of the exam clip) -- that is not a mosaic region and it
+        # dominated the worst-fit sheet. Reject frames whose diff support
+        # covers most of the picture.
+        _cover = float(mask.mean())
+        if _cover > args.max_frame_cover:
+            rows.append({"frame": fi, "region": -1,
+                         "note": f"whole-frame difference ({100.0 * _cover:.0f}% of picture) -- "
+                                 f"not a mosaic region; skipped"})
+            frames_done += 1
+            continue
         if ndi is not None:
             lab, nreg = ndi.label(mask)
         else:
@@ -371,14 +386,19 @@ def main() -> int:
             pk_x = _profile_peak(gx, 0, args.pitch_min, args.pitch_max)
             pk_y = _profile_peak(gy, 1, args.pitch_min, args.pitch_max)
             px = py = None
+            # T9b nit: refinement could walk a peak past --pitch-max (a 97 px
+            # "pitch" slipped through a 96 px cap on 09-07); clamp the refined
+            # value to the search window the user asked for.
             if pk_x and pk_x[1] >= args.min_snr:
                 fx = _refine_pitch(gx.sum(axis=0), pk_x[0])
-                row["pitch_x"] = round(fx, 2); row["snr_x"] = round(pk_x[1], 2)
-                px = int(round(fx))
+                if args.pitch_min <= fx <= args.pitch_max:
+                    row["pitch_x"] = round(fx, 2); row["snr_x"] = round(pk_x[1], 2)
+                    px = int(round(fx))
             if pk_y and pk_y[1] >= args.min_snr:
                 fy = _refine_pitch(gy.sum(axis=1), pk_y[0])
-                row["pitch_y"] = round(fy, 2); row["snr_y"] = round(pk_y[1], 2)
-                py = int(round(fy))
+                if args.pitch_min <= fy <= args.pitch_max:
+                    row["pitch_y"] = round(fy, 2); row["snr_y"] = round(pk_y[1], 2)
+                    py = int(round(fy))
             # sanity: a pitch wider than ~40% of the region's short side is the
             # region itself, not a grid
             lim = max(4, min(bw, bh) * 0.4)
@@ -508,6 +528,17 @@ def main() -> int:
         v = "frame-anchored" if s_abs < s_rel * 0.7 else ("region-anchored" if s_rel < s_abs * 0.7 else "undetermined")
         if moved < p:
             v += " (region barely moved; weak evidence)"
+        # T9b nit (read of the first run, 09-07): the region-anchored half of
+        # the test measures phase against the diff-region's bbox corner, which
+        # is the mosaic's own corner only when the mask is rectangular
+        # (fill ~1). A polygon/segmentation mask (fill 0.43 on the exam clip)
+        # moves its bbox corner independently of the grid, so "undetermined"
+        # there is the test failing, not the studio being ambiguous.
+        _fills = [r["fill_ratio"] for r in rows if "fill_ratio" in r]
+        _fill_med = float(np.median(_fills)) if _fills else float("nan")
+        if _fills and _fill_med < 0.85:
+            v += (f" (mask fill median {_fill_med:.2f} -- not rectangular; the bbox-corner "
+                  f"test is unreliable, needs fill ~1)")
         verdict[axis] = {"pitch": p, "n": len(items), "phase_std_frame_px": round(s_abs, 2),
                          "phase_std_region_px": round(s_rel, 2), "region_travel_std_px": round(moved, 1),
                          "verdict": v}

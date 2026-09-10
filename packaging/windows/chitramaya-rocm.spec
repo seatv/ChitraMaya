@@ -233,7 +233,7 @@ else:
         for _name, _why, _required in (
             ("hevc_amf",  "HEVC hardware encode (Radeon)", True),
             ("h264_amf",  "H.264 hardware encode (Radeon)", True),
-            ("av1_amf",   "AV1 hardware encode (RDNA4+)", True),
+            ("av1_amf",   "AV1 hardware encode (RDNA3+)", True),
             ("libsvtav1", "software AV1 fallback (full build only)", False),
             ("libx265",   "software HEVC fallback", False),
         ):

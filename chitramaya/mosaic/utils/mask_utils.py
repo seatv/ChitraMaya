@@ -84,6 +84,58 @@ def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
 
+def box_filter_2d(x: torch.Tensor, k: int, *, pad_mode: str = "reflect") -> torch.Tensor:
+    """k x k box (mean) filter, stride 1, same-size output -- WITHOUT conv2d / avg_pool2d.
+
+    CM-172. The blend masks are built at the size of the region in the frame,
+    so their (h, w, k) changes with every region on every frame. On CUDA that
+    is free (cuDNN picks a kernel by heuristic); on ROCm/Windows every unseen
+    shape sent to F.conv2d or F.avg_pool2d is a new MIOpen problem -- search,
+    compile, cache -- costing seconds to minutes each. On a full title that
+    became a compile storm: paste-back of one MCL-180 clip took 2-5 minutes
+    with the GPU idle and one CPU core busy (9060 XT, 09-08). PurpleRain never
+    showed it (3 fixed regions = 3 shapes, paid once).
+
+    This computes the identical box mean from a summed-area table: reflect or
+    zero pad, two cumulative sums, four gathers, one divide. Pure tensor
+    arithmetic -- no cuDNN, no MIOpen, no oneDNN -- so it costs the same on
+    every edition and never compiles anything. Sums are taken in float64 so a
+    0/1 mask (the usual input) is exact; the result is cast back to x.dtype.
+
+    Args:
+        x: (H, W) tensor.
+        k: window size (odd; k <= 1 returns a copy).
+        pad_mode: "reflect" reproduces the legacy filter2D path
+                  (create_blend_mask); "zeros" reproduces
+                  F.avg_pool2d(..., stride=1, padding=k//2) with
+                  count_include_pad=True (create_support_blend_mask).
+    """
+    if x.ndim != 2:
+        raise ValueError(f"box_filter_2d expects an HW tensor, got shape={tuple(x.shape)}")
+    k = int(k)
+    if k <= 1:
+        return x.clone()
+    r = k // 2
+    x4 = x.unsqueeze(0).unsqueeze(0)
+    if pad_mode == "reflect":
+        xp = F.pad(x4, (r, r, r, r), mode="reflect")
+    elif pad_mode == "zeros":
+        xp = F.pad(x4, (r, r, r, r), mode="constant", value=0.0)
+    else:
+        raise ValueError(f"box_filter_2d: unknown pad_mode {pad_mode!r}")
+    xp = xp[0, 0].to(torch.float64)
+
+    hp, wp = xp.shape
+    sat = torch.zeros((hp + 1, wp + 1), dtype=torch.float64, device=xp.device)
+    sat[1:, 1:] = xp.cumsum(0).cumsum(1)
+
+    h, w = int(x.shape[0]), int(x.shape[1])
+    # Window for output (i, j) covers padded rows i..i+k-1, cols j..j+k-1.
+    s = (sat[k:k + h, k:k + w] - sat[0:h, k:k + w]
+         - sat[k:k + h, 0:w] + sat[0:h, 0:w])
+    return (s / float(k * k)).to(x.dtype)
+
+
 def get_nonzero_box_torch(mask: torch.Tensor) -> Optional[Box]:
     """Return (top, left, bottom, right) for non-zero support, or None."""
     mask = mask.squeeze()
@@ -139,10 +191,12 @@ def create_support_blend_mask(
         return support
 
     k = 2 * feather_px + 1
-    alpha = support.unsqueeze(0).unsqueeze(0)
+    alpha = support
     for _ in range(max(1, int(passes))):
-        alpha = F.avg_pool2d(alpha, kernel_size=k, stride=1, padding=feather_px)
-    alpha = alpha.squeeze(0).squeeze(0)
+        # CM-172: summed-area box mean instead of F.avg_pool2d (same numbers,
+        # no per-shape MIOpen compile on ROCm). Zero padding matches
+        # avg_pool2d's count_include_pad=True default.
+        alpha = box_filter_2d(alpha, k, pad_mode="zeros")
 
     # Inward-only feather: do not let alpha extend outside the actual support.
     alpha = alpha * support
@@ -178,10 +232,12 @@ def create_blend_mask(crop_mask: torch.Tensor):
     pad_left = w_outer // 2
     pad_right = w_outer - pad_left
     blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
-    mask4 = (mask > 0)
+    mask4 = (mask > 0).to(dtype=blend.dtype)
     blend = torch.maximum(mask4, blend)
-    kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
-    blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+    # CM-172: the legacy path was image_utils.filter2D (F.conv2d with a
+    # uniform 1/k^2 kernel, reflect padding). Same box mean via a summed-area
+    # table -- no conv2d, so no per-shape MIOpen compile on ROCm.
+    blend = box_filter_2d(blend, blur_size, pad_mode="reflect")
     assert blend.shape == mask.shape
     return blend
 
