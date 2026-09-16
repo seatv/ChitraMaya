@@ -366,6 +366,8 @@ def composite_clip_into_store_projected(
             continue
 
         clip_img = restored_frames_u8[i]
+        if clip_img is None:
+            continue   # CM-186 guard dropped this frame's restoration
         clip_mask = clip.masks[i]
         box: Box = clip.boxes[i]
         orig_shape_hw = clip.crop_shapes[i]

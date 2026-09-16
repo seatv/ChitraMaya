@@ -18,6 +18,11 @@ import shlex
 import struct
 import subprocess
 from chitramaya.winproc import NOWINDOW
+from chitramaya.video.finalize import (
+    AudioSidecar, sidecar_path_for, estimate_moov_bytes, moov_too_small,
+    build_onepass_raw_cmd, build_onepass_container_cmd, probe_av_start,
+    probe_audio_desc, audio_mux_failed, with_audio_reencode,
+)
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -364,6 +369,160 @@ def _probe_stream_start_seconds(ffprobe: str, path: str, stream: str) -> Optiona
         return None
 
 
+
+def run_ffmpeg_supervised(cmd: List[str], label: str, timeout_s: int = 900,
+                          watch_path: Optional[str] = None,
+                          stall_s: int = 600) -> "tuple[bool, str]":
+    """Run one ffmpeg command; return (ok, stderr_tail). Shared by both
+    encoders (v1.71: the ffmpeg-encoder path used a plain wall-clock
+    ``subprocess.run`` before -- a slow disk killed its remux too).
+    UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames.
+    ``timeout_s``: pass _finalize_timeout_s(...) for whole-file remux
+    steps (v1.50.00, the 50GB Idol lesson); the 900s default suits
+    everything else.
+
+    ``watch_path`` (CM-124, field 2026-08-28): a wall-clock timeout,
+    however scaled, still killed a remux that was MAKING DISK PROGRESS
+    at ~4 MB/s (slow HDD pair + faststart second pass; a complete
+    229,812-frame bitstream lost its finalize at 59% written). When
+    watch_path is set, the command is instead supervised by progress:
+    the output's size AND modification time (CM-174: an in-place rewrite
+    grows nothing but keeps touching the file) are polled every 5s, and
+    the process is killed only after ``stall_s`` seconds with NO change --
+    a slow disk gets as long as it needs, while a truly wedged ffmpeg
+    still dies in minutes. The scaled ``timeout_s`` becomes an estimate:
+    passing it just logs a courtesy note that the remux is slow but alive."""
+    print(f"[Encoder] {label}: {' '.join(cmd)}")
+    if watch_path is None:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout_s,
+                **NOWINDOW,
+            )
+            tail = "\n".join((result.stderr or "").strip().split("\n")[-8:])
+            if result.returncode != 0:
+                print(f"[Encoder] {label} failed (rc={result.returncode})")
+                for line in tail.split("\n")[-5:]:
+                    if line:
+                        print(f"  {line}")
+                return False, tail
+            print(f"[Encoder] {label} OK")
+            return True, tail
+        except subprocess.TimeoutExpired:
+            print(f"[Encoder] {label} TIMED OUT after {timeout_s}s with no "
+                  f"result. Every encoded frame is preserved in the raw "
+                  f"bitstream -- use the recovery command printed below, "
+                  f"ideally targeting a faster disk.")
+            return False, ""
+        except Exception as e:
+            print(f"[Encoder] {label} error: {e}")
+            return False, ""
+
+    # Progress-supervised mode (CM-124).
+    import tempfile
+    import time as _time
+
+    def _progress() -> "tuple[int, float]":
+        total = 0
+        mtime = 0.0
+        for p in (watch_path, watch_path + ".tmp"):
+            try:
+                st = os.stat(p)
+                total += st.st_size
+                mtime = max(mtime, st.st_mtime)
+            except OSError:
+                pass
+        return total, mtime
+
+    err_path = None
+    err_f = None
+    try:
+        err_f = tempfile.NamedTemporaryFile(
+            prefix="cm_ffmpeg_", suffix=".stderr", delete=False)
+        err_path = err_f.name
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=err_f, **NOWINDOW)
+        start = last_change = _time.monotonic()
+        last_bytes, last_mtime = _progress()
+        hard_cap_s = max(int(timeout_s) * 10, 6 * 3600)
+        slow_noted = False
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            _time.sleep(5)
+            cur, cur_m = _progress()
+            now = _time.monotonic()
+            if cur != last_bytes or cur_m != last_mtime:
+                last_bytes, last_mtime = cur, cur_m
+                last_change = now
+            if now - last_change > stall_s:
+                proc.kill()
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                print(f"[Encoder] {label} KILLED: no disk progress for "
+                      f"{int(now - last_change)}s (output stuck at "
+                      f"{last_bytes / 1e6:.1f} MB). Every encoded frame "
+                      f"is preserved in the raw bitstream -- use the "
+                      f"recovery script.")
+                return False, ""
+            if now - start > hard_cap_s:
+                proc.kill()
+                try:
+                    proc.wait(timeout=30)
+                except Exception:
+                    pass
+                print(f"[Encoder] {label} KILLED after {int(now - start)}s "
+                      f"(absolute safety cap). Raw bitstream preserved -- "
+                      f"use the recovery script on a faster disk.")
+                return False, ""
+            if not slow_noted and now - start > timeout_s \
+                    and last_bytes > 0:
+                slow_noted = True
+                print(f"[Encoder] {label}: past the {int(timeout_s)}s "
+                      f"estimate but still making disk progress "
+                      f"({last_bytes / 1e6:.1f} MB written) -- letting it "
+                      f"finish (CM-124).")
+        err_f.close()
+        tail = ""
+        try:
+            with open(err_path, "r", encoding="utf-8", errors="replace") as f:
+                tail = "\n".join(f.read().strip().split("\n")[-8:])
+        except Exception:
+            pass
+        if rc != 0:
+            print(f"[Encoder] {label} failed (rc={rc})")
+            for line in tail.split("\n")[-5:]:
+                if line:
+                    print(f"  {line}")
+            return False, tail
+        elapsed = _time.monotonic() - start
+        print(f"[Encoder] {label} OK ({elapsed:.0f}s, "
+              f"{last_bytes / 1e6:.1f} MB)")
+        return True, tail
+    except Exception as e:
+        print(f"[Encoder] {label} error: {e}")
+        return False, ""
+    finally:
+        if err_f is not None:
+            try:
+                err_f.close()
+            except Exception:
+                pass
+        if err_path:
+            try:
+                os.unlink(err_path)
+            except Exception:
+                pass
+
+
 class Encoder:
     """NVENC video encoder with ffmpeg remux.
 
@@ -481,6 +640,10 @@ class Encoder:
         self._frames_encoded = 0
         self._closed = False
         self._remux_ok = False
+        # CM-187: audio sidecar attached by the pipeline right after
+        # construction (extraction runs in the background during the run).
+        self._audio_sidecar: Optional[AudioSidecar] = None
+        self._last_ffmpeg_stderr = ""
 
         # CM-122 NVENC liveness canary (field event 2026-08-28): an NVENC
         # session died silently 16.5 minutes into an 11-hour run (metrics
@@ -725,6 +888,15 @@ class Encoder:
                     f"duration before trusting it."
                 )
 
+
+    def attach_audio_sidecar(self, sidecar: "AudioSidecar") -> None:
+        """CM-187: use the run-start audio extraction at finalize."""
+        self._audio_sidecar = sidecar
+
+    @property
+    def sidecar_path(self) -> str:
+        return sidecar_path_for(self._stem)
+
     def _mp4_tag(self) -> str:
         """Per-codec MP4 fourcc tag (hvc1/avc1/av01) — a wrong tag makes
         some players reject the file."""
@@ -747,8 +919,7 @@ class Encoder:
         mp4_args = ""
         if self._container == "mp4":
             mp4_args = f'-tag:v {self._mp4_tag()} -video_track_timescale 90000 '
-            if self.mp4_faststart:
-                mp4_args += "-movflags +faststart "
+            # CM-187: no faststart in the manual command either (one pass).
         return (
             f'ffmpeg -hide_banner -fflags +genpts -r {self.fps_str} '
             f'{fmt_arg}-i "{self._raw_path}" -c:v copy {mp4_args}"{fixed}"'
@@ -786,12 +957,14 @@ class Encoder:
         is_mp4 = self._container == "mp4"
         tag_args = f"-tag:v {self._mp4_tag()} " if is_mp4 else ""
         ts_args = "-video_track_timescale 90000 " if is_mp4 else ""
-        fs_args = "-movflags +faststart " if (is_mp4 and self.mp4_faststart) \
-            else ""
+        # CM-187: no faststart in recovery -- it doubled the disk work and
+        # the recovered file plays fine with the index at the end.
+        fs_args = ""
 
         has_source = bool(self.mux_audio and self.input_path)
         src_line = (
-            f"$source = {_ps_quote(self.input_path)}\n" if has_source else ""
+            f"$source = {_ps_quote(self.input_path)}\n"
+            f"$audio  = {_ps_quote(self.sidecar_path)}\n" if has_source else ""
         )
 
         av1_note = ""
@@ -840,8 +1013,12 @@ class Encoder:
                 "# match. The tiny source A/V start offset (usually < 50 ms)\n"
                 "# is not restored here; a normal completed run does that.\n"
                 "$done = $false\n"
-                "if (Test-Path -LiteralPath $source) {\n"
-                f"    & ffmpeg -hide_banner -y -i $source -i $vtmp "
+                "# The audio sidecar (extracted at run start) is preferred;\n"
+                "# the source file is the fallback.\n"
+                "$asrc = $source\n"
+                "if (Test-Path -LiteralPath $audio) { $asrc = $audio }\n"
+                "if (Test-Path -LiteralPath $asrc) {\n"
+                f"    & ffmpeg -hide_banner -y -i $asrc -i $vtmp "
                 f"-map 1:v:0 -c:v copy {tag_args}-map 0:a? -c:a copy "
                 f"-shortest {fs_args}{ts_args}$fixed\n"
                 "    if ($LASTEXITCODE -eq 0) {\n"
@@ -854,7 +1031,7 @@ class Encoder:
                 "video-only recovery instead.'\n"
                 "    }\n"
                 "} else {\n"
-                "    Write-Host 'Source file not found -- producing a "
+                "    Write-Host 'Neither the audio sidecar nor the source file was found -- producing a "
                 "VIDEO-ONLY recovery.'\n"
                 "    Write-Host 'If the source moved, edit the $source "
                 "line at the top of this script and re-run.'\n"
@@ -914,6 +1091,9 @@ class Encoder:
             self._remove_recovery_script()
         elif self._needs_remux and not self._remux_ok:
             print(f"[Encoder] Raw bitstream kept for debugging: {self._raw_path}")
+            sc = self._audio_sidecar
+            if sc is not None and sc.ready:
+                print(f"[Encoder] Audio sidecar kept for recovery: {sc.path}")
 
         if self._needs_remux and not self._remux_ok:
             # Do NOT print a cheerful "Done" over a broken output (field
@@ -940,150 +1120,16 @@ class Encoder:
         else:
             print(f"[Encoder] Done: {self.output_path}")
 
-    def _run_ffmpeg(self, cmd: List[str], label: str = "ffmpeg",
-                    timeout_s: int = 900,
+    def _run_ffmpeg(self, cmd: List[str], label: str, timeout_s: int = 900,
                     watch_path: Optional[str] = None,
                     stall_s: int = 600) -> bool:
-        """Run one ffmpeg command; return True on rc==0. Shared by both remux
-        passes. UTF-8 decoding avoids cp1252 crashes on non-ASCII filenames.
-        ``timeout_s``: pass _finalize_timeout_s(...) for whole-file remux
-        steps (v1.50.00, the 50GB Idol lesson); the 900s default suits
-        everything else.
-
-        ``watch_path`` (CM-124, field 2026-08-28): a wall-clock timeout,
-        however scaled, still killed a remux that was MAKING DISK PROGRESS
-        at ~4 MB/s (slow HDD pair + faststart second pass; a complete
-        229,812-frame bitstream lost its finalize at 59% written). When
-        watch_path is set, the command is instead supervised by progress:
-        the output's size (plus its ffmpeg faststart '.tmp' sibling) is
-        polled every 5s, and the process is killed only after ``stall_s``
-        seconds with NO byte growth -- a slow disk gets as long as it
-        needs, while a truly wedged ffmpeg still dies in minutes. The
-        scaled ``timeout_s`` becomes an estimate: passing it just logs a
-        courtesy note that the remux is slow but alive."""
-        print(f"[Encoder] {label}: {' '.join(cmd)}")
-        if watch_path is None:
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    timeout=timeout_s,
-                    **NOWINDOW,
-                )
-                if result.returncode != 0:
-                    print(f"[Encoder] {label} failed (rc={result.returncode})")
-                    if result.stderr:
-                        for line in result.stderr.strip().split("\n")[-5:]:
-                            print(f"  {line}")
-                    return False
-                print(f"[Encoder] {label} OK")
-                return True
-            except subprocess.TimeoutExpired:
-                print(f"[Encoder] {label} TIMED OUT after {timeout_s}s with no "
-                      f"result. Every encoded frame is preserved in the raw "
-                      f"bitstream -- use the recovery command printed below, "
-                      f"ideally targeting a faster disk.")
-                return False
-            except Exception as e:
-                print(f"[Encoder] {label} error: {e}")
-                return False
-
-        # Progress-supervised mode (CM-124).
-        import tempfile
-        import time as _time
-
-        def _progress() -> int:
-            total = 0
-            for p in (watch_path, watch_path + ".tmp"):
-                try:
-                    total += os.path.getsize(p)
-                except OSError:
-                    pass
-            return total
-
-        err_path = None
-        err_f = None
-        try:
-            err_f = tempfile.NamedTemporaryFile(
-                prefix="cm_ffmpeg_", suffix=".stderr", delete=False)
-            err_path = err_f.name
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                    stderr=err_f, **NOWINDOW)
-            start = last_change = _time.monotonic()
-            last_bytes = _progress()
-            hard_cap_s = max(int(timeout_s) * 10, 6 * 3600)
-            slow_noted = False
-            while True:
-                rc = proc.poll()
-                if rc is not None:
-                    break
-                _time.sleep(5)
-                cur = _progress()
-                now = _time.monotonic()
-                if cur != last_bytes:
-                    last_bytes = cur
-                    last_change = now
-                if now - last_change > stall_s:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=30)
-                    except Exception:
-                        pass
-                    print(f"[Encoder] {label} KILLED: no disk progress for "
-                          f"{int(now - last_change)}s (output stuck at "
-                          f"{last_bytes / 1e6:.1f} MB). Every encoded frame "
-                          f"is preserved in the raw bitstream -- use the "
-                          f"recovery script.")
-                    return False
-                if now - start > hard_cap_s:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=30)
-                    except Exception:
-                        pass
-                    print(f"[Encoder] {label} KILLED after {int(now - start)}s "
-                          f"(absolute safety cap). Raw bitstream preserved -- "
-                          f"use the recovery script on a faster disk.")
-                    return False
-                if not slow_noted and now - start > timeout_s \
-                        and last_bytes > 0:
-                    slow_noted = True
-                    print(f"[Encoder] {label}: past the {int(timeout_s)}s "
-                          f"estimate but still making disk progress "
-                          f"({last_bytes / 1e6:.1f} MB written) -- letting it "
-                          f"finish (CM-124).")
-            err_f.close()
-            if rc != 0:
-                print(f"[Encoder] {label} failed (rc={rc})")
-                try:
-                    with open(err_path, "r", encoding="utf-8",
-                              errors="replace") as f:
-                        for line in f.read().strip().split("\n")[-5:]:
-                            print(f"  {line}")
-                except Exception:
-                    pass
-                return False
-            elapsed = _time.monotonic() - start
-            print(f"[Encoder] {label} OK ({elapsed:.0f}s, "
-                  f"{last_bytes / 1e6:.1f} MB)")
-            return True
-        except Exception as e:
-            print(f"[Encoder] {label} error: {e}")
-            return False
-        finally:
-            if err_f is not None:
-                try:
-                    err_f.close()
-                except Exception:
-                    pass
-            if err_path:
-                try:
-                    os.unlink(err_path)
-                except Exception:
-                    pass
+        """Run one ffmpeg command under progress supervision (CM-124); see
+        ``run_ffmpeg_supervised``. Keeps the last stderr lines in
+        ``self._last_ffmpeg_stderr`` for the caller (CM-187 moov retry)."""
+        ok, tail = run_ffmpeg_supervised(cmd, label, timeout_s=timeout_s,
+                                         watch_path=watch_path, stall_s=stall_s)
+        self._last_ffmpeg_stderr = tail
+        return ok
 
     def _discard_partial_output(self) -> None:
         """CM-124: a killed/failed final remux leaves a half-written output
@@ -1266,92 +1312,149 @@ class Encoder:
         timescale_args = (
             ["-video_track_timescale", "90000"] if self._container == "mp4" else []
         )
-        # faststart is mp4-only AND now honors the mp4_faststart flag (was
-        # previously forced on with no way to disable it).
-        faststart_args = (
-            ["-movflags", "+faststart"]
-            if (self._container == "mp4" and self.mp4_faststart) else []
-        )
-        # User-supplied extra remux args (must not include -i), appended just
-        # before the output path in whichever final remux command runs.
         extra_args: List[str] = []
         if self.mux_extra_args.strip():
             extra_args = shlex.split(self.mux_extra_args)
             for _t in extra_args:
                 if _t == "-i" or _t.startswith("-i"):
                     raise ValueError("mux_extra_args must not include -i")
-
-        # Cap output near the (possibly delayed) video length so trailing audio
-        # doesn't extend the file, without clipping the delayed video's tail.
-        # (Avoids -shortest, which fails with raw bitstreams lacking timestamps.)
-        dur_args: List[str] = []
+        duration = 0.0
         if self._frames_encoded > 0 and self.fps > 0:
             duration = video_delay + (self._frames_encoded / self.fps)
-            dur_args = ["-t", f"{duration:.3f}"]
-
+        dur_args: List[str] = ["-t", f"{duration:.3f}"] if duration > 0 else []
         ff = self.ffmpeg_path
-        temp_video: Optional[Path] = None
-        try:
-            if video_delay > 0:
-                # -itsoffset is silently DROPPED on a raw annexb input when
-                # ffmpeg CFR-stamps it from frame 0 (confirmed: output video
-                # start_time stayed 0.000). So first bounce the raw stream into
-                # a temp CONTAINER (lossless copy) to give it real timestamps,
-                # then apply -itsoffset on that container in the audio-mux pass.
-                # -itsoffset on a container input is reliable (lada's pattern).
-                # CM-127: derive from the (possibly shortened) sidecar stem.
-                temp_video = Path(self._stem + ".vtmp" + out_path.suffix)
 
+        # CM-187: faststart by RESERVATION (-moov_size) instead of ffmpeg's
+        # second read+rewrite of the whole output. mp4 only; 0 = index at
+        # the end (no faststart).
+        moov_bytes = 0
+        if self._container == "mp4" and self.mp4_faststart:
+            moov_bytes = estimate_moov_bytes(self._frames_encoded, duration)
+
+        # CM-187: the audio sidecar (extracted at run start) replaces the
+        # source as the audio input whenever it is usable. ``audio_none``
+        # = the source has no audio at all -> video-only output, no fallback.
+        sc = self._audio_sidecar
+        if sc is not None and not sc.decided:
+            print("[Encoder] Waiting for the audio sidecar extraction to finish ...")
+            sc.wait(timeout=_finalize_timeout_s(self.input_path))
+        use_sidecar = bool(sc is not None and sc.ready and has_audio_source)
+        audio_none = bool(sc is not None and sc.none)
+
+        def _finish(ok: bool) -> bool:
+            if ok:
+                self._report_av_alignment(video_delay, audio_delay)
+                if sc is not None:
+                    sc.cleanup()
+            else:
+                self._discard_partial_output()
+            return ok
+
+        if self._container == "mp4" and (use_sidecar or audio_none
+                                          or not has_audio_source):
+            sidecar_in = sc.path if use_sidecar else None
+            if self.bf == 0:
+                # P-only NVENC stream: ONE pass. The A/V start offset becomes
+                # an edit list on the audio (negative itsoffset + negative
+                # timestamps allowed), sample-accurate -- measured, see
+                # finalize.py.
+                cmd = build_onepass_raw_cmd(
+                    ff, fps_str=self.fps_str, input_fmt_args=input_fmt_args,
+                    raw_path=str(raw_path), sidecar=sidecar_in,
+                    audio_itsoffset=(audio_delay - video_delay),
+                    color_args=color_args, tag_args=tag_args,
+                    timescale_args=timescale_args, extra_args=extra_args,
+                    moov_bytes=moov_bytes, out_path=str(out_path),
+                    duration_s=(self._frames_encoded / self.fps
+                                if self.fps > 0 else 0.0))
+                print(f"[Encoder] finalize (CM-187): one pass -- raw bitstream "
+                      f"{'+ audio sidecar ' if sidecar_in else ''}-> "
+                      f"{out_path.name}"
+                      + (f", index reserved up front ({moov_bytes / 1e6:.1f} MB)"
+                         if moov_bytes else ""))
+                ok = self._run_finalize(
+                    cmd, "remux", moov_bytes,
+                    timeout_s=_finalize_timeout_s(raw_path, sidecar_in),
+                    watch_path=str(out_path))
+                return _finish(ok)
+            # B-frame stream (bf != 0): the raw stream carries reorder
+            # delay, so keep the wrap step that gives it real timestamps;
+            # the audio mux then uses the sidecar instead of the source.
+            temp_video = Path(self._stem + ".vtmp" + out_path.suffix)
+            try:
                 step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
-                         "-fflags", "+genpts",
+                         "-nostdin", "-fflags", "+genpts",
                          "-analyzeduration", "10M", "-probesize", "50M",
                          "-r", self.fps_str,
                          *input_fmt_args, "-i", str(raw_path),
                          "-map", "0:v:0", "-c:v", "copy"]
                 step1 += color_args + tag_args + timescale_args + [str(temp_video)]
-                # v1.50.00: scale finalize timeouts with the bytes moved
-                # (the 50GB Idol lesson -- faststart = TWO passes of I/O).
-                # CM-124: supervised by disk progress; the scaled value is
-                # now just the "slow but alive" courtesy-note threshold.
+                if not self._run_ffmpeg(step1, "video-container",
+                                        timeout_s=_finalize_timeout_s(raw_path),
+                                        watch_path=str(temp_video)):
+                    return _finish(False)
+                cmd = build_onepass_container_cmd(
+                    ff, video_path=str(temp_video), video_itsoffset=video_delay,
+                    sidecar=sidecar_in, audio_itsoffset=audio_delay,
+                    tag_args=tag_args, timescale_args=timescale_args,
+                    extra_args=extra_args, duration_s=duration,
+                    moov_bytes=moov_bytes, out_path=str(out_path))
+                ok = self._run_finalize(
+                    cmd, "remux", moov_bytes,
+                    timeout_s=_finalize_timeout_s(temp_video, sidecar_in),
+                    watch_path=str(out_path))
+                return _finish(ok)
+            finally:
+                try:
+                    temp_video.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        # ---- Legacy path (sidecar unavailable, or mkv output): audio from
+        # the SOURCE, exactly as shipped -- except that mp4 faststart is now
+        # the front reservation instead of the second pass.
+        if sc is not None and has_audio_source and not use_sidecar:
+            print("[Encoder] Audio sidecar unavailable; finalizing from the "
+                  "source file (legacy path).")
+        temp_video: Optional[Path] = None
+        try:
+            if video_delay > 0:
+                temp_video = Path(self._stem + ".vtmp" + out_path.suffix)
+                step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                         "-nostdin", "-fflags", "+genpts",
+                         "-analyzeduration", "10M", "-probesize", "50M",
+                         "-r", self.fps_str,
+                         *input_fmt_args, "-i", str(raw_path),
+                         "-map", "0:v:0", "-c:v", "copy"]
+                step1 += color_args + tag_args + timescale_args + [str(temp_video)]
                 _t_s = _finalize_timeout_s(raw_path)
                 if not self._run_ffmpeg(step1, "video-container",
                                         timeout_s=_t_s,
                                         watch_path=str(temp_video)):
                     return False
-
-                # Mux with lada's input ordering: the un-delayed AUDIO source is
-                # input 0, the delayed restored VIDEO is input 1. ffmpeg baselines
-                # output timestamps against input 0 (audio @ 0), so the video's
-                # +offset survives as an edit list. With the delayed video as
-                # input 0 instead, ffmpeg re-zeroed it and the offset was lost
-                # (confirmed: output start_time stayed 0.000).
                 if has_audio_source:
                     step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
-                             "-i", self.input_path,
+                             "-nostdin", "-i", self.input_path,
                              "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
                              "-map", "1:v:0", "-c:v", "copy"] + tag_args
                     step2 += ["-map", "0:a?", "-c:a", "copy"]
                 else:
                     step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
-                             "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
+                             "-nostdin", "-itsoffset", f"{video_delay:.6f}",
+                             "-i", str(temp_video),
                              "-map", "0:v:0", "-c:v", "copy"] + tag_args
-                step2 += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
-                # CM-124: the remux also READS the audio source end to end,
-                # so its bytes belong in the estimate too.
-                ok = self._run_ffmpeg(
-                    step2, "remux",
+                step2 += timescale_args + dur_args + extra_args
+                if moov_bytes:
+                    step2 += ["-moov_size", str(moov_bytes)]
+                step2 += [str(out_path)]
+                ok = self._run_finalize(
+                    step2, "remux", moov_bytes,
                     timeout_s=_finalize_timeout_s(
                         temp_video,
                         self.input_path if has_audio_source else None),
                     watch_path=str(out_path))
-                if not ok:
-                    self._discard_partial_output()
-                return ok
-
-            # No video delay: single pass raw -> final. audio_delay (rare: source
-            # video led its audio) is applied on the audio CONTAINER input, which
-            # is reliable.
-            cmd = [ff, "-hide_banner", "-y", "-loglevel", "warning",
+                return _finish(ok)
+            cmd = [ff, "-hide_banner", "-y", "-loglevel", "warning", "-nostdin",
                    "-fflags", "+genpts",
                    "-analyzeduration", "10M", "-probesize", "50M",
                    "-r", self.fps_str,
@@ -1363,24 +1466,82 @@ class Encoder:
             cmd += ["-map", "0:v:0", "-c:v", "copy"] + color_args + tag_args
             if has_audio_source:
                 cmd += ["-map", "1:a?", "-c:a", "copy"]
-            cmd += faststart_args + timescale_args + dur_args + extra_args + [str(out_path)]
-            # v1.50.00: size-scaled timeout (the 50GB Idol lesson).
-            # CM-124: progress-supervised; source audio bytes included.
-            ok = self._run_ffmpeg(
-                cmd, "remux",
+            cmd += timescale_args + dur_args + extra_args
+            if moov_bytes:
+                cmd += ["-moov_size", str(moov_bytes)]
+            cmd += [str(out_path)]
+            ok = self._run_finalize(
+                cmd, "remux", moov_bytes,
                 timeout_s=_finalize_timeout_s(
                     raw_path,
                     self.input_path if has_audio_source else None),
                 watch_path=str(out_path))
-            if not ok:
-                self._discard_partial_output()
-            return ok
+            return _finish(ok)
         finally:
             if temp_video is not None:
                 try:
                     Path(temp_video).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _run_finalize(self, cmd: List[str], label: str, moov_bytes: int,
+                      timeout_s: int, watch_path: str) -> bool:
+        """Run the final mux; if the reserved index space was too small
+        (ffmpeg says so at the trailer), run once more with the index at
+        the end -- a playable file beats a faststart one."""
+        ok = self._run_ffmpeg(cmd, label, timeout_s=timeout_s,
+                              watch_path=watch_path)
+        if ok:
+            return True
+        err = getattr(self, "_last_ffmpeg_stderr", "")
+        if "-c:a" in cmd and audio_mux_failed(err) and not moov_too_small(err):
+            # The AUDIO could not be stream-copied (TS capture quirks: LATM
+            # AAC, damaged ADTS packets, a codec mp4 cannot hold). The video
+            # is complete -- re-encode the audio to AAC-LC and keep the run.
+            print("[Encoder] The source audio cannot be copied into the "
+                  "output as-is; writing again with the audio re-encoded "
+                  "to AAC 192 kb/s (video untouched).")
+            self._discard_partial_output()
+            ok = self._run_ffmpeg(with_audio_reencode(cmd),
+                                  label + " (audio re-encoded)",
+                                  timeout_s=timeout_s, watch_path=watch_path)
+            if ok:
+                return True
+            err = getattr(self, "_last_ffmpeg_stderr", "")
+            cmd = with_audio_reencode(cmd)
+        if not moov_bytes:
+            return False
+        if moov_too_small(err):
+            print(f"[Encoder] The reserved index space ({moov_bytes / 1e6:.1f} MB) "
+                  f"was too small for this file; writing again with the "
+                  f"index at the end (no faststart).")
+            retry = list(cmd)
+            i = retry.index("-moov_size")
+            del retry[i:i + 2]
+            self._discard_partial_output()
+            return self._run_ffmpeg(retry, label + " (no faststart)",
+                                    timeout_s=timeout_s, watch_path=watch_path)
+        return False
+
+    def _report_av_alignment(self, video_delay: float, audio_delay: float) -> None:
+        """One honest line about what the finished file will present."""
+        try:
+            ffprobe = _derive_ffprobe(self.ffmpeg_path)
+            v0, a0, skip = probe_av_start(ffprobe, self.output_path)
+            want = video_delay - audio_delay
+            parts = []
+            if v0 is not None:
+                parts.append(f"video starts at {v0 * 1000:.0f} ms")
+            if a0 is not None:
+                parts.append(f"audio at {a0 * 1000:.0f} ms")
+            if skip:
+                parts.append(f"audio edit list skips {skip} samples")
+            desc = probe_audio_desc(ffprobe, self.output_path)
+            print(f"[Encoder] A/V start: " + ", ".join(parts)
+                  + f" (source offset {want * 1000:+.0f} ms)"
+                  + (f" [{desc}]" if desc else "") + ".")
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -1519,6 +1680,8 @@ class FfmpegEncoder:
 
         self._venc_path = self._stem + ".venc.mp4"
         self._stderr_path = self._stem + ".venc.stderr.log"
+        self._audio_sidecar: Optional[AudioSidecar] = None   # CM-187
+        self._last_ffmpeg_stderr = ""
 
         # Pick the encoder: QSV -> AMF -> software (Batch 34 ladder). Each
         # rung is a real 2-frame init probe on THIS machine, so a missing
@@ -1605,6 +1768,23 @@ class FfmpegEncoder:
         except Exception:
             pass  # recovery aid must never break the encode
 
+
+    def attach_audio_sidecar(self, sidecar: "AudioSidecar") -> None:
+        """CM-187: use the run-start audio extraction at finalize."""
+        self._audio_sidecar = sidecar
+
+    @property
+    def sidecar_path(self) -> str:
+        return sidecar_path_for(self._stem)
+
+    def _run_ffmpeg(self, cmd: List[str], label: str, timeout_s: int = 900,
+                    watch_path: Optional[str] = None,
+                    stall_s: int = 600) -> bool:
+        ok, tail = run_ffmpeg_supervised(cmd, label, timeout_s=timeout_s,
+                                         watch_path=watch_path, stall_s=stall_s)
+        self._last_ffmpeg_stderr = tail
+        return ok
+
     def _mp4_tag(self) -> str:
         return {"hevc": "hvc1", "h265": "hvc1", "h264": "avc1",
                 "avc": "avc1", "av1": "av01"}.get(self.codec, "hvc1")
@@ -1622,11 +1802,12 @@ class FfmpegEncoder:
         fixed = self._stem + "-FIXED" + out.suffix
         tag_args = f"-tag:v {self._mp4_tag()} "
         ts_args = "-video_track_timescale 90000 "
-        fs_args = "-movflags +faststart " if self.mp4_faststart else ""
+        fs_args = ""   # CM-187: no faststart in recovery (see the NVENC twin)
 
         has_source = bool(self.mux_audio and self.input_path)
         src_line = (
-            f"$source = {_ps_quote(self.input_path)}\n" if has_source else ""
+            f"$source = {_ps_quote(self.input_path)}\n"
+            f"$audio  = {_ps_quote(self.sidecar_path)}\n" if has_source else ""
         )
         vid_only_cmd = (
             f"& ffmpeg -hide_banner -y -i $venc -map 0:v:0 -c:v copy "
@@ -1654,8 +1835,10 @@ class FfmpegEncoder:
                 "# source A/V start offset (usually < 50 ms) is not restored\n"
                 "# here; a normal completed run does that.\n"
                 "$done = $false\n"
-                "if (Test-Path -LiteralPath $source) {\n"
-                f"    & ffmpeg -hide_banner -y -i $source -i $venc "
+                "$asrc = $source\n"
+                "if (Test-Path -LiteralPath $audio) { $asrc = $audio }\n"
+                "if (Test-Path -LiteralPath $asrc) {\n"
+                f"    & ffmpeg -hide_banner -y -i $asrc -i $venc "
                 f"-map 1:v:0 -c:v copy {tag_args}-map 0:a? -c:a copy "
                 f"-shortest {fs_args}{ts_args}$fixed\n"
                 "    if ($LASTEXITCODE -eq 0) {\n"
@@ -1666,8 +1849,8 @@ class FfmpegEncoder:
                 "video-only recovery instead.'\n"
                 "    }\n"
                 "} else {\n"
-                "    Write-Host 'Source file not found -- producing a "
-                "VIDEO-ONLY recovery.'\n"
+                "    Write-Host 'Neither the audio sidecar nor the source "
+                "file was found -- producing a VIDEO-ONLY recovery.'\n"
                 "    Write-Host 'If the source moved, edit the $source "
                 "line at the top of this script and re-run.'\n"
                 "}\n"
@@ -1835,8 +2018,39 @@ class FfmpegEncoder:
         duration = video_delay + (self._frames_encoded / self.fps
                                   if self.fps > 0 else 0)
 
-        cmd = [self.ffmpeg_path, "-hide_banner", "-y", "-loglevel", "warning"]
-        if has_audio:
+        # CM-187: one pass -- the fragmented .venc + the audio sidecar
+        # (extracted at run start) -> final mp4 with the index reserved up
+        # front. The source is read only when the sidecar is unavailable.
+        sc = self._audio_sidecar
+        if sc is not None and not sc.decided:
+            print("[Encoder] Waiting for the audio sidecar extraction to finish ...")
+            sc.wait(timeout=_finalize_timeout_s(self.input_path))
+        use_sidecar = bool(sc is not None and sc.ready and has_audio)
+        audio_none = bool(sc is not None and sc.none)
+        moov_bytes = estimate_moov_bytes(self._frames_encoded, duration) \
+            if self.mp4_faststart else 0
+        tag_args = ["-tag:v", tag]
+        ts_args = ["-video_track_timescale", "90000"]
+        if use_sidecar or audio_none or not has_audio:
+            audio_in = sc.path if use_sidecar else None
+            cmd = build_onepass_container_cmd(
+                self.ffmpeg_path, video_path=str(venc),
+                video_itsoffset=video_delay, sidecar=audio_in,
+                audio_itsoffset=audio_delay, tag_args=tag_args,
+                timescale_args=ts_args, extra_args=[], duration_s=duration,
+                moov_bytes=moov_bytes, out_path=self.output_path)
+            print(f"[Encoder] finalize (CM-187): one pass -- .venc "
+                  f"{'+ audio sidecar ' if audio_in else ''}-> "
+                  f"{Path(self.output_path).name}"
+                  + (f", index reserved up front ({moov_bytes / 1e6:.1f} MB)"
+                     if moov_bytes else ""))
+            _t_s = _finalize_timeout_s(venc, audio_in)
+        else:
+            if sc is not None and has_audio:
+                print("[Encoder] Audio sidecar unavailable; finalizing from "
+                      "the source file (legacy path).")
+            cmd = [self.ffmpeg_path, "-hide_banner", "-y", "-loglevel",
+                   "warning", "-nostdin"]
             if audio_delay:
                 cmd += ["-itsoffset", f"{audio_delay:.6f}"]
             cmd += ["-i", self.input_path]
@@ -1845,56 +2059,89 @@ class FfmpegEncoder:
             cmd += ["-i", str(venc),
                     "-map", "1:v:0", "-c:v", "copy", "-tag:v", tag,
                     "-map", "0:a?", "-c:a", "copy"]
-        else:
-            cmd += ["-i", str(venc),
-                    "-map", "0:v:0", "-c:v", "copy", "-tag:v", tag]
-        if self.mp4_faststart:
-            cmd += ["-movflags", "+faststart"]
-        cmd += ["-video_track_timescale", "90000"]
-        if duration > 0:
-            cmd += ["-t", f"{duration:.3f}"]
-        cmd += [self.output_path]
+            cmd += ts_args
+            if moov_bytes:
+                cmd += ["-moov_size", str(moov_bytes)]
+            if duration > 0:
+                cmd += ["-t", f"{duration:.3f}"]
+            cmd += [self.output_path]
+            _t_s = _finalize_timeout_s(venc, self.input_path)
 
-        print(f"[Encoder] remux: {' '.join(cmd)}")
-        # v1.50.00: size-scaled timeout (the 50GB Idol lesson -- faststart
-        # rewrites the whole output a second time; flat 900s killed a remux
-        # that was still making disk progress).
-        _t_s = _finalize_timeout_s(venc)
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               timeout=_t_s, **NOWINDOW)
-            ok = (r.returncode == 0)
-            if not ok:
-                for line in (r.stderr or "").strip().split("\n")[-5:]:
-                    print(f"  {line}")
-        except subprocess.TimeoutExpired:
-            ok = False
-            print(f"[Encoder] remux TIMED OUT after {_t_s}s with no result.")
-        except Exception as e:
-            ok = False
-            print(f"[Encoder] remux error: {e}")
+        # v1.71: progress-supervised like the NVENC path (a wall-clock
+        # timeout killed slow-disk remuxes here too); the reserved index
+        # falls back to index-at-end if the estimate was too small.
+        ok = self._run_ffmpeg(cmd, "remux", timeout_s=_t_s,
+                              watch_path=self.output_path)
+        if (not ok and "-c:a" in cmd and audio_mux_failed(self._last_ffmpeg_stderr)
+                and not moov_too_small(self._last_ffmpeg_stderr)):
+            print("[Encoder] The source audio cannot be copied into the "
+                  "output as-is; writing again with the audio re-encoded "
+                  "to AAC 192 kb/s (video untouched).")
+            try:
+                Path(self.output_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            cmd = with_audio_reencode(cmd)
+            ok = self._run_ffmpeg(cmd, "remux (audio re-encoded)", timeout_s=_t_s,
+                                  watch_path=self.output_path)
+        if not ok and moov_bytes and moov_too_small(self._last_ffmpeg_stderr):
+            print(f"[Encoder] The reserved index space ({moov_bytes / 1e6:.1f} MB) "
+                  f"was too small for this file; writing again with the "
+                  f"index at the end (no faststart).")
+            retry = list(cmd)
+            i = retry.index("-moov_size")
+            del retry[i:i + 2]
+            try:
+                Path(self.output_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            ok = self._run_ffmpeg(retry, "remux (no faststart)", timeout_s=_t_s,
+                                  watch_path=self.output_path)
 
         if ok:
-            print("[Encoder] remux OK")
+            try:
+                ffprobe = _derive_ffprobe(self.ffmpeg_path)
+                v0, a0, skip = probe_av_start(ffprobe, self.output_path)
+                parts = []
+                if v0 is not None:
+                    parts.append(f"video starts at {v0 * 1000:.0f} ms")
+                if a0 is not None:
+                    parts.append(f"audio at {a0 * 1000:.0f} ms")
+                desc = probe_audio_desc(ffprobe, self.output_path)
+                print("[Encoder] A/V start: " + ", ".join(parts)
+                      + f" (source offset {(video_delay - audio_delay) * 1000:+.0f} ms)"
+                      + (f" [{desc}]" if desc else "") + ".")
+            except Exception:
+                pass
             try:
                 venc.unlink()
                 Path(self._stderr_path).unlink(missing_ok=True)
             except Exception:
                 pass
+            if sc is not None:
+                sc.cleanup()
             self._remove_recovery_script()
             print(f"[Encoder] Done: {self.output_path}")
         else:
+            try:
+                p = Path(self.output_path)
+                if p.exists():
+                    p.unlink()
+                    print(f"[Encoder] Removed unplayable partial output: {self.output_path}")
+            except Exception:
+                pass
             print(f"[Encoder] *** REMUX FAILED -- {self.output_path} is NOT "
                   f"complete. Video-only stream preserved at: {venc} "
                   f"(fragmented mp4; playable).")
+            if sc is not None and sc.ready:
+                print(f"[Encoder] Audio sidecar kept for recovery: {sc.path}")
             if self._recovery_script_path:
                 print(f"[Encoder] Recover now -- run the ready-made script "
                       f"(it re-adds the audio automatically): "
                       f"{self._recovery_script_path}")
             else:
                 print(f"[Encoder] Re-wrap manually with: "
-                      f'ffmpeg -i "{venc}" -c copy -movflags +faststart out.mp4')
+                      f'ffmpeg -i "{venc}" -c copy out.mp4')
 
 
 # (Encoder, FfmpegEncoder, nvenc_available are imported explicitly by the

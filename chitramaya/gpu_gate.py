@@ -124,7 +124,7 @@ def compose_message(edition: str, names: List[str], detail: str) -> str:
                      "AMD RDNA 3-4) was found.")
     lines += ["",
               "For the exact reason run:  ChitraMaya-cli.exe -self-check",
-              "This text is also in ChitraMaya-console.log next to the app."]
+              "This text is also in the newest ChitraMaya-console-*.log next to the app."]
     if detail:
         lines += ["", f"Probe result: {detail}"]
     return "\n".join(lines)

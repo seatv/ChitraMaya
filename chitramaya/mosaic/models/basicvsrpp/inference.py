@@ -32,6 +32,69 @@ def get_default_gan_inference_config() -> dict:
     )
 
 
+def _load_permissive(checkpoint_path: str):
+    """torch.load with an Unpickler that substitutes an inert stub for any
+    class whose module is not installed (mmengine, mmagic, mmcv ...). Only
+    tensors are used from the result; the stubs are discarded."""
+    import pickle
+    import types
+
+    class _StubMeta(type):
+        # torch.save writes pickle protocol 2. At that protocol a nested
+        # qualified name (mmengine's HistoryBuffer.min, stored in the
+        # buffer's statistics table) is written as getattr(HistoryBuffer,
+        # "min") -- so the stub CLASS must answer any attribute lookup with
+        # another stub, or the field _full.pth fails with "type object
+        # 'HistoryBuffer' has no attribute 'min'" (#9, 09-15 field test).
+        def __getattr__(cls, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return _StubMeta(f"{cls.__name__}.{name}", (cls,), {"__module__": cls.__module__})
+
+    class _Stub(metaclass=_StubMeta):
+        def __new__(cls, *a, **k):
+            return object.__new__(cls)
+
+        def __init__(self, *a, **k):
+            pass
+
+        def __setstate__(self, state):
+            self.__dict__["_state"] = state
+
+        def __call__(self, *a, **k):
+            return self
+
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return self
+
+        # dict / list subclasses (mmengine ConfigDict, addict Dict) are
+        # rebuilt by pickle with obj[key] = value / obj.append(...): swallow.
+        def __setitem__(self, key, value):
+            pass
+
+        def append(self, item):
+            pass
+
+        def extend(self, items):
+            pass
+
+    class _PermissiveUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            try:
+                return super().find_class(module, name)
+            except (ModuleNotFoundError, AttributeError, ImportError):
+                return _StubMeta(str(name), (_Stub,), {"__module__": str(module)})
+
+    def _load(f, **kw):
+        return _PermissiveUnpickler(f, **kw).load()
+
+    pm = types.SimpleNamespace(Unpickler=_PermissiveUnpickler, load=_load,
+                               __name__="chitramaya_permissive_pickle")
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=False, pickle_module=pm)
+
+
 def _load_checkpoint_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     # CM-095 (v1.50.00): a wrong or corrupt file here used to surface as a
     # cryptic torch/pickle traceback deep inside compile or load. Catch the
@@ -50,6 +113,17 @@ def _load_checkpoint_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]
             ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:
             ckpt = torch.load(checkpoint_path, map_location="cpu")
+        except (ModuleNotFoundError, AttributeError) as _mnf:
+            # GitHub #9: lada's `_full.pth` files are mmengine TRAINING
+            # checkpoints -- the pickle references mmengine/mmagic classes
+            # (message hub, config objects, optimizer state) that are not
+            # part of ChitraMaya. The generator weights inside are the same
+            # ones the runtime .pth carries, so read them with a permissive
+            # unpickler that stands in an inert stub for any class it cannot
+            # import; everything we use is plain tensors under state_dict.
+            print(f"[Restorer] {_os.path.basename(checkpoint_path)}: full training checkpoint "
+                  f"({_mnf}); reading its weights with a permissive loader (#9).")
+            ckpt = _load_permissive(checkpoint_path)
     except Exception as e:
         _sz = _os.path.getsize(checkpoint_path)
         raise RuntimeError(

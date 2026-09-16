@@ -29,6 +29,8 @@ from chitramaya.mosaic.detector.core import Detection, Detector as YoloDetector
 from chitramaya.mosaic.core.clip import Clip
 from chitramaya.mosaic.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from chitramaya.mosaic.restorer.compositor import composite_clip_into_store
+from chitramaya.mosaic.redecode import LagDecoder, RedecodeStore, drain_plan_to_encoder, normalize_patch_home
+from chitramaya.run_report import RunReport, format_vram, vram_snapshot
 from chitramaya.mosaic.vr_projection import composite_clip_into_store_projected
 from chitramaya.mosaic.utils.config_util import Config
 from chitramaya.video.decoder import Decoder
@@ -69,6 +71,38 @@ from .pipeline_utils import (
     wrap_surface_as_tensor,
     write_timecodes_v2,
 )
+
+
+class RegionStats:
+    """CM-196 T11 report nit: the size of every restored region, whether or
+    not a secondary upscaler is on (the SecStats crop sizes only existed
+    with one). largest_px + the top frames are the seek list for the
+    biggest regions -- the 256/512 clip-size study and the VRAM ledger
+    both need them on plain runs."""
+
+    __slots__ = ("crops", "largest_px", "frame_max_px")
+
+    def __init__(self) -> None:
+        self.crops = 0
+        self.largest_px = 0
+        self.frame_max_px: Dict[int, int] = {}
+
+    def note(self, frame_num, orig_shape_hw) -> None:
+        try:
+            dim = max(int(orig_shape_hw[0]), int(orig_shape_hw[1]))
+        except Exception:
+            return
+        self.crops += 1
+        if dim > self.largest_px:
+            self.largest_px = dim
+        if frame_num is not None:
+            fn = int(frame_num)
+            if dim > self.frame_max_px.get(fn, 0):
+                self.frame_max_px[fn] = dim
+
+    def top_frames(self, n: int = 20):
+        ranked = sorted(self.frame_max_px.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [{"frame": f, "crop_px": px} for f, px in ranked[:max(0, int(n))]]
 
 
 @dataclass
@@ -179,6 +213,17 @@ class PipelineMetrics:
 
     # [CHANGE 2] backpressure stats
     backpressure_waits: int = 0
+
+    # CM-191: re-decode frame source stats (0 when a FrameStore was used)
+    t_redecode: float = 0.0
+    redecode_frames: int = 0
+    redecode_skipped: int = 0
+    redecode_missing: int = 0
+    redecode_peak_patch_mb: float = 0.0
+
+    # CM-186: restored clip frames the black-output guard refused (all-zero
+    # restorer output for a non-black source crop); the source crop stays.
+    guard_black_frames: list = field(default_factory=list)
 
     def sum_parts(self) -> float:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
@@ -667,13 +712,60 @@ class Pipeline:
         # today's device-resident store whenever it fits free VRAM and
         # flips to system RAM only when the projected store would not fit
         # (the long-MCL enabler); "device"/"host" force the choice.
+        # CM-191 (v1.71): "redecode" stores no frames at all -- a second
+        # decoder on the same source re-produces each frame when it is due
+        # for paste-back and encoding. "auto" resolves to it on the NVDEC
+        # path (see run()); "device"/"host" keep the FrameStore.
         self.store_backend: str = str(
             self.cfg.get("store_backend", default="auto") or "auto"
         ).strip().lower()
-        if self.store_backend not in ("auto", "device", "host"):
+        if self.store_backend not in ("auto", "device", "host", "redecode"):
             print(f"[FrameStore] WARNING: invalid store_backend "
                   f"{self.store_backend!r}; using 'auto'.")
             self.store_backend = "auto"
+        # CM-196: where the re-decode path parks pending patches while their
+        # clip is open: "host" (pinned RAM, default) | "device" (VRAM, the
+        # T10c behaviour, for A/B). Config key redecode_patches / flat
+        # redecodePatches / CLI --redecode-patches. No panel control.
+        self.redecode_patches: str = normalize_patch_home(
+            self.cfg.get("redecode_patches", default="host"))
+        # CM-196 T10f: torch.cuda.empty_cache() after drains is OPT-IN. On an
+        # 8 GB card at the ceiling the released space is taken by NVDEC/NVENC
+        # surfaces and torch's next allocation has to evict someone -- the
+        # T10e Dell run (died at 20 %, vs 59 % on T10d-2) is the suspect case.
+        # Config key vram_cache_release / flat vramCacheRelease / CLI flag.
+        self.vram_cache_release: bool = bool(self.cfg.get("vram_cache_release", default=False))
+        # CM-196 T10f: per-stage VRAM ledger -- what each build step costs on
+        # the card, so `other` in the [VRAM] lines gets names. Filled by
+        # _vram_stage(); the warm UI build (MosaicPipeline) records the
+        # detector/restorer here before any run exists.
+        self._vram_ledger: list = []        # this run's stages (reset per run)
+        # The UI's warm detector/restorer build. process_file() re-runs
+        # __post_init__ per file on the same host, so keep what is there.
+        self._vram_ledger_warm: list = list(getattr(self, "_vram_ledger_warm", []) or [])
+        self._vram_prev = None
+
+        # CM-180: run report (replaces the misses JSON). runReport = beside |
+        # temp | off; run_panel = the control panel exactly as the UI
+        # submitted it (None on CLI runs).
+        self.run_report_mode: str = str(self.cfg.get("runReport", default="beside") or "beside").strip().lower()
+        _rp = self.cfg.get("run_panel", default=None)
+        self.run_panel = _rp if isinstance(_rp, dict) else None
+        # What was ASKED, captured before any forcing (CM-169 mutates det_fp16
+        # in _build_detector; the secondary may fall back; TRT may fall back).
+        self._asked = {
+            "det_fp16": bool(self.det_fp16),
+            "rest_fp16": bool(self.rest_fp16),
+            "store_backend": str(self.store_backend),
+            "secondary": str(self.secondary_restoration),
+            "secondary_denoise": str(getattr(self, "secondary_denoise", "none")),
+            "rest_backend": str(self.cfg.get("restoration", "backend", default="auto") or "auto"),
+            "blendmask": str(self.rest_blendmask),
+            "feather_radius": int(self.feather_radius),
+            "max_clip_length": int(self.rest_max_clip_length),
+            "det_imgsz": int(self.det_imgsz),
+            "redecode_patches": str(self.redecode_patches),
+        }
 
         # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
@@ -704,6 +796,35 @@ class Pipeline:
         self.async_encoder: bool = bool(self.cfg.get("encoder", "async_encoder", default=False))
         self.async_encoder_queue: int = int(self.cfg.get("encoder", "async_encoder_queue", default=16))
 
+    def _vram_stage(self, label: str, frame=None) -> None:
+        """CM-196 T10f: one ledger line per build step: the driver's used
+        VRAM now and the delta since the previous stage (= what this step
+        allocated, torch and non-torch alike). Printed and kept for the run
+        report's `vram.samples` (label, used, delta_mb, torch_*, other)."""
+        try:
+            snap = vram_snapshot(self.device)
+        except Exception:
+            snap = None
+        if not snap:
+            return
+        prev = self._vram_prev
+        delta = (int(snap["used"]) - int(prev["used"])) if prev else None
+        self._vram_prev = dict(snap)
+        row = {"label": str(label), "delta_mb": delta}
+        row.update(snap)
+        if frame is not None:
+            row["frame"] = int(frame)
+        self._vram_ledger.append(row)
+        d = f" ({'+' if delta >= 0 else ''}{delta} MB this step)" if delta is not None else ""
+        print(f"[VRAM] {label}: used {snap['used']} / {snap['total']} MB{d}; "
+              f"torch reserved {snap['torch_reserved']}, other {snap['other']}")
+        rep = getattr(self, "_report", None)
+        if rep is not None:
+            try:
+                rep.vram(str(label), snap, frame=frame, delta_mb=delta)
+            except Exception:
+                pass
+
     def _build_detector(self):
         if self.mode == "none":
             return None
@@ -732,6 +853,29 @@ class Pipeline:
             f"[Detector] type={det_type} imgsz={self.det_imgsz} "
             f"conf={self.det_conf} iou={self.det_iou} fp16={self.det_fp16}"
         )
+        # CM-201: say what shapes this engine was built for. The ledger line
+        # right after the build shows what it costs; an engine without a
+        # sidecar was built before CM-201 (ultralytics' 2x-imgsz, batch-8
+        # profile) and is the 3 GB item on an 8 GB card.
+        try:
+            _mp = str(self.det_model)
+            if _mp.lower().endswith(".engine"):
+                import json as _json
+                _sc = Path(_mp + ".json")
+                if _sc.is_file():
+                    _pi = _json.loads(_sc.read_text(encoding="utf-8"))
+                    _mx = _pi.get("shape_max") or []
+                    print(f"[Detector] engine profile: {_pi.get('profile', '?')} -- batch 1..{_pi.get('max_batch', '?')}, "
+                          f"H,W up to {(_mx[2] if len(_mx) > 2 else '?')} (built {_pi.get('built', '?')}"
+                          f"{', ' + str(_pi.get('gpu')) if _pi.get('gpu') else ''})")
+                    if str(_pi.get("profile")) == "legacy":
+                        print("[Detector] NOTE: legacy profile (max H,W = 2x imgsz, batch 8): TensorRT sizes its "
+                              "context for shapes that never run. Recompile from Manage Models to reclaim ~2-3 GB (CM-201).")
+                else:
+                    print("[Detector] engine profile: unknown (built before CM-201: batch 8, H,W up to 2x imgsz -- "
+                          "~3 GB of VRAM on this card). Recompile from Manage Models to reclaim it.")
+        except Exception:
+            pass
 
         common = dict(
             model_path=self.det_model,
@@ -993,6 +1137,17 @@ class Pipeline:
         from chitramaya.keep_awake import acquire as _ka_acquire, \
             release as _ka_release
         _ka_acquire(label=Path(self.input_path).name)
+        _audio_sidecar = None   # CM-187, set once the encoder exists
+        # A sidecar from a run that died before its main loop (model load
+        # failure etc.) would otherwise linger next to that output.
+        _prev_sc = getattr(self, "_audio_sidecar_live", None)
+        if _prev_sc is not None:
+            try:
+                _prev_sc.cancel()
+                _prev_sc.cleanup()
+            except Exception:
+                pass
+            self._audio_sidecar_live = None
 
         inp = Path(self.input_path)
         out = Path(self.output_path)
@@ -1009,6 +1164,38 @@ class Pipeline:
             except (TypeError, ValueError):
                 _foi_target = None
         out.parent.mkdir(parents=True, exist_ok=True)
+
+        # CM-180: the run report starts NOW so the per-run console log
+        # covers model builds and warnings printed before the first frame.
+        # Test Frame (FOI) runs write no report.
+        self._report = None
+        if foi_capture is None:
+            try:
+                from chitramaya import __version__ as _cm_version
+                from chitramaya.device import is_rocm as _is_rocm_rr
+                _ed = "rocm" if _is_rocm_rr() else ("xpu" if self.device.type == "xpu"
+                                                    else "cuda" if self.device.type == "cuda" else "cpu")
+                self._report = RunReport(
+                    mode=self.run_report_mode, output_path=str(out), input_path=str(inp),
+                    panel=self.run_panel,
+                    config=({k: v for k, v in self.cfg.data.items() if k != "run_panel"}
+                            if isinstance(getattr(self.cfg, "data", None), dict) else None),
+                    version=str(_cm_version), edition=_ed,
+                    temp_dir=str(self.cfg.get("temp_dir", default="") or ""),
+                )
+                # CM-196 T10f: the warm build's ledger lines (detector,
+                # restorer built before any run) go into this run's report.
+                try:
+                    for _row in list(self._vram_ledger_warm):
+                        self._report.vram(str(_row.get("label")), {k: _row[k] for k in ("used","free","total","torch_allocated","torch_reserved","other") if k in _row},
+                                          frame=_row.get("frame"), delta_mb=_row.get("delta_mb"))
+                except Exception:
+                    pass
+                if self._report.mode == "off":
+                    print("[Pipeline] run report: off (runReport) -- no .run.json / .log will be written")
+            except Exception as _rr_e:
+                print(f"[Pipeline] run report unavailable ({_rr_e}); continuing without it")
+                self._report = None
 
         metrics = PipelineMetrics()
         metrics.det_stats.dump_rois = bool(self.det_dump_rois)
@@ -1030,6 +1217,9 @@ class Pipeline:
             from chitramaya.device import empty_cache as _dev_empty_cache
             _dev_empty_cache(self.device)   # CM-093: device-generic
 
+        self._vram_ledger = []
+        self._vram_prev = None
+        self._vram_stage("run start (context + warm models)")
         decoder = Decoder(
             input_path=str(inp),
             gpu_id=self.dec_gpu_id,
@@ -1038,6 +1228,7 @@ class Pipeline:
             ffmpeg_input_args=self.dec_ffmpeg_input_args,
             trim_negative_pts=False,
         )
+        self._vram_stage("primary decoder")
 
         w = int(decoder.metadata.width)
         h = int(decoder.metadata.height)
@@ -1145,6 +1336,7 @@ class Pipeline:
         # paste-back (and before the secondary, whose per-frame variance it
         # removes at the source). Real restoration only; only restored
         # pixels are ever touched. Weights degrade gracefully to a WARNING.
+        self._vram_stage("secondary upscaler")
         if self.temporal_stability > 0 and self._stabilizer is None:
             if self.mode != "real":
                 print("[TemporalFix] Note: temporal stabilization applies only "
@@ -1179,6 +1371,7 @@ class Pipeline:
                           f"restoration model or in models/.")
 
         # ChitraMaya's Encoder has a slimmer signature than gRestorer's.
+        self._vram_stage("temporal stabilizer")
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
         _mux_audio_bool = str(self.mux_audio).lower() != "none"
         if foi_capture is not None:
@@ -1203,6 +1396,28 @@ class Pipeline:
                 mux_extra_args=self.mux_extra_args,
             )
 
+            # CM-187: extract the source audio ONCE, now, in the background
+            # (stream copy, low priority). The finalize muxes from this
+            # sidecar instead of re-reading the whole source, and the
+            # RECOVER script prefers it too -- the source drive is never
+            # needed again after this point.
+            if _mux_audio_bool and hasattr(encoder, "attach_audio_sidecar"):
+                try:
+                    from chitramaya.video.finalize import AudioSidecar
+                    from chitramaya.video.encoder import _derive_ffprobe
+                    _sc = AudioSidecar(
+                        ffmpeg=encoder.ffmpeg_path,
+                        ffprobe=_derive_ffprobe(encoder.ffmpeg_path),
+                        src=str(inp), out_path=encoder.sidecar_path)
+                    _sc.start()
+                    encoder.attach_audio_sidecar(_sc)
+                    _audio_sidecar = _sc
+                    self._audio_sidecar_live = _sc
+                except Exception as _sc_e:
+                    print(f"[Encoder] Audio sidecar not started "
+                          f"({type(_sc_e).__name__}: {_sc_e}); the finalize "
+                          f"will read the source file.")
+
             # Wrap in AsyncEncoder if enabled — runs encode_frame() on a
             # background thread, overlapping NVENC work with the main thread's
             # decode/detect/restore/composite pass.
@@ -1210,6 +1425,7 @@ class Pipeline:
                 print(f"[Encoder] Async encoder thread enabled (queue_size={self.async_encoder_queue})")
                 encoder = AsyncEncoder(encoder, device=self.device, queue_size=self.async_encoder_queue)
 
+        self._vram_stage("encoder")
         # Warm-model injection (additive): the UI bridge passes pre-built
         # models so repeated previews don't reload. When not provided, build
         # exactly as before. analysis_use_synth_rois still forces no detector.
@@ -1219,7 +1435,12 @@ class Pipeline:
             detector = detector_override
         else:
             detector = self._build_detector()
-        restorer = restorer_override if restorer_override is not None else self._build_restorer()
+            self._vram_stage("detector (built in run)")
+        if restorer_override is not None:
+            restorer = restorer_override
+        else:
+            restorer = self._build_restorer()
+            self._vram_stage("restorer (built in run)")
 
         tracker = None
         if self.mode != "none":
@@ -1266,6 +1487,67 @@ class Pipeline:
         # files and a stale floor from a previous host run must not throttle
         # a device-store run.
         self._ram_floor_bytes = None
+
+        # CM-191 (v1.71): the re-decode frame source. Resolved BEFORE the
+        # store plan because when it is in use there is no store to plan:
+        # no full frame is kept, so Max Clip Length no longer costs RAM or
+        # VRAM, and the host-store GPU->host->GPU round trip is gone (the
+        # Dell/OCuLink 4-lane case: ~5 GB/s of PCIe traffic, measured
+        # 2026-09-12). The second decoder is opened HERE, before the first
+        # frame is processed, so a failure to open still leaves the run on
+        # the frame store with nothing lost.
+        _lag: Optional[LagDecoder] = None
+        _redecode_wanted = store_backend in ("auto", "redecode")
+        _redecode_note = ""
+        if store_backend == "auto" and decoder.backend != "nvdec":
+            # ffmpeg-decode editions (AMD/Intel/CPU): a second software decode
+            # is not free; the default stays the frame store until measured.
+            _redecode_wanted = False
+        if _redecode_wanted and self._vrproj is not None:
+            _redecode_wanted = False
+            _redecode_note = "VR projection composites into stored frames"
+        if _redecode_wanted and foi_capture is not None:
+            _redecode_wanted = False
+            _redecode_note = "Test Frame runs keep the frame store"
+        if _redecode_wanted and tracker is None:
+            _redecode_wanted = False   # mode none: frames never enter the store
+        if _redecode_wanted:
+            try:
+                _lag = LagDecoder(decoder, batch_size=2)   # CM-196: 4-frame queue
+                self._vram_stage("lag decoder")
+            except Exception as _lag_e:
+                _lag = None
+                print(f"[FrameStore] re-decode source unavailable "
+                      f"({type(_lag_e).__name__}: {_lag_e}); using the frame "
+                      f"store for this run.")
+        elif store_backend == "redecode" and _redecode_note:
+            print(f"[FrameStore] NOTE: {_redecode_note}; using the frame store for this run.")
+        if _lag is not None:
+            requested_cap = 0        # no store to plan
+            print(f"[FrameStore] backend: REDECODE -- no frame store. Frames are "
+                  f"decoded a second time ({_lag.backend}) when they are due "
+                  f"for paste-back and encoding; Max Clip Length costs no "
+                  f"VRAM, and no full frame crosses the PCIe bus. Pending "
+                  f"patches wait in "
+                  f"{'pinned RAM' if self.redecode_patches == 'host' else 'VRAM'} "
+                  f"(redecodePatches={self.redecode_patches}).")
+            # CM-103's encoder-headroom preflight still matters here (NVENC
+            # surfaces live in VRAM); the store-plan block below is skipped.
+            try:
+                if self.device.type in ("cuda", "xpu"):
+                    from chitramaya.device import empty_cache as _dev_empty_cache
+                    _dev_empty_cache(self.device)
+                _free_b0, _total_b0 = _vram_free_total(self.device)
+                _enc_obj0 = (encoder.underlying if isinstance(encoder, AsyncEncoder) else encoder)
+                if (_free_b0 is not None and type(_enc_obj0).__name__ == "Encoder"
+                        and _free_b0 < max(192 * 1024 * 1024, int(w * h * 36))):
+                    print(f"[Pipeline] WARNING: only ~{_free_b0 // (1024*1024)} MB VRAM "
+                          f"free after models, but the NVENC encoder needs roughly "
+                          f"{max(192 * 1024 * 1024, int(w * h * 36)) // (1024*1024)} MB "
+                          f"at {w}x{h}. This run will likely FAIL mid-encode (NVENC error 8)."
+                          f"{getattr(self, '_rest_engine_note', '') or ' Levers: a smaller restoration engine set, restore Use Tensor off, or smaller --det-imgsz.'}")
+            except Exception:
+                pass
         if store_backend == "host" and self._vrproj is not None:
             print("[FrameStore] NOTE: VR projection composites into device "
                   "frames; host offload disabled for this run.")
@@ -1396,13 +1678,102 @@ class Pipeline:
                     pass
         if store_backend == "auto":
             store_backend = "device"   # no measurement possible -> today's behavior
-        store = FrameStore(max_frames=final_cap, backend=store_backend)
+        if _lag is not None:
+            store = RedecodeStore(patch_home=self.redecode_patches)    # CM-191: records PTS + patches, keeps no frame
+        else:
+            store = FrameStore(max_frames=final_cap, backend=store_backend)
         # CM-120: arm decoder-drop compensation. Both drain helpers pick the
         # filler up from the store, so every encode path (sync + async, all
         # backpressure/final drains) is covered from one construction point.
         # Inert when per-frame PTS are unavailable (see Decoder._frame_pts)
         # or uniform (the ffmpeg fallback synthesizes exact-CFR PTS).
         store.gap_filler = PtsGapFiller()
+
+        # CM-180: what actually ran, for every field that can differ from
+        # the panel. Recorded here because by now every stage is built.
+        if self._report is not None:
+            try:
+                _rr = self._report
+                _ak = getattr(self, "_asked", {})
+                _rr.note("store_backend", _ak.get("store_backend"), store.backend,
+                         "auto resolves to redecode on NVDEC; VR projection / Test Frame keep the store"
+                         if _ak.get("store_backend") == "auto" else "")
+                _rr.note("decoder", "auto", decoder.backend,
+                         ("MPEG-TS remuxed to a CFR temp first (CM-120)"
+                          if getattr(decoder, "_ts_remux_path", None) or getattr(_lag, "_dec", None) and getattr(_lag._dec, "_ts_remux_path", None)
+                          else ""))
+                _enc_obj = encoder.underlying if isinstance(encoder, AsyncEncoder) else encoder
+                _rr.note("encoder", str(self.enc_codec),
+                         f"{type(_enc_obj).__name__}:{getattr(_enc_obj, 'codec', self.enc_codec)}"
+                         f" preset={getattr(_enc_obj, 'preset', '')} qp={getattr(_enc_obj, 'qp', '')}"
+                         f" async={isinstance(encoder, AsyncEncoder)}", "")
+                _rr.note("det_fp16", _ak.get("det_fp16"), bool(self.det_fp16),
+                         "forced off on the ROCm edition (CM-169)"
+                         if _ak.get("det_fp16") and not self.det_fp16 else "")
+                _rr.note("rest_fp16", _ak.get("rest_fp16"), bool(self.rest_fp16), "")
+                _rr.note("detector", "tensorrt" if self.cfg.get("detection", "trt", default=None) else "auto",
+                         type(detector).__name__ if detector is not None else "none", "")
+                _rr.note("restorer", _ak.get("rest_backend"),
+                         type(restorer).__name__ if restorer is not None else "none",
+                         getattr(self, "_rest_engine_note", "") or "")
+                _sec_ran = ("none" if self._secondary is None
+                            else f"{type(self._secondary).__name__}:{getattr(self._secondary, 'scale', '')}x")
+                _rr.note("secondary", _ak.get("secondary"), _sec_ran,
+                         "requested secondary unavailable on this GPU/edition; ran without one (CM-184 pending)"
+                         if (_ak.get("secondary") not in ("none", "", None) and self._secondary is None) else "")
+                _rr.note("secondary_denoise", _ak.get("secondary_denoise"),
+                         str(getattr(self, "secondary_denoise", "none")), "")
+                _rr.note("blendmask", _ak.get("blendmask"), str(self.rest_blendmask), "")
+                _rr.note("feather_radius", _ak.get("feather_radius"), int(self.feather_radius),
+                         "0 = auto (derived from crop size) with the facefusion mask" if self.feather_radius == 0 else "")
+                _rr.note("max_clip_length", _ak.get("max_clip_length"), int(self.rest_max_clip_length), "")
+                _rr.note("temporal_stability", int(self.cfg.get("temporal_stability", default=0) or 0),
+                         int(self.cfg.get("temporal_stability", default=0) or 0), "")
+                _rr.note("watchdog_stall_seconds", None,
+                         float(self.cfg.get("monitoring", "watchdog_stall_seconds", default=0) or 0) or None,
+                         "from ChitraMaya-config.json when set; None = built-in default")
+                _rr.note("keep_awake", True, True, "released after finalize (CM-179)")
+                _rr.note("frame_store_max_frames", int(self.store_max_frames),
+                         int(store.max_frames),
+                         "0 = no store on the redecode path" if store.backend == "redecode" else "")
+                # CM-196: the panel copy is gathered before the CM-148 gate can
+                # snap the Image Size dial to the engine's compiled size; the
+                # UI now patches the panel too, but say it here regardless.
+                _panel_imgsz = None
+                try:
+                    if isinstance(self.run_panel, dict) and self.run_panel.get("ctrlMosaicDetImgsz") not in (None, ""):
+                        _panel_imgsz = int(self.run_panel.get("ctrlMosaicDetImgsz"))
+                except Exception:
+                    _panel_imgsz = None
+                _rr.note("det_imgsz", _panel_imgsz if _panel_imgsz is not None else _ak.get("det_imgsz"),
+                         int(self.det_imgsz),
+                         "ran at the TensorRT engine's compiled size (CM-148 'Use engine size')"
+                         if (_panel_imgsz is not None and _panel_imgsz != int(self.det_imgsz)) else "")
+                _rr.note("run_files", str(self.cfg.get("runReport", default="beside") or "beside"),
+                         str(getattr(self._report, "mode", "beside")),
+                         "the .run.json / .log / .timecodes.txt set: beside the video | Temp folder | off "
+                         "(panel 'Run Files' wins over the runReport key; CM-202)")
+                _rr.note("vram_cache_release", bool(self.vram_cache_release), bool(self.vram_cache_release),
+                         "torch cache handed back to the driver after drains; OFF by default since T10f (CM-196)")
+                _rr.note("redecode_patches", _ak.get("redecode_patches"),
+                         getattr(store, "patch_home", None) if store.backend == "redecode" else None,
+                         "pending patches wait in pinned RAM (host) or VRAM (device); redecode path only (CM-196)")
+            except Exception as _rr_e:
+                print(f"[Pipeline] run report: effective-values note failed ({_rr_e})")
+
+        # CM-196 VRAM ledger, line 1: every stage is built, no frame yet.
+        # "other" is what torch cannot see (TensorRT engines, RTX SS, the
+        # two NVDEC sessions, NVENC, the driver) -- on an 8 GB card this is
+        # the number that decides whether the run survives its largest
+        # regions, and until now it was a guess.
+        try:
+            _snap0 = vram_snapshot(self.device)
+            if _snap0:
+                print(format_vram("after models", _snap0))
+                if self._report is not None:
+                    self._report.vram("after_models", _snap0, frame=0)
+        except Exception:
+            pass
 
         # CM-084: NVENC consumes device tensors, so a host-backed store pays
         # one H2D upload per frame at drain time. The ffmpeg encoder path
@@ -1424,7 +1795,7 @@ class Pipeline:
             _budget_kind = "RAM" if store.backend == "host" else "VRAM"
             print(f"[FrameStore] max_frames={store.max_frames} "
                   f"(~{est_mb:.0f} MB {_budget_kind} budget)")
-        else:
+        elif _lag is None:
             print("[FrameStore] max_frames=unlimited")
 
         # CM-111 (Batch 50): runtime RAM guard for HOST-backed stores. The
@@ -1524,6 +1895,195 @@ class Pipeline:
             except Exception:
                 pass
 
+        def _item_to_rgb(item: object) -> torch.Tensor:
+            """One decoder item (NVDEC surface or CPU tensor) -> RGB HWC u8 on
+            the pipeline device. Shared by consume_batch and, under CM-191,
+            by the re-decode drain, so both decoders' frames take one path."""
+            # CPU lane returns torch.Tensor (either NV12 2D or RGB HWC 3D)
+            if isinstance(item, torch.Tensor):
+                t_cpu = item
+
+                # NV12 heuristic: [H*3/2, W] uint8
+                is_nv12 = (
+                    t_cpu.ndim == 2
+                    and t_cpu.dtype == torch.uint8
+                    and int(t_cpu.shape[0]) == (h * 3 // 2)
+                    and int(t_cpu.shape[1]) == w
+                )
+
+                if is_nv12:
+                    # Upload NV12 then CSC on device
+                    if self.device.type != "cpu":
+                        t0_up = time.perf_counter()
+                        nv12_dev = t_cpu.to(self.device, non_blocking=True)
+                        metrics.t_upload += (time.perf_counter() - t0_up)
+                    else:
+                        nv12_dev = t_cpu
+
+                    t0_csc = time.perf_counter()
+                    rgb = nv12_to_rgb_hwc_u8(nv12_dev, width=w, height=h)
+                    metrics.t_csc += (time.perf_counter() - t0_csc)
+                else:
+                    # Assume RGB HWC u8
+                    rgb = t_cpu
+                    if self.device.type != "cpu":
+                        t0_up = time.perf_counter()
+                        rgb = rgb.to(self.device, non_blocking=True)
+                        metrics.t_upload += (time.perf_counter() - t0_up)
+
+                return rgb.contiguous()
+
+            # NVDEC lane returns a PyNvVideoCodec surface (dlpack)
+            t = wrap_surface_as_tensor(item)
+            # t is usually RGBP CHW u8 on GPU; convert to RGB HWC u8
+            if t.ndim == 3 and t.shape[-1] == 3:
+                rgb = t
+            else:
+                rgb = rgbp_chw_to_rgb_hwc_u8(t)
+
+            # Ensure on pipeline device (normally already correct for cuda)
+            if self.device.type != "cpu" and rgb.device != self.device:
+                rgb = rgb.to(self.device, non_blocking=True)
+
+            return rgb.contiguous()
+
+        def _item_to_bgr(item: object) -> torch.Tensor:
+            """CM-191: the re-decoded frame, as the store would have held it
+            (BGR HWC u8 on the pipeline device, own memory)."""
+            # flip() copies, so the blend's in-place writes never touch the
+            # decoder's surface -- the same tensor the store used to hold.
+            return rgb_hwc_to_bgr_hwc_u8(_item_to_rgb(item))
+
+        _ledger = {"first_drain": False, "last_release": 0.0}
+
+        def _after_drain(n_done: int) -> None:
+            """CM-196: (1) the ledger line after the first drain -- the point
+            where every stage incl. NVENC, the lag decoder and the secondary
+            has run once; (2) hand torch's idle cache back to the driver now
+            and then, so a burst (a 2400-px clip's resize/blend temporaries)
+            does not stay reserved for the rest of the run while NVENC and
+            the decoders fight the WDDM pager for the same 8 GB."""
+            try:
+                if not _ledger["first_drain"]:
+                    _ledger["first_drain"] = True
+                    _snap = vram_snapshot(self.device)
+                    if _snap:
+                        print(format_vram(f"after first drain ({n_done} frames encoded)", _snap))
+                        if self._report is not None:
+                            self._report.vram("after_first_drain", _snap, frame=int(metrics.processed_frames))
+                if self.device.type == "cuda" and self.vram_cache_release:
+                    _now = time.perf_counter()
+                    if _now - _ledger["last_release"] >= 30.0:
+                        _idx = self.device.index if self.device.index is not None else 0
+                        _idle = int(torch.cuda.memory_reserved(_idx)) - int(torch.cuda.memory_allocated(_idx))
+                        if _idle > 256 * 1024 * 1024:
+                            torch.cuda.empty_cache()
+                            _ledger["last_release"] = _now
+            except Exception:
+                pass
+
+        def _drain(safe_before: int) -> int:
+            """Encode every frame below the tracker watermark, from the store
+            (legacy) or by re-decoding it (CM-191)."""
+            if _lag is not None:
+                n_done = drain_plan_to_encoder(
+                    store=store,
+                    lag=_lag,
+                    to_bgr=_item_to_bgr,
+                    safe_before=int(safe_before),
+                    encoder=encoder,
+                    device=self.device,
+                    sync_before_encode=self.enc_sync_before_encode,
+                    pts_log=pts_log,
+                    foi_target=_foi_target,
+                    foi_capture=foi_capture,
+                )
+                if n_done > 0:
+                    _after_drain(n_done)
+                return n_done
+            return drain_store_to_encoder(
+                store=store,
+                upload_device=store_upload_device,  # CM-084
+                safe_before=int(safe_before),
+                encoder=encoder,
+                device=self.device,
+                sync_before_encode=self.enc_sync_before_encode,
+                pts_log=pts_log,
+            )
+
+        def _guard_restored(clip, restored: List[torch.Tensor]) -> List[Optional[torch.Tensor]]:
+            """CM-186: a restorer that returns an all-zero frame for a source
+            crop that is not black has failed (NaN/garbage -> 0 at uint8; the
+            black rectangles of the 09-11 AMD overnight runs). Never paste
+            that: drop the frame's restoration (the source crop stays) and
+            record where it happened, so a recurrence carries a frame number
+            and a wall-clock time instead of a mystery."""
+            out: List[Optional[torch.Tensor]] = list(restored)
+            n = min(len(out), len(clip.frame_nums), len(clip.frames))
+            hits: List[int] = []
+            for i in range(n):
+                r = out[i]
+                if r is None or r.numel() == 0:
+                    continue
+                try:
+                    if int(r.max()) != 0:
+                        continue
+                    if int(clip.frames[i].max()) == 0:
+                        continue     # black source -> black output is right
+                except Exception:
+                    continue
+                out[i] = None
+                hits.append(int(clip.frame_nums[i]))
+            if hits:
+                metrics.guard_black_frames.extend(hits)
+                print(f"[Restorer] WARNING (CM-186 guard): the restorer returned an "
+                      f"all-black result for {len(hits)} frame(s) "
+                      f"({hits[0]}..{hits[-1]}) of a non-black region at "
+                      f"{_dt.datetime.now().strftime('%H:%M:%S')}; those frames keep "
+                      f"their source pixels. If this repeats, note the time: it "
+                      f"points at a GPU/driver event, not at the settings.")
+            return out
+
+        _region_stats = RegionStats()
+
+        def _composite_closed_clip(clip, restored: List[Optional[torch.Tensor]]) -> None:
+            """Paste-back for one closed clip: into the store (legacy / VR) or
+            into the CM-191 patch plan."""
+            try:
+                for _i, _shp in enumerate(getattr(clip, "crop_shapes", []) or []):
+                    _region_stats.note(clip.frame_nums[_i] if _i < len(clip.frame_nums) else None, _shp)
+            except Exception:
+                pass
+            if _lag is not None:
+                store.add_clip(
+                    clip, restored,
+                    model_dtype=restorer.model_dtype,
+                    blendmask=self.rest_blendmask,
+                    feather_radius=self.feather_radius,
+                    secondary=self._secondary,
+                )
+            elif self._vrproj is not None:
+                composite_clip_into_store_projected(
+                    clip=clip,
+                    restored_frames_u8=restored,
+                    store_bgr_u8=store.frames_bgr_u8,
+                    vrproj=self._vrproj,
+                    model_dtype=restorer.model_dtype,
+                    blendmask=self.rest_blendmask,
+                    feather_radius=self.feather_radius,
+                    secondary=self._secondary,
+                )
+            else:
+                composite_clip_into_store(
+                    clip=clip,
+                    restored_frames_u8=restored,
+                    store_bgr_u8=store.frames_bgr_u8,
+                    model_dtype=restorer.model_dtype,
+                    blendmask=self.rest_blendmask,
+                    feather_radius=self.feather_radius,
+                    secondary=self._secondary,
+                )
+
         def consume_batch(batch: List[object], batch_pts: Optional[List[Optional[int]]] = None) -> None:
             nonlocal frame_num
             _mem_beat()
@@ -1549,58 +2109,7 @@ class Pipeline:
             # + NV12 CPU lane support
             # -----------------------------
             t0_prep = time.perf_counter()
-            batch_rgb: List[torch.Tensor] = []
-
-            for item in batch:
-                # CPU lane returns torch.Tensor (either NV12 2D or RGB HWC 3D)
-                if isinstance(item, torch.Tensor):
-                    t_cpu = item
-
-                    # NV12 heuristic: [H*3/2, W] uint8
-                    is_nv12 = (
-                        t_cpu.ndim == 2
-                        and t_cpu.dtype == torch.uint8
-                        and int(t_cpu.shape[0]) == (h * 3 // 2)
-                        and int(t_cpu.shape[1]) == w
-                    )
-
-                    if is_nv12:
-                        # Upload NV12 then CSC on device
-                        if self.device.type != "cpu":
-                            t0_up = time.perf_counter()
-                            nv12_dev = t_cpu.to(self.device, non_blocking=True)
-                            metrics.t_upload += (time.perf_counter() - t0_up)
-                        else:
-                            nv12_dev = t_cpu
-
-                        t0_csc = time.perf_counter()
-                        rgb = nv12_to_rgb_hwc_u8(nv12_dev, width=w, height=h)
-                        metrics.t_csc += (time.perf_counter() - t0_csc)
-                    else:
-                        # Assume RGB HWC u8
-                        rgb = t_cpu
-                        if self.device.type != "cpu":
-                            t0_up = time.perf_counter()
-                            rgb = rgb.to(self.device, non_blocking=True)
-                            metrics.t_upload += (time.perf_counter() - t0_up)
-
-                    batch_rgb.append(rgb.contiguous())
-                    continue
-
-                # NVDEC lane returns a PyNvVideoCodec surface (dlpack)
-                t = wrap_surface_as_tensor(item)
-                # t is usually RGBP CHW u8 on GPU; convert to RGB HWC u8
-                if t.ndim == 3 and t.shape[-1] == 3:
-                    rgb = t
-                else:
-                    rgb = rgbp_chw_to_rgb_hwc_u8(t)
-
-                # Ensure on pipeline device (normally already correct for cuda)
-                if self.device.type != "cpu" and rgb.device != self.device:
-                    rgb = rgb.to(self.device, non_blocking=True)
-
-                batch_rgb.append(rgb.contiguous())
-
+            batch_rgb: List[torch.Tensor] = [_item_to_rgb(item) for item in batch]
             metrics.t_prepare += (time.perf_counter() - t0_prep)
 
             # Convert RGB -> BGR uint8 once per frame (LADA parity + reuse everywhere)
@@ -1760,27 +2269,8 @@ class Pipeline:
                         t0 = time.perf_counter()
                         restored = restorer.restore_clip(clip)
                         restored = self._stabilize_restored(restored)  # CM-078
-                        if self._vrproj is not None:
-                            composite_clip_into_store_projected(
-                                clip=clip,
-                                restored_frames_u8=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                vrproj=self._vrproj,
-                                model_dtype=restorer.model_dtype,
-                                blendmask=self.rest_blendmask,
-                                feather_radius=self.feather_radius,
-                                secondary=self._secondary,
-                            )
-                        else:
-                            composite_clip_into_store(
-                                clip=clip,
-                                restored_frames_u8=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                model_dtype=restorer.model_dtype,
-                                blendmask=self.rest_blendmask,
-                                feather_radius=self.feather_radius,
-                                secondary=self._secondary,
-                            )
+                        restored = _guard_restored(clip, restored)     # CM-186
+                        _composite_closed_clip(clip, restored)         # store or CM-191 plan
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
                         metrics.t_restore += (time.perf_counter() - t0)
@@ -1809,17 +2299,9 @@ class Pipeline:
                 metrics.processed_frames += 1
                 pbar.update(1)
 
-            # Drain once per batch (sync once per drain happens inside drain_store_to_encoder)
+            # Drain once per batch (sync once per drain happens inside the drain helper)
             t0 = time.perf_counter()
-            drain_store_to_encoder(
-                store=store,
-                upload_device=store_upload_device,  # CM-084
-                safe_before=int(safe_before_batch),
-                encoder=encoder,
-                device=self.device,
-                sync_before_encode=self.enc_sync_before_encode,
-                pts_log=pts_log,
-            )
+            _drain(int(safe_before_batch))
             metrics.t_encode += (time.perf_counter() - t0)
 
             # T9b: honest console checkpoint. tqdm's it/s is the INSTANTANEOUS
@@ -1848,10 +2330,24 @@ class Pipeline:
                     else:
                         _ck_line = (f"[Pipeline] frame {_ck_done}  avg {_ck_fps:.1f} fps  "
                                     f"elapsed {_fmt_hms(_ck_el)}")
+                    # CM-196: the driver's VRAM reading rides on every
+                    # checkpoint (console + report column 3) -- one driver
+                    # call per 500 frames, and the run's own memory timeline.
+                    _ck_vram = None
+                    try:
+                        if self.device.type == "cuda":
+                            _cf, _ct = torch.cuda.mem_get_info(
+                                self.device.index if self.device.index is not None else 0)
+                            _ck_vram = int((_ct - _cf) // (1024 * 1024))
+                            _ck_line += f"  vram {_ck_vram} MB"
+                    except Exception:
+                        _ck_vram = None
                     try:
                         pbar.write(_ck_line)
                     except Exception:
                         print(_ck_line, flush=True)
+                    if self._report is not None:
+                        self._report.checkpoint(_ck_done, _ck_el, vram_used_mb=_ck_vram)
             except Exception:
                 pass
 
@@ -2016,15 +2512,7 @@ class Pipeline:
                         tracker_sb = int(min_start) if min_start is not None else int(frame_num + 1)
                         sb = tracker_sb
 
-                        _drained = drain_store_to_encoder(
-                            store=store,
-                            upload_device=store_upload_device,  # CM-084
-                            safe_before=sb,
-                            encoder=encoder,
-                            device=self.device,
-                            sync_before_encode=self.enc_sync_before_encode,
-                            pts_log=pts_log,
-                        )
+                        _drained = _drain(sb)
 
                         if not (store.is_full() or _ram_low()):
                             break
@@ -2085,15 +2573,7 @@ class Pipeline:
                         tracker_sb = int(min_start) if min_start is not None else int(frame_num + 1)
                         sb = tracker_sb
 
-                        _drained = drain_store_to_encoder(
-                            store=store,
-                            upload_device=store_upload_device,  # CM-084
-                            safe_before=sb,
-                            encoder=encoder,
-                            device=self.device,
-                            sync_before_encode=self.enc_sync_before_encode,
-                            pts_log=pts_log,
-                        )
+                        _drained = _drain(sb)
 
                         if not (store.is_full() or _ram_low()):
                             break
@@ -2144,6 +2624,16 @@ class Pipeline:
             # exception and abort the rest of cleanup (remux of the partial
             # output, reports). On a clean exit, cleanup errors still raise.
             _inflight_exc = _sys.exc_info()[0] is not None
+            # CM-196: keep the exception's own words for the run report's
+            # run_error event (the console has them; the report did not).
+            _inflight_exc_text = ""
+            if _inflight_exc:
+                try:
+                    _et, _ev = _sys.exc_info()[0], _sys.exc_info()[1]
+                    _inflight_exc_text = f"{getattr(_et, '__name__', 'Exception')}: {_ev}"
+                    _inflight_exc_text = " ".join(_inflight_exc_text.split())[:400]
+                except Exception:
+                    _inflight_exc_text = ""
 
             # Watchdog off first: the EOF flush below can legitimately spend
             # a long time restoring one final long clip -- not a stall.
@@ -2152,14 +2642,13 @@ class Pipeline:
             except Exception:
                 pass
 
-            # Batch 32: drop the keep-awake claim (same thread as acquire).
-            # Deliberately BEFORE the EOF flush/remux: those finish within
-            # minutes, well inside any idle-sleep timeout, and releasing
-            # here guarantees the claim can never outlive a failed cleanup.
-            try:
-                _ka_release()
-            except Exception:
-                pass
+            # CM-179 (v1.71): the keep-awake claim is now released AFTER the
+            # finalize below. It used to be dropped here, on the theory that
+            # the EOF flush + remux "finish within minutes" -- a 31 GB 4K
+            # remux does not (field: the machine slept mid-remux on two
+            # boxes, mux=2316 s on both; the disk watchdog read the sleep
+            # as a stall and killed it). Released in the try/finally that
+            # wraps encoder.close(), so it still cannot outlive a failure.
 
             # Stop producer safely and avoid deadlock if it is blocked on a full queue.
             stop.set()
@@ -2194,33 +2683,13 @@ class Pipeline:
                         _t_eof = time.perf_counter()
                         restored = restorer.restore_clip(clip)
                         restored = self._stabilize_restored(restored)  # CM-078
+                        restored = _guard_restored(clip, restored)     # CM-186
                         # Batch 26 fix: the EOF flush previously omitted
                         # secondary= entirely, so end-of-video clips silently
-                        # skipped the RTX Super-Res upscale (and, when VR
-                        # projection was active, this flat composite is also
-                        # wrong -- but projected runs route their EOF clips
-                        # through the same tracker, so parity matters).
-                        if self._vrproj is not None:
-                            composite_clip_into_store_projected(
-                                clip=clip,
-                                restored_frames_u8=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                vrproj=self._vrproj,
-                                model_dtype=restorer.model_dtype,
-                                blendmask=self.rest_blendmask,
-                                feather_radius=self.feather_radius,
-                                secondary=self._secondary,
-                            )
-                        else:
-                            composite_clip_into_store(
-                                clip=clip,
-                                restored_frames_u8=restored,
-                                store_bgr_u8=store.frames_bgr_u8,
-                                model_dtype=restorer.model_dtype,
-                                blendmask=self.rest_blendmask,
-                                feather_radius=self.feather_radius,
-                                secondary=self._secondary,
-                            )
+                        # skipped the RTX Super-Res upscale. One helper now
+                        # serves the main loop and the flush (store, VR
+                        # projection, or the CM-191 patch plan).
+                        _composite_closed_clip(clip, restored)
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
                         metrics.t_restore += (time.perf_counter() - _t_eof)
@@ -2231,15 +2700,7 @@ class Pipeline:
                                 store.frames_bgr_u8[int(_foi_target)].detach().clone()
                             )
 
-                drain_store_to_encoder(
-                    store=store,
-                    upload_device=store_upload_device,  # CM-084
-                    safe_before=10**18,
-                    encoder=encoder,
-                    device=self.device,
-                    sync_before_encode=self.enc_sync_before_encode,
-                    pts_log=pts_log,
-                )
+                _drain(10**18)
             except Exception as _flush_e:
                 if not _inflight_exc:
                     raise
@@ -2252,6 +2713,26 @@ class Pipeline:
                     f"error ({type(_flush_e).__name__}: {_flush_e}); continuing "
                     f"cleanup with frames encoded so far"
                 )
+            finally:
+                # CM-191: the second decoder is done once the last planned
+                # frame is out (it also owns the MPEG-TS remux temp now).
+                if _lag is not None:
+                    try:
+                        metrics.t_redecode = float(_lag.t_decode)
+                        metrics.redecode_frames = int(_lag.frames_read)
+                        metrics.redecode_skipped = int(_lag.skipped)
+                        metrics.redecode_missing = int(_lag.missing)
+                        metrics.redecode_peak_patch_mb = (
+                            store.plan.peak_patch_bytes / (1024.0 * 1024.0))
+                        print(_lag.summary()
+                              + f"; peak pending patches {metrics.redecode_peak_patch_mb:.0f} MB"
+                              + f" across {store.clips_planned} clip(s)")
+                    except Exception:
+                        pass
+                    try:
+                        _lag.close()
+                    except Exception:
+                        pass
 
             t_total_no_mux = time.perf_counter() - t0_all
 
@@ -2261,7 +2742,21 @@ class Pipeline:
             is_vfr: bool = False
             if pts_log and foi_capture is None:
                 pts_fps, is_vfr = compute_pts_fps(pts_log, fallback_fps=fps)
-                tc_path = write_timecodes_v2(pts_log, self.output_path, fps=fps)
+                # CM-202: the timecodes file follows the run-files switch:
+                # beside (next to the video, as before) | temp (in the Temp
+                # folder) | off (written to Temp for the finalize step only
+                # and deleted after it, VFR or not).
+                _tc_anchor = str(self.output_path)
+                _rr_mode_now = str(getattr(self, "run_report_mode", "beside") or "beside").lower()
+                if _rr_mode_now in ("temp", "off"):
+                    try:
+                        import tempfile as _tf
+                        _td_ = str(self.cfg.get("temp_dir", default="") or "") or _tf.gettempdir()
+                        Path(_td_).mkdir(parents=True, exist_ok=True)
+                        _tc_anchor = str(Path(_td_) / Path(self.output_path).name)
+                    except Exception:
+                        _tc_anchor = str(self.output_path)
+                tc_path = write_timecodes_v2(pts_log, _tc_anchor, fps=fps)
 
                 if abs(pts_fps - fps) / max(fps, 0.001) > 0.002:
                     print(f"[PTS] FPS mismatch: metadata={fps:.3f}  pts_derived={pts_fps:.3f}")
@@ -2383,7 +2878,23 @@ class Pipeline:
                             f"in {encoder.worker_wall:.2f}s wall (overlapping with main thread)"
                         )
                 finally:
-                    encoder.close()
+                    try:
+                        encoder.close()
+                    finally:
+                        # CM-179: machine may sleep only once the output is
+                        # finalized (or its finalize has failed).
+                        try:
+                            _ka_release()
+                        except Exception:
+                            pass
+                        # A sidecar extraction still running at this point
+                        # belongs to an aborted run: stop it.
+                        try:
+                            if _audio_sidecar is not None and not _audio_sidecar.decided:
+                                _audio_sidecar.cancel()
+                        except Exception:
+                            pass
+                        self._audio_sidecar_live = None
             except Exception as _enc_e:
                 if not _inflight_exc:
                     raise
@@ -2477,6 +2988,30 @@ class Pipeline:
             # [CHANGE 2] Print backpressure stats
             if metrics.backpressure_waits > 0:
                 print(f"[Pipeline] Backpressure waits: {metrics.backpressure_waits} (store peaked at max_frames={store.max_frames})")
+            # CM-191: the re-decode time is spent INSIDE t_encode (the drain
+            # pulls the frame right before encoding it); say how much.
+            # CM-196 VRAM ledger, last line: processing done (or died), before finalize.
+            try:
+                _snapE = vram_snapshot(self.device)
+                if _snapE:
+                    print(format_vram("end of processing", _snapE))
+                    if self._report is not None:
+                        self._report.vram("end_of_processing", _snapE, frame=int(metrics.processed_frames))
+            except Exception:
+                pass
+            if metrics.redecode_frames > 0:
+                print(f"[Pipeline] Re-decode (CM-191): {metrics.redecode_frames} frames, "
+                      f"t_redecode={metrics.t_redecode:.2f}s (inside t_encode); "
+                      f"alignment skipped={metrics.redecode_skipped} "
+                      f"missing={metrics.redecode_missing}; "
+                      f"peak pending patches {metrics.redecode_peak_patch_mb:.0f} MB "
+                      f"in {'pinned RAM' if getattr(store, 'patch_home', 'host') == 'host' else 'VRAM'}")
+            # CM-186: black-output guard hits (should be zero)
+            if metrics.guard_black_frames:
+                _gb = metrics.guard_black_frames
+                print(f"[Pipeline] WARNING: CM-186 guard refused {len(_gb)} all-black "
+                      f"restorer result(s) (frames {min(_gb)}..{max(_gb)}); those "
+                      f"frames kept their source pixels.")
             print(
                 f"[Pipeline] Processing time (no mux) = {t_total_no_mux:.2f}s "
                 f"Overhead = {overhead:.2f}s (sum_parts={sum_parts:.2f}s)"
@@ -2569,6 +3104,10 @@ class Pipeline:
             # seek-and-inspect A/B at exactly those frames.
             _sec_stats = getattr(self._secondary, "stats", None) \
                 if self._secondary is not None else None
+            if _sec_stats is None and _region_stats.crops:
+                _top = ", ".join(f"{d['frame']}({d['crop_px']}px)" for d in _region_stats.top_frames(5))
+                print(f"[RegionStats] crops={_region_stats.crops} largest_crop_px={_region_stats.largest_px} "
+                      f"biggest-crop frames: {_top} -- top 20 in the run report (counts.regions)")
             if _sec_stats is not None:
                 _sec_pct = round(
                     100.0 * _sec_stats.crops_upscaled / _sec_stats.crops_seen, 1
@@ -2603,64 +3142,74 @@ class Pipeline:
                         f"there is nothing for the scaler to add."
                     )
 
-            # Write misses JSON next to the output. Lists are sorted for
-            # readability + reproducibility. The actionable list is
-            # `visible_miss_frames` — feed those into a viewer or rerun
-            # under `--mode pseudo` to inspect them visually.
-            # X5b: capture the console tail for embedding in the report.
-            # Makes the misses file a SELF-CONTAINED run record -- settings,
-            # stats, and the console context (warnings, [SecStats], watchdog
-            # dumps, xpu VRAM beats) in one artifact that outlives the
-            # terminal scrollback. Caps keep the JSON sane; None when no
-            # buffer is installed (headless -restore runs).
-            def _console_tail(max_lines: int = 400, max_chars: int = 65536):
+            # CM-180: the run report (replaces the misses JSON). Everything
+            # the old file carried is here in a defined shape, plus the
+            # panel, the effective values, structured timing and events;
+            # per-frame lists are run-length ranges (kilobytes, not
+            # megabytes). Off with runReport = off.
+            self.last_report_path = None
+            if self._report is not None:
                 try:
-                    from chitramaya.console_buffer import get_buffer
-                    buf = get_buffer()
-                    if buf is None:
-                        return None
-                    lines = [str(x) for x in
-                             (buf.snapshot().get("lines") or [])[-max_lines:]]
-                    out, total = [], 0
-                    for ln in reversed(lines):     # keep the NEWEST lines
-                        total += len(ln) + 1
-                        if total > max_chars:
-                            break
-                        out.append(ln)
-                    return list(reversed(out))
-                except Exception:
-                    return None
+                    _rr = self._report
+                    # events from state we can read here
+                    if metrics.guard_black_frames:
+                        _gb = sorted(metrics.guard_black_frames)
+                        _rr.event("black_output_guard", _gb[0],
+                                  f"restorer returned all-black for {len(_gb)} clip frame(s); source pixels kept (CM-186)",
+                                  count=len(_gb))
+                    if metrics.redecode_skipped or metrics.redecode_missing:
+                        _rr.event("redecode_alignment", None,
+                                  f"skipped={metrics.redecode_skipped} missing={metrics.redecode_missing} (CM-191)",
+                                  count=int(metrics.redecode_skipped + metrics.redecode_missing))
+                    _fl = getattr(store, "gap_filler", None)
+                    if _fl is not None and getattr(_fl, "total_filled", 0):
+                        _rr.event("gap_fill", None,
+                                  f"{_fl.total_filled} duplicate frame(s) across {len(_fl.gaps)} gap(s) (CM-120)",
+                                  count=int(_fl.total_filled))
+                    if _fl is not None and getattr(_fl, "skipped_gaps", None):
+                        _rr.event("timeline_jump_unfilled", None,
+                                  f"{len(_fl.skipped_gaps)} jump(s) too large to fill", count=len(_fl.skipped_gaps))
+                    _flaps = int(getattr(_watchdog, "flap_count", 0) or 0)
+                    if _flaps:
+                        _rr.event("pcie_flap", None, f"{_flaps} down-train/recover cycle(s)", count=_flaps)
+                    _re_obj = locals().get("_real_encoder")
+                    _head = float(getattr(_re_obj, "_head_skip_seconds", 0.0) or 0.0) if _re_obj is not None else 0.0
+                    if _head > 0:
+                        _rr.event("head_skip", 0, f"decoder discarded ~{_head:.3f}s at the stream head; remux delays the video")
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        _rr.event("cancelled", int(metrics.processed_frames), "run cancelled by the user")
+                    if _inflight_exc:
+                        _rr.event("run_error", int(metrics.processed_frames),
+                                  "the run raised; the output is a PARTIAL result"
+                                  + (f" -- {_inflight_exc_text}" if _inflight_exc_text else " (see the console log)"))
 
-            try:
-                import json
-                miss_path = Path(self.output_path).with_suffix(".misses.json")
-                report = {
-                    "video": str(self.input_path),
-                    "output": str(self.output_path),
-                    "total_frames": int(ft),
-                    "settings": {
+                    _run = {
+                        "total_frames": int(ft),
+                        "processed_frames": int(metrics.processed_frames),
+                        "fps": float(fps),
+                        "resolution": [int(w), int(h)],
+                        "source_container": str(getattr(decoder, "_container_format", "") or ""),
+                        "partial": bool(_inflight_exc or (cancel_flag is not None and cancel_flag.is_set())),
                         "mode": self.mode,
-                        "det_model": str(self.det_model),
-                        "det_imgsz": int(self.det_imgsz),
-                        "det_conf": float(self.det_conf),
-                        "det_iou": float(self.det_iou),
-                        "det_fp16": bool(self.det_fp16),
-                        "rest_model": str(self.rest_model),
-                        "rest_max_clip_length": int(self.rest_max_clip_length),
-                        "rest_fp16": bool(self.rest_fp16),
-                        "trk_ttl_after_end": int(self.trk_ttl_after_end),
-                        "trk_crop_quant_px": int(self.trk_crop_quant_px),
-                        "trk_crop_sticky": bool(self.trk_crop_sticky),
-                        "trk_match_pad_px": int(self.trk_match_pad_px),
-                        # Batch 72: echo the scaler + denoise so a misses
-                        # JSON is self-describing for A/B runs (field case
-                        # 2026-09-01: a denoise A/B ran with esrgan-4x,
-                        # where denoise does not apply, and nothing in the
-                        # report said which denoise setting was requested).
-                        "secondary_restoration": str(self.secondary_restoration),
-                        "secondary_denoise": str(getattr(self, "secondary_denoise", "none")),
-                    },
-                    "summary": {
+                    }
+                    _timing = {
+                        "wall_s": round(float(t_total_with_mux), 2),
+                        "processing_s": round(float(t_total_no_mux), 2),
+                        "decode_s": round(metrics.t_decode, 2),
+                        "redecode_s": round(metrics.t_redecode, 2),
+                        "detect_s": round(metrics.t_det, 2),
+                        "track_s": round(metrics.t_track, 2),
+                        "restore_s": round(metrics.t_restore, 2),
+                        "encode_s": round(metrics.t_encode, 2),
+                        "queue_wait_s": round(metrics.t_queue_wait, 2),
+                        "prepare_s": round(metrics.t_prepare, 2),
+                        "remux_s": round(metrics.t_mux, 2),
+                        "avg_fps_completed": round(float(metrics.processed_frames) / t_total_no_mux, 2) if t_total_no_mux > 0 else 0.0,
+                        "redecode_frames": int(metrics.redecode_frames),
+                        "redecode_peak_patch_mb": round(float(metrics.redecode_peak_patch_mb), 1),
+                        "backpressure_waits": int(metrics.backpressure_waits),
+                    }
+                    _counts = {
                         "restored": int(fr),
                         "detected": int(len(det_set)),
                         "detected_and_restored": int(detected_and_restored),
@@ -2669,79 +3218,66 @@ class Pipeline:
                         "visible_miss": int(visible_miss),
                         "restoration_miss": int(restoration_miss),
                         "early_passthrough_count": int(metrics.early_passthrough_frames),
-                    },
-                    "clips": {
-                        "count": int(n_clips),
-                        "total_clip_frames": int(total_clip_frames),
-                        "len_min": int(clip_min),
-                        "len_median": int(clip_med),
-                        "len_max": int(clip_max),
-                        "len_mean": float(clip_mean),
-                    },
-                    # Batch 44 (opt-in via detection.dump_rois /
-                    # --det-dump-rois / detDumpRois): per-frame FINAL
-                    # detection boxes (post dilate/clip/seam-split -- what
-                    # the restorer actually saw). Consumed by
-                    # tools/ab_eval.py to mask metrics to the true
-                    # restored regions. Absent when the option is off.
-                    **({"detection_rois_format":
-                            "frame_num -> [[top,left,bottom,right], ...] "
-                            "(pixel coords, inclusive)",
-                        "detection_rois": {
-                            str(k): v for k, v in
-                            sorted(metrics.det_stats.rois.items())
-                        }} if metrics.det_stats.rois else {}),
-                    # CM-077b: secondary (RTX Super-Res) engagement. Only
-                    # present when the stage was active this run. The frame
-                    # list is the seek-and-inspect tool: pause on one of
-                    # these frames and Test Frame with the scaler on/off to
-                    # see its contribution on real pixels.
-                    "secondary": None if _sec_stats is None else {
-                        "mode": str(self.secondary_restoration),
-                        "crops_seen": int(_sec_stats.crops_seen),
-                        "crops_upscaled": int(_sec_stats.crops_upscaled),
-                        "skipped_small": int(_sec_stats.skipped_small),
-                        "skipped_geom": int(_sec_stats.skipped_geom),
-                        "largest_crop_px": int(_sec_stats.largest_px),
-                        "gate_threshold_px": int(self._secondary.min_apply_size),
-                        "frames_with_upscale": len(_sec_stats.applied_frames),
-                    },
-                    "secondary_upscaled_frames": sorted(_sec_stats.applied_frames)
-                        if _sec_stats is not None else [],
-                    # CM-077c: frames ranked by biggest crop (largest first,
-                    # px = longest side of the original region). Seek to
-                    # these to see the scaler where it matters most; entry 0
-                    # is the frame behind largest_crop_px.
-                    "secondary_biggest_frames": _sec_stats.top_frames(20)
-                        if _sec_stats is not None else [],
-                    "visible_miss_frames": sorted(miss_set),
-                    "restoration_miss_frames": sorted(restoration_miss_set),
-                    "gap_fill_frames": sorted(gap_fill_set),
-                    "legit_passthrough_frames": sorted(legit_set),
-                    # X5b: last console lines (<=400 lines / 64KB) as of
-                    # report time. The full log is still the terminal /
-                    # ChitraMaya-console.log; this is the durable tail.
-                    "console_tail": _console_tail(),
-                    # NOTE: detected_frames and restored_frames lists were
-                    # intentionally dropped — they're huge on long videos
-                    # (~270k entries each for a 2.5hr clip) and redundant
-                    # with the count summary above. Use the four lists
-                    # above for any inspection / tooling needs.
-                }
-                with miss_path.open("w", encoding="utf-8") as f:
-                    json.dump(report, f, indent=2)
-                print(f"[Pipeline] Misses report: {miss_path}")
-            except Exception as e:
-                # Don't fail the whole run if JSON write hits an issue.
-                print(f"[Pipeline] WARNING: failed to write misses JSON: {e}")
+                        "total_boxes": int(getattr(metrics.det_stats, "total_boxes", 0) or 0),
+                        "clips": {
+                            "count": int(n_clips),
+                            "total_clip_frames": int(total_clip_frames),
+                            "len_min": int(clip_min),
+                            "len_median": int(clip_med),
+                            "len_max": int(clip_max),
+                            "len_mean": float(clip_mean),
+                            "capped": int(capped),
+                            "capped_pct": float(capped_pct),
+                        },
+                        "regions": {
+                            "crops": int(_region_stats.crops),
+                            "largest_crop_px": int(_region_stats.largest_px),
+                            "biggest_frames": _region_stats.top_frames(20),
+                        },
+                        "secondary": None if _sec_stats is None else {
+                            "mode": str(self.secondary_restoration),
+                            "crops_seen": int(_sec_stats.crops_seen),
+                            "crops_upscaled": int(_sec_stats.crops_upscaled),
+                            "skipped_small": int(_sec_stats.skipped_small),
+                            "skipped_geom": int(_sec_stats.skipped_geom),
+                            "largest_crop_px": int(_sec_stats.largest_px),
+                            "gate_threshold_px": int(self._secondary.min_apply_size),
+                            "frames_with_upscale": len(_sec_stats.applied_frames),
+                            "biggest_frames": _sec_stats.top_frames(20),
+                        },
+                    }
+                    _frames = {
+                        "visible_miss": sorted(miss_set),
+                        "restoration_miss": sorted(restoration_miss_set),
+                        "gap_fill": sorted(gap_fill_set),
+                        "legit_passthrough": sorted(legit_set),
+                        "secondary_upscaled": sorted(_sec_stats.applied_frames) if _sec_stats is not None else [],
+                        "black_output_guard": sorted(metrics.guard_black_frames),
+                    }
+                    _debug = None
+                    if metrics.det_stats.rois:
+                        _debug = {
+                            "detection_rois_format": "frame_num -> [[top,left,bottom,right], ...] (pixel coords, inclusive)",
+                            "detection_rois": {str(k): v for k, v in sorted(metrics.det_stats.rois.items())},
+                        }
+                    _rep = _rr.build(run=_run, timing=_timing, counts=_counts, frames=_frames,
+                                     debug=_debug, device=self.device)
+                    _rp = _rr.write(_rep)
+                    _lp = _rr.write_log()
+                    if _rp:
+                        self.last_report_path = _rp
+                        print(f"[Pipeline] Run report: {_rp}" + (f"  (console log: {Path(_lp).name})" if _lp else ""))
+                except Exception as e:
+                    print(f"[Pipeline] WARNING: failed to write the run report: {e}")
 
             if metrics.wall_start and metrics.wall_end:
                 elapsed = metrics.wall_end - metrics.wall_start
                 print(f"[Pipeline] Wall clock: start={metrics.wall_start} end={metrics.wall_end} elapsed={elapsed}")
             print(f"[Pipeline] perf_counter elapsed = {t_total_with_mux:.2f}s")
 
-            # [CHANGE 4] Cleanup timecodes file (kept only if VFR)
-            if tc_path and not is_vfr:
+            # [CHANGE 4] Cleanup timecodes file (kept only if VFR; CM-202:
+            # never kept when the run-files switch is off)
+            if tc_path and (not is_vfr or str(getattr(self, "run_report_mode", "beside")).lower() == "off"):
                 try:
                     Path(tc_path).unlink(missing_ok=True)
                 except Exception:
@@ -2860,6 +3396,9 @@ class MosaicPipelineConfig:
     store_max_frames: int = 0
     # CM-084: FrameStore backend -- "auto" | "device" | "host".
     store_backend: str = "auto"
+    # CM-202: the panel's run-files switch ("beside" | "temp" | "off");
+    # "" = not set by the panel -> the flat runReport key decides.
+    run_report: str = ""
     det_imgsz: int = 640
     det_iou: float = 0.70
     roi_dilate: int = 0
@@ -2884,7 +3423,7 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "detection_model", "restoration_model", "detection_score",
     "detection_batch_size", "max_clip_size", "mask_preview", "mask_color",
     "mask_opacity", "censor", "censor_block", "detection_fp16", "restoration_fp16", "use_trt",
-    "codec", "preset", "qp", "async_encoder", "write_diagnostics",
+    "codec", "preset", "qp", "async_encoder", "write_diagnostics", "run_report",
     "sbs_enabled", "sbs_layout",
     "sbs_det_split", "vr_projection", "secondary_restoration",
     "secondary_denoise",
@@ -2949,8 +3488,14 @@ class MosaicPipeline:
         # no restorer. The detector is always built (needed by real + pseudo).
         # This replaces the old detect_only guards, which wrongly nulled the
         # detector and let run() rebuild a restorer anyway.
+        # CM-196 T10f: ledger the warm build -- these two are the largest
+        # non-torch residents (TensorRT engines) and were invisible until now.
+        self._host._vram_stage("before models (CUDA context)")
         self._detector = self._host._build_detector()
+        self._host._vram_stage("detector (warm build)")
         self._restorer = self._host._build_restorer()
+        self._host._vram_stage("restorer (warm build)")
+        self._host._vram_ledger_warm = list(self._host._vram_ledger)
 
     # -- config construction -------------------------------------------------
 
@@ -3045,6 +3590,29 @@ class MosaicPipeline:
         except Exception:
             _wd_stall = 120.0
         data["monitoring"] = {"watchdog_stall_seconds": _wd_stall}
+        # CM-180: run report switch (flat file, hand-edit channel) + the
+        # panel this call carries.
+        try:
+            from chitramaya.run_report import normalize_mode as _rr_mode
+            data["runReport"] = _rr_mode(_flat.get("runReport", "beside"))
+            if str(_flat.get("runReport", "beside")).lower() != data["runReport"]:
+                print(f"[Pipeline] WARNING: ignoring invalid runReport {_flat.get('runReport')!r} "
+                      f"in ChitraMaya-config.json (use beside, temp, or off).")
+            # CM-202: the panel's "Run files" dropdown wins whenever it says
+            # something explicit (same precedence as the store backend).
+            _pr = str(getattr(self.config, "run_report", "") or "").strip().lower()
+            if _pr in ("beside", "temp", "off"):
+                data["runReport"] = _pr
+        except Exception:
+            data["runReport"] = "beside"
+        data["run_panel"] = getattr(self, "_pending_panel", None)
+        # Segment previews / Test Frame set write_diagnostics=False: no report
+        # for temp outputs (the flag existed before but nothing read it).
+        if not bool(getattr(self.config, "write_diagnostics", True)):
+            data["runReport"] = "off"
+        _td = str(getattr(self.config, "temp_dir", "") or "")
+        if _td:
+            data["temp_dir"] = _td
 
         # CM-084 (Batch 36r2): FrameStore knobs from the SAME flat file.
         # to_pipeline_config() (the UI path) carries no store_* fields, so
@@ -3063,14 +3631,40 @@ class MosaicPipeline:
             if (_sb is not None
                     and str(data.get("store_backend", "auto")).lower() == "auto"):
                 _sb = str(_sb).strip().lower()
-                if _sb in ("auto", "device", "host"):
+                if _sb in ("auto", "device", "host", "redecode"):
                     data["store_backend"] = _sb
                     print(f"[FrameStore] backend request: {_sb} "
                           f"(from ChitraMaya-config.json)")
                 else:
                     print(f"[FrameStore] WARNING: ignoring invalid "
                           f"storeBackend {_sb!r} in ChitraMaya-config.json "
-                          f"(use auto, device, or host).")
+                          f"(use auto, redecode, device, or host).")
+        except Exception:
+            pass
+        # CM-196 T10f: opt-in torch cache release after drains.
+        try:
+            _vcr = _flat.get("vramCacheRelease")
+            if _vcr is not None:
+                data["vram_cache_release"] = bool(_vcr)
+                print(f"[Pipeline] VRAM cache release after drains: {bool(_vcr)} "
+                      f"(from ChitraMaya-config.json)")
+        except Exception:
+            pass
+        # CM-196: where the re-decode path parks pending patches (host RAM
+        # by default; "device" = VRAM, the T10c behaviour, for A/B). Hand-edit
+        # key only; the run report's `effective.redecode_patches` says what ran.
+        try:
+            _rp = _flat.get("redecodePatches")
+            if _rp is not None:
+                _rp = str(_rp).strip().lower()
+                if _rp in ("host", "device"):
+                    data["redecode_patches"] = _rp
+                    print(f"[FrameStore] redecode patches: {_rp} "
+                          f"(from ChitraMaya-config.json)")
+                else:
+                    print(f"[FrameStore] WARNING: ignoring invalid "
+                          f"redecodePatches {_rp!r} in ChitraMaya-config.json "
+                          f"(use host or device).")
         except Exception:
             pass
         try:
@@ -3151,16 +3745,20 @@ class MosaicPipeline:
         use_tqdm: bool = False,
         cancel_flag=None,
         foi_capture=None,
+        panel=None,
     ) -> MosaicResult:
         """Process one file using the warm models. Returns a MosaicResult.
 
         foi_capture: optional dict with 'target_frame'; when given, run() fills
         it with that frame's boxes + pre/post-composite tensors (FOI preview).
+        panel (CM-180): the control panel as the UI submitted it (preset
+        schema); lands verbatim in the run report.
         """
         # Rebuild the host's config for this input/output, re-running
         # __post_init__ so paths/knobs are picked up, then drive run() with the
         # warm models injected. Reusing the same Pipeline instance keeps the
         # builders/device consistent; only cfg-derived fields change.
+        self._pending_panel = panel if isinstance(panel, dict) else None
         self._host.cfg = self._build_base_config(input_path, output_path)
         self._host.__post_init__()
 
@@ -3175,11 +3773,8 @@ class MosaicPipeline:
             foi_capture=foi_capture,
         )
 
-        diag_path = None
-        try:
-            diag_path = str(Path(output_path).with_suffix(".misses.json"))
-        except Exception:
-            diag_path = None
+        # CM-180: the run report path (None when runReport = off)
+        diag_path = getattr(self._host, "last_report_path", None)
 
         if metrics is None:
             return MosaicResult()

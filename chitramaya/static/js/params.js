@@ -101,6 +101,8 @@ function buildParamsSummary() {
 // (MOSAIC_CONFIG_CONTROLS). Face-swap control IDs were removed here — they
 // do not exist in ChitraMaya's UI and were silently skipped on save/load.
 const CONFIG_CONTROLS = [
+  // CM-182: UI language (gear menu); applied by i18n.js after applyConfig
+  'ctrlUiLanguage',
   // Encoder
   'ctrlCodec', 'ctrlPreset', 'ctrlQP',
   // Transport
@@ -150,6 +152,11 @@ function applyConfig(cfg) {
     if (el.type === 'checkbox') el.checked = !!cfg[id];
     else el.value = String(cfg[id]);
   }
+  // CM-182: (re)apply the UI language the config carries (English when unset).
+  try {
+    const langEl = document.getElementById('ctrlUiLanguage');
+    if (window.I18N && langEl) window.I18N.setLanguage(langEl.value || 'en');
+  } catch (e) { /* i18n is optional */ }
 
   // The mosaic model dropdowns are filled asynchronously (populateMosaic-
   // ModelDropdowns fetches the list). At startup this can race the config

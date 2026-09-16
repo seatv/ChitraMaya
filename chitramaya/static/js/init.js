@@ -933,10 +933,28 @@ if (stcBtn) {
   }
 
   let lineCount = 0;
+  // CM-194 (field 2026-09-12): the 1 Hz timer fired while an earlier poll
+  // was still waiting on a busy server (the GIL is held for seconds while
+  // TensorRT engines load), so several requests went out with the SAME
+  // cursor and every late answer appended the same lines again -- the
+  // startup block showed up 5-15 times in a copied console. One poll in
+  // flight at a time, and an answer computed for a cursor we have already
+  // moved past is dropped.
+  let inflight = false;
 
   async function pull() {
-    const res = await apiGet('/api/console?since=' + cursor);
+    if (inflight) return;
+    inflight = true;
+    const asked = cursor;
+    let res;
+    try {
+      res = await apiGet('/api/console?since=' + asked);
+    } finally {
+      inflight = false;
+    }
     if (!res || res.error || !Array.isArray(res.lines)) return;
+    if (asked !== cursor) return;          // stale answer; a newer poll owns the cursor
+    if (typeof res.next === 'number' && res.next < cursor) return;
     cursor = res.next || cursor;
     if (!res.lines.length) return;
     const stick = atBottom();

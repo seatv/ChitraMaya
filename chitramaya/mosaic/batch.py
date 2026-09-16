@@ -87,9 +87,36 @@ class BatchSummary:
                 + f" of {self.total} in {self.seconds:.0f}s")
 
 
+# CM-202: a user-chosen restoration suffix (GitHub #10) must also be
+# recognised as "our own output", or a folder re-run would restore the
+# restorations. register_output_suffix() is called by the server/CLI with
+# the resolved suffix before enumerate_videos().
+_EXTRA_OUTPUT_SUFFIXES: set = set()
+
+_BAD_SUFFIX_CHARS = set('\\/:*?"<>|\t\r\n')
+
+
+def sanitize_output_suffix(value, default: str = "-restored") -> str:
+    """Trim, drop path/illegal characters, cap the length; returns "" when the
+    user asked for no suffix at all (the caller decides whether that is safe)."""
+    v = str(value if value is not None else default)
+    v = "".join(ch for ch in v if ch not in _BAD_SUFFIX_CHARS).strip()
+    if len(v) > 32:
+        v = v[:32]
+    return v
+
+
+def register_output_suffix(suffix: str) -> None:
+    s = str(suffix or "").strip()
+    if s:
+        _EXTRA_OUTPUT_SUFFIXES.add(s)
+
+
 def _is_own_output(stem: str) -> bool:
     low = stem.lower()
-    return any(low.endswith(suf.lower()) for suf in _OUTPUT_STEM_SUFFIXES)
+    if any(low.endswith(suf.lower()) for suf in _OUTPUT_STEM_SUFFIXES):
+        return True
+    return any(low.endswith(suf.lower()) for suf in _EXTRA_OUTPUT_SUFFIXES)
 
 
 def enumerate_videos(

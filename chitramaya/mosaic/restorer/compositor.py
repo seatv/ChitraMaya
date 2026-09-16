@@ -179,24 +179,10 @@ def composite_clip_into_store(
         frame = store_bgr_u8.get(frame_num)
         if frame is None:
             continue
-
-        clip_img = restored_frames_u8[i]
-        clip_mask = clip.masks[i]
-        orig_box: Box = clip.boxes[i]
-        orig_shape_hw = clip.crop_shapes[i]
-        pad: Pad = clip.pad_after_resizes[i]
-
-        # CM-077: secondary upscale BEFORE unpad (fixed-size model input).
-        clip_img, sec_scale = _apply_secondary(
-            clip_img, orig_shape_hw, secondary, frame_num=frame_num)
-
-        # Unpad back to resized crop dims (image offsets scale with the upscale)
-        clip_img = _unpad_any(clip_img, _scale_pad(pad, sec_scale))
-        clip_mask = _unpad_any(clip_mask, pad)
-
-        # Resize back to original crop size
-        clip_img = _resize_img_u8(clip_img, orig_shape_hw)
-        clip_mask = _resize_mask_u8(clip_mask, orig_shape_hw)
+        prepared = prepare_patch(clip, i, restored_frames_u8[i], secondary)
+        if prepared is None:
+            continue   # CM-186 guard dropped this frame's restoration
+        clip_img, clip_mask, orig_box = finish_patch(*prepared)
 
         _blend_into_frame_lada(
             frame_bgr_u8=frame,
@@ -209,4 +195,65 @@ def composite_clip_into_store(
             feather_radius=feather_radius,
         )
 
-__all__ = ["composite_clip_into_store"]
+
+def prepare_patch(clip, i: int, restored_img_u8, secondary):
+    """CM-191: the compositor's work for one restored clip frame that must
+    happen when the clip closes -- the secondary upscale (the expensive,
+    stateful step) -- returned together with everything ``finish_patch``
+    needs later: ``(clip_img_u8, sec_scale, clip_mask_u8, pad, orig_shape_hw,
+    orig_box)``. The image is still at CLIP resolution (clip_size x
+    sec_scale, padded), so a pending patch costs at most ~3 MB with a 4x
+    secondary and ~200 KB without, whatever the region's size on the frame
+    (CM-193: a 3483-px region held at frame resolution would have been
+    ~30 MB per frame, ~5 GB for one 180-frame clip). ``composite_clip_into_
+    store`` calls prepare + finish back to back, so the legacy store path
+    and the re-decode path share one arithmetic. Returns None when
+    ``restored_img_u8`` is None (a frame the CM-186 guard refused)."""
+    if restored_img_u8 is None:
+        return None
+    frame_num = int(clip.frame_nums[i])
+    orig_shape_hw = clip.crop_shapes[i]
+    # CM-077: secondary upscale BEFORE unpad (fixed-size model input).
+    clip_img, sec_scale = _apply_secondary(
+        restored_img_u8, orig_shape_hw, secondary, frame_num=frame_num)
+    return (clip_img, int(sec_scale), clip.masks[i], clip.pad_after_resizes[i],
+            orig_shape_hw, clip.boxes[i])
+
+
+def finish_patch(clip_img, sec_scale: int, clip_mask, pad: Pad, orig_shape_hw, orig_box: Box):
+    """CM-191/193: unpad and resize a prepared patch back to the original
+    crop shape -- the cheap half, run right before the blend."""
+    # Unpad back to resized crop dims (image offsets scale with the upscale)
+    clip_img = _unpad_any(clip_img, _scale_pad(pad, sec_scale))
+    clip_mask = _unpad_any(clip_mask, pad)
+    # Resize back to original crop size
+    clip_img = _resize_img_u8(clip_img, orig_shape_hw)
+    clip_mask = _resize_mask_u8(clip_mask, orig_shape_hw)
+    return clip_img, clip_mask, orig_box
+
+
+def blend_patch(
+    frame_bgr_u8: torch.Tensor,
+    clip_img_u8: torch.Tensor,
+    clip_mask_u8: torch.Tensor,
+    orig_box: Box,
+    *,
+    model_dtype: torch.dtype,
+    border_ratio: float = 0.05,
+    blendmask: str = "none",
+    feather_radius: int = 0,
+) -> None:
+    """CM-191: the blend half of the compositor, unchanged arithmetic."""
+    _blend_into_frame_lada(
+        frame_bgr_u8=frame_bgr_u8,
+        clip_img_u8=clip_img_u8,
+        clip_mask_u8=clip_mask_u8,
+        orig_clip_box=orig_box,
+        model_dtype=model_dtype,
+        border_ratio=border_ratio,
+        blendmask=blendmask,
+        feather_radius=feather_radius,
+    )
+
+
+__all__ = ["composite_clip_into_store", "prepare_patch", "finish_patch", "blend_patch"]

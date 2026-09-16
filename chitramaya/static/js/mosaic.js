@@ -84,6 +84,9 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicCensor', 'ctrlMosaicCensorBlock',
   'ctrlAsyncEncoder',
   'ctrlStoreBackend',   // CM-084 (Batch 38): FrameStore backend
+  'ctrlOutputSuffix',   // CM-202 (GitHub #10): output file suffix
+  'ctrlRunReport',      // CM-202 (GitHub #10): run files beside | temp | off
+  'mmEndpoint',         // CM-199 (GitHub #13): model download endpoint (Manage Models)
 ];
 
 if (typeof CONFIG_CONTROLS !== 'undefined') {
@@ -500,6 +503,9 @@ function gatherMosaicParams() {
   return {
     output_dir: outDir,
     temp_dir: tmpDir,
+    // CM-180: the whole control panel (preset schema) rides with the job and
+    // lands verbatim in <output stem>.run.json -- "what did I run", answered.
+    panel: (typeof gatherFullConfig === 'function') ? gatherFullConfig() : null,
     mosaic: {
       detection_model: document.getElementById('ctrlMosaicDetModel').value,
       restoration_model: document.getElementById('ctrlMosaicRestModel').value,
@@ -534,6 +540,9 @@ function gatherMosaicParams() {
       mosaic_temporal_stability: parseInt((document.getElementById('ctrlMosaicTemporalFix') || {}).value || '0', 10) || 0,
       // CM-084 (Batch 38): FrameStore backend (auto | device | host)
       mosaic_store_backend: ((document.getElementById('ctrlStoreBackend') || {}).value || 'auto'),
+      // CM-202 (GitHub #10): output suffix + the run-files switch
+      mosaic_output_suffix: (document.getElementById('ctrlOutputSuffix') ? document.getElementById('ctrlOutputSuffix').value : '-restored'),
+      mosaic_run_report: ((document.getElementById('ctrlRunReport') || {}).value || ''),
     },
     encoder: {
       codec: document.getElementById('ctrlCodec').value,
@@ -930,7 +939,11 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
   }
   // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
   // compiled Image Size (params were gathered before the gate snapped the dial).
-  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
+  if (gate.imgsz) {
+    params.mosaic.mosaic_det_imgsz = gate.imgsz;
+    // CM-196 report nit: the panel copy in the run report must show the size that ran.
+    if (params.panel && typeof params.panel === 'object') params.panel.ctrlMosaicDetImgsz = String(gate.imgsz);
+  }
 
   const result = await apiPost('/api/mosaic-segment', {
     params, start_time: startTime, end_time: endTime,
@@ -1015,7 +1028,11 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
   }
   // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
   // compiled Image Size (params were gathered before the gate snapped the dial).
-  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
+  if (gate.imgsz) {
+    params.mosaic.mosaic_det_imgsz = gate.imgsz;
+    // CM-196 report nit: the panel copy in the run report must show the size that ran.
+    if (params.panel && typeof params.panel === 'object') params.panel.ctrlMosaicDetImgsz = String(gate.imgsz);
+  }
 
   const result = await apiPost('/api/mosaic-full', { params });
   if (result.error) {
@@ -1231,7 +1248,11 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
       if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
     }
     // CM-148 (Batch 76): honor "Use engine size" (see segment handler).
-    if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
+    if (gate.imgsz) {
+      params.mosaic.mosaic_det_imgsz = gate.imgsz;
+      // CM-196 report nit: the panel copy in the run report must show the size that ran.
+      if (params.panel && typeof params.panel === 'object') params.panel.ctrlMosaicDetImgsz = String(gate.imgsz);
+    }
 
     const result = await apiPost('/api/mosaic-folder', { params });
     if (result.error) { alert('Failed to start: ' + result.error); return; }
@@ -1480,8 +1501,12 @@ async function mmCompile() {
   const force = document.getElementById('mmForce').checked;
   _mmSetCompiling(true);
   if (log) log.textContent = 'Starting…';
+  // CM-201: the detector engine's batch profile follows the panel's
+  // Detection Batch (shapes that never run are VRAM thrown away).
+  const detBatchEl = document.getElementById('ctrlMosaicDetBatch');
+  const maxBatch = Math.max(1, parseInt(detBatchEl ? detBatchEl.value : '4', 10) || 4);
   const res = await apiPost('/api/compile-engines',
-    { models: [..._mmSelected], imgsz, max_clip: maxClip, force });
+    { models: [..._mmSelected], imgsz, max_clip: maxClip, force, max_batch: maxBatch });
   if (!res || res.error) {
     if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
     _mmSetCompiling(false);
@@ -1611,7 +1636,9 @@ async function mmFetch() {
   if (list) { list.classList.remove('mm-hidden'); list.innerHTML = 'Fetching…'; }
   if (btns) btns.classList.add('mm-hidden');
   try {
-    const res = await apiPost('/api/fetch-model-list', { url: _mmCurrentRepoUrl });
+    // CM-199 (GitHub #13): the download endpoint rides with the request.
+    const _ep = (document.getElementById('mmEndpoint') || {}).value || '';
+    const res = await apiPost('/api/fetch-model-list', { url: _mmCurrentRepoUrl, endpoint: _ep });
     if (!res || res.error) { if (list) list.innerHTML = '<div class="mm-empty">' + ((res && res.error) || 'Fetch failed') + '</div>'; return; }
     _mmFetchFiles = res.files || [];
     _mmDlSelected.clear();
@@ -1697,7 +1724,8 @@ async function mmDownload() {
   _mmSetDownloading(true);
   if (log) log.textContent = 'Starting download…';
   const res = await apiPost('/api/download-models',
-    { url: _mmCurrentRepoUrl, files: [..._mmDlSelected] });
+    { url: _mmCurrentRepoUrl, files: [..._mmDlSelected],
+      endpoint: ((document.getElementById('mmEndpoint') || {}).value || '') });   // CM-199
   if (!res || res.error) {
     if (log) log.textContent = 'Error: ' + (res ? res.error : 'no response');
     _mmSetDownloading(false);
@@ -1894,7 +1922,11 @@ async function runFoiPreview() {
   }
   // CM-148 (Batch 76): user chose "Use engine size" -- run at the engine's
   // compiled Image Size (params were gathered before the gate snapped the dial).
-  if (gate.imgsz) params.mosaic.mosaic_det_imgsz = gate.imgsz;
+  if (gate.imgsz) {
+    params.mosaic.mosaic_det_imgsz = gate.imgsz;
+    // CM-196 report nit: the panel copy in the run report must show the size that ran.
+    if (params.panel && typeof params.panel === 'object') params.panel.ctrlMosaicDetImgsz = String(gate.imgsz);
+  }
 
   // The button itself is the working indicator — no modal, no poll — so the
   // images (strip + open enlarge) stay put and your eye keeps its reference for

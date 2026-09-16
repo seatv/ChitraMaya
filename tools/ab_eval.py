@@ -290,10 +290,12 @@ class RoiMasks:
     def from_misses(cls, misses_path: str, n_frames: int, src_w: int,
                     src_h: int, w: int, h: int):
         data = json.loads(Path(misses_path).read_text(encoding="utf-8"))
-        rois = data.get("detection_rois")
+        # CM-180: the run report keeps the ROI dump under debug.detection_rois;
+        # the old misses JSON had it at the top level. Accept both.
+        rois = data.get("detection_rois") or (data.get("debug") or {}).get("detection_rois")
         if not rois:
             raise KeyError(
-                "misses JSON has no detection_rois -- re-run the restore with "
+                "run report / misses JSON has no detection_rois -- re-run the restore with "
                 "--det-dump-rois (or detDumpRois in ChitraMaya-config.json)")
         sx, sy = w / float(src_w), h / float(src_h)
         rm = cls(n_frames, h, w, "detection_rois")

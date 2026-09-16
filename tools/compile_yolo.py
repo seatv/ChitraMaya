@@ -1,6 +1,18 @@
 # tools/compile_yolo.py
 """Compile YOLO .pt checkpoint(s) to TensorRT .engine files via ultralytics' export.
 
+CM-201 (2026-09-15): the default is now a FIXED-IMGSZ profile built by this
+tool from ultralytics' ONNX export: batch 1..--max-batch, H,W 32..imgsz
+(opt = --max-batch x imgsz x imgsz). ultralytics' own engine export ties the
+maximum shape to the workspace number (max H,W = max(2, workspace) x imgsz),
+so the field engines carried a batch-8 x 1600^2 profile while runs use
+4 x 800^2 -- TensorRT sizes the execution context for the largest profile
+shape, and the ledger measured that at 3.1 GB on a 3060 Ti (vs 1.1 GB for
+the whole restorer). The engine header is ultralytics' (4-byte length +
+JSON metadata + engine), so AutoBackend loads it unchanged; a
+<engine>.json sidecar records the profile. --profile legacy keeps the old
+ultralytics export path.
+
 Ultralytics' AutoBackend (used by ``LadaYoloDetector``) auto-detects the file
 extension, so after compilation you can swap ``--det-model X.pt`` for
 ``--det-model X.engine`` to take the TRT path. The .engine file lands in
@@ -49,6 +61,98 @@ def _free_cuda(model=None):
         pass
 
 
+def _onnx_metadata(onnx_path: Path) -> dict:
+    """ultralytics writes its export metadata into the ONNX metadata_props as
+    str(value); recover the original types (dicts, lists, ints) so the engine
+    header we write matches what ultralytics' own export would carry."""
+    import ast
+    import onnx
+    m = onnx.load(str(onnx_path), load_external_data=False)
+    out = {}
+    for prop in m.metadata_props:
+        v = prop.value
+        try:
+            v = ast.literal_eval(v)
+        except Exception:
+            pass
+        out[prop.key] = v
+    return out
+
+
+def _build_fixed_profile_engine(onnx_path: Path, engine_path: Path, *, imgsz: int,
+                                max_batch: int, fp16: bool, workspace_gb: int,
+                                metadata: dict) -> None:
+    """CM-201: build the TensorRT engine with the profile ChitraMaya runs:
+    min (1,3,32,32) -- the rect letterbox is always <= imgsz on both sides --
+    opt/max (max_batch, 3, imgsz, imgsz). Writes the ultralytics header."""
+    import json
+    import tensorrt as trt
+
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    config = builder.create_builder_config()
+    if workspace_gb and workspace_gb > 0:
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gb) * (1 << 30))
+    try:
+        flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    except Exception:
+        flag = 0
+    network = builder.create_network(flag)
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(str(onnx_path)):
+        errs = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+        raise RuntimeError(f"ONNX parse failed: {errs}")
+    profile = builder.create_optimization_profile()
+    for i in range(network.num_inputs):
+        inp = network.get_input(i)
+        shp = tuple(int(d) for d in inp.shape)
+        mn = tuple(d if d != -1 else lo for d, lo in zip(shp, (1, 3, 32, 32)))
+        op = tuple(d if d != -1 else v for d, v in zip(shp, (int(max_batch), 3, int(imgsz), int(imgsz))))
+        profile.set_shape(inp.name, min=mn, opt=op, max=op)
+        print(f"[compile-yolo] profile {inp.name}: min {mn} opt {op} max {op}")
+    config.add_optimization_profile(profile)
+    if fp16:
+        config.set_flag(trt.BuilderFlag.FP16)
+    engine = builder.build_serialized_network(network, config)
+    if engine is None:
+        raise RuntimeError("TensorRT engine build failed (see the TensorRT log above)")
+    engine_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(engine_path, "wb") as t:
+        meta = json.dumps(metadata)
+        t.write(len(meta).to_bytes(4, byteorder="little", signed=True))
+        t.write(meta.encode())
+        t.write(bytes(engine))
+
+
+def _write_profile_sidecar(engine_path: Path, *, imgsz: int, max_batch: int, fp16: bool,
+                           profile: str, gpu_id: int, workspace_gb: int) -> None:
+    """<engine>.json: what this engine accepts and what it was built with --
+    read at model load (CM-201 line) and by the CM-151 manifest later."""
+    import json
+    import datetime as _dt
+    info = {"profile": profile, "imgsz": int(imgsz), "max_batch": int(max_batch),
+            "fp16": bool(fp16), "workspace_gb": int(workspace_gb),
+            "built": _dt.datetime.now().isoformat(timespec="seconds")}
+    if profile == "fixed":
+        info["shape_min"] = [1, 3, 32, 32]
+        info["shape_max"] = [int(max_batch), 3, int(imgsz), int(imgsz)]
+    else:
+        info["shape_min"] = [1, 3, 32, 32]
+        info["shape_max"] = [int(max_batch), 3, 2 * int(imgsz), 2 * int(imgsz)]
+        info["note"] = "ultralytics dynamic export: max H,W = max(2, workspace) x imgsz"
+    try:
+        import torch
+        info["gpu"] = torch.cuda.get_device_name(int(gpu_id))
+        import tensorrt as trt
+        info["tensorrt"] = str(trt.__version__)
+    except Exception:
+        pass
+    try:
+        Path(str(engine_path) + ".json").write_text(json.dumps(info, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[compile-yolo] warning: could not write the profile sidecar: {e}")
+
+
 def compile_one(model_path: Path, args) -> int:
     """Compile a single YOLO .pt to a TensorRT engine.
 
@@ -69,6 +173,8 @@ def compile_one(model_path: Path, args) -> int:
 
     print(f"[compile-yolo] checkpoint:    {model_path}")
     print(f"[compile-yolo] engine target: {engine_path}")
+    print(f"[compile-yolo] profile:       {args.profile} "
+          f"({'fixed imgsz, batch 1..N -- CM-201' if args.profile == 'fixed' else 'ultralytics dynamic export'})")
     print(f"[compile-yolo] dynamic:       {bool(args.dynamic)}")
     print(f"[compile-yolo] opt imgsz:     {args.det_imgsz}")
     print(f"[compile-yolo] max batch:     {args.max_batch}")
@@ -79,7 +185,10 @@ def compile_one(model_path: Path, args) -> int:
     else:
         print(f"[compile-yolo] workspace:     no cap (TensorRT default: "
               f"full device VRAM)")
-    if args.dynamic:
+    if args.profile == "fixed":
+        print(f"[compile-yolo] shape range:   batch 1..{args.max_batch}, "
+              f"H,W 32..{args.det_imgsz} (opt {args.max_batch} x {args.det_imgsz}^2)")
+    elif args.dynamic:
         # Shape ceiling mirrors ultralytics' hard-coded formula
         # (ultralytics/utils/export/engine.py, onnx2engine):
         #     max H,W = max(2, workspace or 2) * imgsz
@@ -138,6 +247,65 @@ def compile_one(model_path: Path, args) -> int:
         return 1
     print(f"[compile-yolo] Loaded ({time.perf_counter() - t0:.1f}s)")
     print()
+
+    if args.profile == "fixed":
+        # CM-201: ONNX via ultralytics (dynamic axes on batch/H/W), engine by us.
+        _trt_major = 0
+        try:
+            import tensorrt as _trt
+            _trt_major = int(str(_trt.__version__).split(".")[0])
+        except Exception:
+            pass
+        if _trt_major >= 11:
+            print("[compile-yolo] TensorRT 11+ detected (strongly typed builder): the fixed "
+                  "profile path needs an update; falling back to the ultralytics export.")
+            args.profile = "legacy"
+    if args.profile == "fixed":
+        print("[compile-yolo] Exporting ONNX (ultralytics), then building the engine with the "
+              "fixed profile (this can take several minutes) ...")
+        t0 = time.perf_counter()
+        try:
+            onnx_out = model.export(
+                format="onnx",
+                imgsz=int(args.det_imgsz),
+                half=False,
+                dynamic=True,
+                batch=int(args.max_batch),
+                simplify=True,
+                device=int(args.gpu_id),
+                verbose=False,
+            )
+            onnx_path = Path(str(onnx_out)) if onnx_out else ultra_onnx_path
+            if not onnx_path.is_file():
+                onnx_path = ultra_onnx_path
+            meta = _onnx_metadata(onnx_path)
+            meta["batch"] = int(args.max_batch)
+            meta["imgsz"] = [int(args.det_imgsz), int(args.det_imgsz)]
+            meta["chitramaya_profile"] = {"kind": "fixed", "imgsz": int(args.det_imgsz),
+                                          "max_batch": int(args.max_batch)}
+            _free_cuda(None)
+            _build_fixed_profile_engine(
+                onnx_path, engine_path, imgsz=int(args.det_imgsz), max_batch=int(args.max_batch),
+                fp16=bool(args.fp16), workspace_gb=int(args.workspace), metadata=meta)
+        except Exception as e:
+            print(f"[!] fixed-profile build failed: {e}", file=sys.stderr)
+            return 1
+        elapsed = time.perf_counter() - t0
+        if ultra_onnx_path.is_file():
+            try:
+                ultra_onnx_path.unlink()
+            except OSError:
+                pass
+        _write_profile_sidecar(engine_path, imgsz=int(args.det_imgsz), max_batch=int(args.max_batch),
+                               fp16=bool(args.fp16), profile="fixed", gpu_id=int(args.gpu_id),
+                               workspace_gb=int(args.workspace))
+        size_mb = engine_path.stat().st_size / (1024 * 1024)
+        print()
+        print(f"[compile-yolo] Done in {elapsed:.1f}s.")
+        print(f"[compile-yolo] Engine: {engine_path} ({size_mb:.1f} MB) -- profile batch 1..{args.max_batch}, "
+              f"H,W 32..{args.det_imgsz}")
+        _free_cuda(model)
+        return 0
 
     print("[compile-yolo] Exporting to TensorRT engine (this can take several minutes) ...")
     t0 = time.perf_counter()
@@ -200,6 +368,9 @@ def compile_one(model_path: Path, args) -> int:
             print(f"[compile-yolo] warning: could not remove intermediate "
                   f"{ultra_onnx_path}: {e}")
 
+    _write_profile_sidecar(engine_path, imgsz=int(args.det_imgsz), max_batch=int(args.max_batch),
+                           fp16=bool(args.fp16), profile="legacy", gpu_id=int(args.gpu_id),
+                           workspace_gb=int(args.workspace))
     size_mb = engine_path.stat().st_size / (1024 * 1024)
     print()
     print(f"[compile-yolo] Done in {elapsed:.1f}s.")
@@ -242,8 +413,16 @@ def main() -> int:
              "(--max-batch, --det-imgsz) at compile time.",
     )
     parser.add_argument(
-        "--max-batch", type=int, default=8,
-        help="Maximum batch size the engine should support (default: 8). "
+        "--profile", choices=["fixed", "legacy"], default="fixed",
+        help="fixed (default, CM-201): batch 1..--max-batch, H,W 32..--det-imgsz -- the "
+             "shapes ChitraMaya actually runs, so TensorRT's execution context is sized "
+             "for them (3.1 GB -> a few hundred MB on the v2 model at 800). legacy: "
+             "ultralytics' own dynamic export (max H,W = max(2, workspace) x imgsz).",
+    )
+    parser.add_argument(
+        "--max-batch", type=int, default=4,
+        help="Maximum batch size the engine should support (default: 4 = the panel's "
+             "Detection Batch default; the UI passes the panel value). "
              "Ultralytics requires this to be >1 when --dynamic=True. "
              "NOTE: larger max-batch raises the TRT builder's scratch-memory "
              "request; on an 8GB card, batch 16 on the 22M-param (YOLO11m) "

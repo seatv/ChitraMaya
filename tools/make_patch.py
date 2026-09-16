@@ -62,6 +62,8 @@ EXCLUDE_PATTERNS = (
     "ChitraMaya-console*.log",
     "*-compile-*.log",
     "*.misses.json",
+    "*.run.json",       # CM-180 run reports
+    "*-restored*.log",  # CM-180 per-run console logs
     "Thumbs.db",
     "desktop.ini",
 )

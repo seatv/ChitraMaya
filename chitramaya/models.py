@@ -149,6 +149,14 @@ class MosaicConfig:
     # 0 = off, 1..3 = strength (higher = more aggressive smoothing).
     mosaic_temporal_stability: int = 0
 
+    # CM-202 (GitHub #10): the suffix appended to the output file name in
+    # restoration mode ("-restored" by default; "-censored"/"-mask" for the
+    # other modes stay fixed) and the per-run files switch: "beside" (the
+    # .run.json / .log / .timecodes.txt next to the video), "temp" (in the
+    # Temp folder) or "off" (none written). "" = follow ChitraMaya-config.json.
+    mosaic_output_suffix: str = "-restored"
+    mosaic_run_report: str = ""
+
     # CM-084 (Batch 38): FrameStore backend -- "auto" | "device" | "host".
     # auto keeps frames in VRAM when they fit, offloads to system RAM when
     # the projected store would not (the long-Max-Clip enabler).
@@ -215,6 +223,7 @@ class MosaicConfig:
             secondary_denoise=str(self.mosaic_secondary_denoise or "none").lower(),
             temporal_stability=int(self.mosaic_temporal_stability or 0),
             store_backend=str(self.mosaic_store_backend or "auto").lower(),
+            run_report=str(self.mosaic_run_report or "").strip().lower(),   # CM-202
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),
             qp=int(enc.get("qp", 18)),

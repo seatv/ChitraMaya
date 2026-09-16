@@ -59,12 +59,40 @@ class ConsoleBuffer:
         self._partial = ""
         self._lock = threading.Lock()
         self._fh = None
+        self.log_path: Optional[str] = None
         if log_path:
             try:
                 self._fh = open(log_path, "w", encoding="utf-8",
                                 errors="replace")
+                self.log_path = str(log_path)
             except Exception:
                 self._fh = None  # unwritable location must never break prints
+
+    # CM-180: the per-run log is a SLICE of this file -- the pipeline
+    # remembers the offset at run start and copies from there at the end.
+    def log_offset(self) -> Optional[int]:
+        with self._lock:
+            if self._fh is None:
+                return None
+            try:
+                self._fh.flush()
+                return int(self._fh.tell())
+            except Exception:
+                return None
+
+    def read_log_from(self, offset: Optional[int]) -> Optional[str]:
+        if not self.log_path:
+            return None
+        try:
+            with self._lock:
+                if self._fh is not None:
+                    self._fh.flush()
+            with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
+                if offset:
+                    f.seek(int(offset))
+                return f.read()
+        except Exception:
+            return None
 
     def feed(self, text: str) -> None:
         """Feed raw stream text; commit completed lines on newline."""

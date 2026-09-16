@@ -14,22 +14,29 @@
   <!-- ── Top Header Bar ─────────────────────────────────── -->
   <div class="app-header">
     <span class="logo">ChitraMaya</span>
-    <div style="display:flex; align-items:center; gap:6px; flex:1; margin:0 8px 0 14px; min-width:0;">
-      <button class="header-btn" id="outputBtn" title="Select output folder">📁 Output</button>
-      <input type="text" class="left-footer-path" id="outputPath" placeholder="Output..."
-             title="Paste path and press Enter" style="flex:1; min-width:60px;">
-      <button class="header-btn" id="tempBtn" title="Select temp folder">📁 Temp</button>
-      <input type="text" class="left-footer-path" id="tempPath" placeholder="Temp..."
-             title="Paste path and press Enter" style="flex:1; min-width:60px;">
+    <!-- Header fields (CM-202 tidy, 09-15): every button, label and box in
+         this bar shares .hdr-item's height; the folder/suffix group never
+         shrinks below its content (min-width:max-content) -- the video-name
+         box is the one that yields, with an ellipsis. Icons sit OUTSIDE the
+         boxes for all four fields (Output, Temp, Suffix, Video). -->
+    <div class="hdr-fields">
+      <button class="header-btn hdr-item" id="outputBtn" title="Select output folder">📁 Output</button>
+      <input type="text" class="left-footer-path hdr-item" id="outputPath" placeholder="Output..."
+             title="Paste path and press Enter" style="flex:1 1 16em; min-width:60px;">
+      <button class="header-btn hdr-item" id="tempBtn" title="Select temp folder">📁 Temp</button>
+      <input type="text" class="left-footer-path hdr-item" id="tempPath" placeholder="Temp..."
+             title="Paste path and press Enter" style="flex:0 0 8em; min-width:5em;">
+      <!-- CM-202 (GitHub #10): the output name suffix lives with the output
+           folder, where the name is decided (Gman's mock-up 09-15). -->
+      <span class="header-btn hdr-item hdr-static" id="resultSuffixLabel"
+            title="Text appended to the output file name in restoration mode (default -restored). Path characters are not allowed. Leave it empty to keep the source name -- allowed only when the output folder differs from the source folder; folder batches always keep a suffix so they can recognise their own outputs.">🏷️ Suffix</span>
+      <input type="text" class="left-footer-path hdr-item" id="ctrlOutputSuffix" value="-restored" maxlength="32"
+             spellcheck="false" placeholder="-restored"
+             title="Text appended to the output file name (default -restored)" style="flex:0 0 11em; min-width:5em;">
     </div>
-    <div id="currentFileWrap"
-         style="display:flex; align-items:center; gap:7px; flex:2; min-width:0; margin-right:10px;
-                padding:3px 10px; background:var(--panel-bg,#161616); border:1px solid var(--border,#2a2a2a);
-                border-radius:5px;">
-      <span style="opacity:.55; flex:0 0 auto;">🎬</span>
-      <span id="currentFileName"
-            style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px;
-                   direction:rtl; text-align:left; color:var(--text-dim,#9a9a9a);">No video loaded</span>
+    <div id="currentFileWrap" class="hdr-video">
+      <span class="header-btn hdr-item hdr-static" title="The video loaded in the player">🎬 Video</span>
+      <span id="currentFileName" class="left-footer-path hdr-item hdr-video-name">No video loaded</span>
     </div>
     <button class="stc-btn" id="stcBtn"
             title="Not affiliated with Save the Children. If you find ChitraMaya useful, please consider donating — this opens their official donation page.">&#10084;&#65039; Save The Children</button>
@@ -39,6 +46,17 @@
         <button class="config-menu-item" id="cfgSave">💾 Save Settings</button>
         <button class="config-menu-item" id="cfgLoad">📂 Load Settings</button>
         <button class="config-menu-item" id="cfgReset">🔄 Reset Defaults</button>
+        <!-- CM-182: UI language. Native names on purpose (never translated);
+             the choice is saved with Save Settings (ctrlUiLanguage). -->
+        <div class="config-menu-item config-menu-lang" title="Interface language. Community translations; English is used for any text a translation does not cover yet.">
+          <span>🌐</span>
+          <select id="ctrlUiLanguage" class="ctrl-select" style="flex:1;">
+            <option value="en" selected>English</option>
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="th">ไทย (ฉบับร่าง)</option>
+          </select>
+        </div>
         <!-- CM-173: saved configurations. One click on a name loads it and
              makes it the active config. The list is filled from /api/presets
              each time the menu opens. -->
@@ -358,9 +376,10 @@
               </div>
               <div class="ctrl-row">
                 <span class="ctrl-label"
-                      title="Where decoded frames wait for restoration. Auto keeps them in GPU VRAM when they fit and moves them to system RAM only when the run would need more than free VRAM (long Max Clip values). Device forces VRAM (the classic behavior); Host forces system RAM. Host adds a small per-frame transfer cost but makes Max Clip 180 possible on 8GB cards.">Frame Store</span>
+                      title="Where decoded frames wait for paste-back. Auto (recommended): on NVIDIA, Re-decode -- no frame store at all; a second decoder produces each frame again when it is due, so Max Clip Length costs no RAM or VRAM and no full frame crosses the PCIe bus. On AMD/Intel, Auto keeps the frame store: GPU VRAM when it fits, system RAM when it would not. Device forces VRAM (the classic behavior); Host forces system RAM; Re-decode forces the second decoder (NVIDIA; Split SBS yes, VR Projection and Test Frame keep the store).">Frame Store</span>
                 <select class="ctrl-select" id="ctrlStoreBackend">
                   <option value="auto" selected>Auto (recommended)</option>
+                  <option value="redecode">Re-decode (no frame store)</option>
                   <option value="device">Device (VRAM)</option>
                   <option value="host">Host (system RAM)</option>
                 </select>
@@ -482,6 +501,14 @@
               <input type="range" class="ctrl-dial" id="ctrlQP" min="0" max="51" value="18">
               <span class="ctrl-value" id="valQP">18</span>
             </div>
+          </div>
+          <div class="ctrl-row">
+            <span class="ctrl-label" title="Where the per-run files go: the run report (.run.json), its console log (.log) and the timecodes file (.timecodes.txt). Beside the video = next to the output (default); Temp folder = in the Temp folder; Off = not written at all. The app's own console log in the program folder is not affected.">Run Files</span>
+            <select class="ctrl-select" id="ctrlRunReport">
+              <option value="beside" selected>Beside the video</option>
+              <option value="temp">Temp folder</option>
+              <option value="off">Off</option>
+            </select>
           </div>
           <div class="ctrl-row">
             <input type="checkbox" class="ctrl-checkbox" id="ctrlAsyncEncoder">
@@ -891,6 +918,13 @@
           <button class="modal-btn" id="mmAddSource" title="Add a Hugging Face repo URL">+ Add</button>
           <button class="modal-btn modal-btn-confirm" id="mmFetch">Fetch</button>
         </div>
+        <div class="mm-dl-row">
+          <span class="ctrl-label" title="Which server the model list and downloads come from. huggingface.co is the original; hf-mirror.com is a free mirror with the same files, reachable from mainland China without a VPN. When huggingface.co cannot be reached at all, ChitraMaya retries on hf-mirror.com by itself.">Download via</span>
+          <select id="mmEndpoint" class="mm-select">
+            <option value="https://huggingface.co" selected>huggingface.co</option>
+            <option value="https://hf-mirror.com">hf-mirror.com (China mainland)</option>
+          </select>
+        </div>
         <div class="mm-list mm-hidden" id="mmFetchList"></div>
         <div class="mm-row-btns mm-hidden" id="mmDlBtns">
           <button class="modal-btn" id="mmDlSelectAll">Select all</button>
@@ -1118,6 +1152,7 @@
 <script src="/static/js/params.js?v={{ cachebust }}"></script>
 <script src="/static/js/init.js?v={{ cachebust }}"></script>
 <script src="/static/js/mosaic.js?v={{ cachebust }}"></script>
+<script src="/static/js/i18n.js?v={{ cachebust }}"></script>
 {% if training_ui %}<script src="/static/js/training.js?v={{ cachebust }}"></script>{% endif %}
 <script type="module" src="/static/js/sbs_viewer.js?v={{ cachebust }}"></script>
 

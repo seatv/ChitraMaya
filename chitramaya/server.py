@@ -54,6 +54,40 @@ def _describe_gpu_error(e: BaseException) -> str:
     return msg
 
 
+def _resolve_output_suffix(mosaic_cfg, *, out_dir, source_dir, batch: bool = False) -> str:
+    """CM-202 (GitHub #10): the restoration output suffix comes from the
+    panel (mosaic_output_suffix, default "-restored"); "-censored" / "-mask"
+    stay fixed for the other modes. An EMPTY suffix is honoured only when
+    the output folder differs from the source folder (otherwise the output
+    would collide with the source name), and never for a folder batch (the
+    batch recognises its own outputs by suffix)."""
+    from chitramaya.mosaic.batch import sanitize_output_suffix
+    if getattr(mosaic_cfg, "mosaic_censor", False):
+        return "-censored"
+    if getattr(mosaic_cfg, "mosaic_mask_preview", False):
+        return "-mask"
+    raw = getattr(mosaic_cfg, "mosaic_output_suffix", "-restored")
+    suf = sanitize_output_suffix(raw, default="-restored")
+    if suf != str(raw if raw is not None else "-restored"):
+        print(f"[Output] suffix {raw!r} cleaned to {suf!r} (path characters are not allowed).")
+    if suf == "":
+        same_dir = False
+        try:
+            if out_dir and source_dir:
+                same_dir = Path(out_dir).resolve() == Path(source_dir).resolve()
+        except Exception:
+            same_dir = False
+        if batch:
+            print("[Output] empty suffix: a folder batch needs one to recognise its own "
+                  "outputs on a re-run -- using '-restored' for this batch.")
+            return "-restored"
+        if same_dir:
+            print("[Output] empty suffix with the output in the source folder would name the "
+                  "output like the source -- using '-restored' for this run.")
+            return "-restored"
+    return suf
+
+
 def _app_base_dir() -> Path:
     """Directory the app treats as home for ``models/`` and the config file.
 
@@ -730,8 +764,7 @@ class SwapServer:
         input_path = Path(self.video_path)
         out_dir = self.output_dir or str(input_path.parent)
         os.makedirs(out_dir, exist_ok=True)
-        suffix = ("-censored" if mosaic_cfg.mosaic_censor
-                  else "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored")
+        suffix = _resolve_output_suffix(mosaic_cfg, out_dir=out_dir, source_dir=str(input_path.parent))
         output_path = self._unique_output_path(
             str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4"))
 
@@ -759,6 +792,7 @@ class SwapServer:
                 progress_cb=self._mosaic_progress_cb,
                 use_tqdm=False,
                 cancel_flag=self._cancel_flag,
+                panel=params.get("panel") if isinstance(params.get("panel"), dict) else None,  # CM-180
             )
         except Exception as e:
             logger.exception("mosaic_full failed")
@@ -814,8 +848,10 @@ class SwapServer:
         files = params.get("files") or None
 
         mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
-        suffix = ("-censored" if mosaic_cfg.mosaic_censor
-                  else "-mask" if mosaic_cfg.mosaic_mask_preview else "-restored")
+        # CM-202: the folder batch needs a NON-empty suffix to recognise its
+        # own outputs on a re-run; an empty one falls back with a note.
+        suffix = _resolve_output_suffix(mosaic_cfg, out_dir=None, source_dir=None, batch=True)
+        _batch.register_output_suffix(suffix)
 
         if files:
             inputs = []
@@ -945,6 +981,7 @@ class SwapServer:
                 progress_cb=self._mosaic_progress_cb,
                 use_tqdm=False,
                 cancel_flag=self._cancel_flag,
+                panel=params.get("panel") if isinstance(params.get("panel"), dict) else None,  # CM-180
             )
 
         bp = self._progress["batch"]
@@ -1989,7 +2026,7 @@ def _compiler_prefix():
     return [sys.executable, "-m", "chitramaya"]        # dev
 
 
-def _run_compile(models, imgsz, max_clip, force):
+def _run_compile(models, imgsz, max_clip, force, max_batch=4):
     """Compile the SELECTED models one at a time via the exe's -compile-det /
     -compile-rest subcommands (.pt -> detection, .pth -> restoration),
     streaming each model's output into the shared log with a header."""
@@ -2000,9 +2037,13 @@ def _run_compile(models, imgsz, max_clip, force):
         name = os.path.basename(mp)
         ext = os.path.splitext(mp)[1].lower()
         if ext == ".pt":
+            # CM-201: the engine profile is what the panel runs -- batch up to
+            # the Detection Batch value, H,W up to the Image Size. (The old
+            # fixed "8" plus ultralytics' 2x-imgsz ceiling cost 3.1 GB of VRAM
+            # on an 8 GB card for shapes that never occur.)
             cmd = prefix + ["-compile-det", "--det-model", mp,
                             "--det-imgsz", str(int(imgsz)),
-                            "--max-batch", "8", "--workspace", "2"]
+                            "--max-batch", str(max(1, int(max_batch))), "--workspace", "2"]
         elif ext == ".pth":
             # v1.60 (CM-104): no --rest-max-clip-length — engines are
             # clip-size independent (the API still accepts max_clip for
@@ -2053,6 +2094,7 @@ def api_compile_engines():
     try:
         imgsz = int(data.get("imgsz", 640))
         max_clip = int(data.get("max_clip", 60))
+        max_batch = int(data.get("max_batch", 4) or 4)   # CM-201: the panel's Detection Batch
     except (TypeError, ValueError):
         return jsonify({"error": "Image Size and Max Clip Length must be integers."})
     force = bool(data.get("force", False))
@@ -2080,7 +2122,7 @@ def api_compile_engines():
             f"{', force rebuild' if force else ''})...\n"
         )
 
-    threading.Thread(target=_run_compile, args=(safe, imgsz, max_clip, force),
+    threading.Thread(target=_run_compile, args=(safe, imgsz, max_clip, force, max_batch),
                      daemon=True).start()
     return jsonify({"ok": True, "started": True, "count": len(safe)})
 
@@ -2346,10 +2388,40 @@ def _save_model_sources(sources):
         logger.exception("failed to write model-sources.json")
 
 
+_HF_MAIN = "https://huggingface.co"
+_HF_MIRROR_CN = "https://hf-mirror.com"
+
+
+def _hf_endpoint(requested=None) -> str:
+    """CM-199 (GitHub #13): where model downloads go. The Manage Models
+    dropdown value rides with each request; the hand-edit key hfEndpoint in
+    ChitraMaya-config.json is the fallback; default huggingface.co.
+    hf-mirror.com is a reverse proxy with identical paths, reachable from
+    mainland China without a VPN."""
+    cand = str(requested or "").strip()
+    if not cand:
+        try:
+            _cp = _config_file_path()
+            _flat = json.loads(_cp.read_text(encoding="utf-8")) if _cp.is_file() else {}
+        except Exception:
+            _flat = {}
+        cand = str((_flat or {}).get("hfEndpoint", "") or "").strip() if isinstance(_flat, dict) else ""
+    if not cand:
+        cand = _HF_MAIN
+    if cand in ("huggingface.co", "hf", "main"):
+        cand = _HF_MAIN
+    elif cand in ("hf-mirror.com", "mirror", "cn"):
+        cand = _HF_MIRROR_CN
+    if not cand.lower().startswith(("http://", "https://")):
+        cand = "https://" + cand
+    return cand.rstrip("/")
+
+
 def _parse_hf_repo(url):
-    """https://huggingface.co/{owner}/{repo}[/tree/...] -> (owner, repo) or None."""
+    """https://huggingface.co/{owner}/{repo}[/tree/...] (or the hf-mirror.com
+    spelling) -> (owner, repo) or None."""
     import re
-    m = re.match(r"https?://huggingface\.co/([^/\s]+)/([^/\s]+)", str(url).strip())
+    m = re.match(r"https?://(?:huggingface\.co|hf-mirror\.com)/([^/\s]+)/([^/\s]+)", str(url).strip())
     return (m.group(1), m.group(2)) if m else None
 
 
@@ -2379,10 +2451,23 @@ def api_fetch_model_list():
     if not repo:
         return jsonify({"error": "Not a Hugging Face repo URL."})
     owner, name = repo
-    api = f"https://huggingface.co/api/models/{owner}/{name}/tree/main?recursive=true"
+    endpoint = _hf_endpoint(data.get("endpoint"))
+    api = f"{endpoint}/api/models/{owner}/{name}/tree/main?recursive=true"
     try:
-        with _hf_open(api, timeout=30) as r:
-            tree = json.loads(r.read().decode("utf-8"))
+        try:
+            with _hf_open(api, timeout=30, endpoint=endpoint) as r:
+                tree = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError) as e0:
+            # CM-199: could not reach the endpoint at all (not an HTTP status):
+            # one retry on the mirror when the main site was asked for.
+            if endpoint == _HF_MAIN and not isinstance(e0, urllib.error.HTTPError):
+                print(f"[ModelHub] {endpoint} unreachable ({e0}); retrying on {_HF_MIRROR_CN} (CM-199)")
+                endpoint = _HF_MIRROR_CN
+                api = f"{endpoint}/api/models/{owner}/{name}/tree/main?recursive=true"
+                with _hf_open(api, timeout=30, endpoint=endpoint) as r:
+                    tree = json.loads(r.read().decode("utf-8"))
+            else:
+                raise
     except urllib.error.HTTPError as e:
         if e.code in (401, 403, 429):
             return jsonify({"error": f"Hugging Face refused the request "
@@ -2400,7 +2485,7 @@ def api_fetch_model_list():
             if path.lower().endswith((".pt", ".pth")):
                 files.append({"path": path, "size": int(item.get("size", 0) or 0)})
     files.sort(key=lambda f: f["path"])
-    return jsonify({"ok": True, "repo": f"{owner}/{name}", "files": files})
+    return jsonify({"ok": True, "repo": f"{owner}/{name}", "files": files, "endpoint": endpoint})
 
 
 def _hf_token() -> str:
@@ -2434,7 +2519,7 @@ from chitramaya import __version__ as _CM_VERSION
 _HF_UA = f"ChitraMaya/{_CM_VERSION} (+https://github.com/seatv/ChitraMaya)"
 
 
-def _hf_open(url: str, timeout: int = 60, *, max_redirects: int = 5):
+def _hf_open(url: str, timeout: int = 60, *, max_redirects: int = 5, endpoint: str = _HF_MAIN):
     """Open an HF URL with optional auth, following redirects SAFELY.
 
     urllib's default redirect handler forwards ALL request headers — including
@@ -2453,7 +2538,9 @@ def _hf_open(url: str, timeout: int = 60, *, max_redirects: int = 5):
     opener = urllib.request.build_opener(_NoRedirect)
     token = _hf_token()
     headers = {"User-Agent": _HF_UA, "Accept": "*/*"}
-    if token and url.startswith("https://huggingface.co/"):
+    # CM-199: the token goes to the configured endpoint host only (the
+    # mirror forwards it for gated repos); never to a CDN redirect target.
+    if token and url.startswith(str(endpoint).rstrip("/") + "/"):
         headers["Authorization"] = f"Bearer {token}"
 
     import urllib.error
@@ -2497,7 +2584,7 @@ def _hf_error_hint(e: BaseException) -> str:
     return ""
 
 
-def _run_download(owner, name, files):
+def _run_download(owner, name, files, endpoint=_HF_MAIN):
     import urllib.request
     # Download into the server's resolved (absolute) models dir so in-app
     # downloads land next to the exe's models/ regardless of launch cwd —
@@ -2517,10 +2604,23 @@ def _run_download(owner, name, files):
             with _download_lock:
                 _download_job["log"] += f"[skip] already in models/ (delete it to re-download)\n"
             continue
-        url = f"https://huggingface.co/{owner}/{name}/resolve/main/{path}"
+        url = f"{endpoint}/{owner}/{name}/resolve/main/{path}"
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
-            with _hf_open(url, timeout=60) as r:
+            try:
+                _resp = _hf_open(url, timeout=60, endpoint=endpoint)
+            except Exception as e0:
+                import urllib.error as _ue
+                if endpoint == _HF_MAIN and not isinstance(e0, _ue.HTTPError):
+                    with _download_lock:
+                        _download_job["log"] += (f"[note] {endpoint} unreachable ({e0}); "
+                                                 f"retrying on {_HF_MIRROR_CN} (CM-199)\n")
+                    endpoint = _HF_MIRROR_CN
+                    url = f"{endpoint}/{owner}/{name}/resolve/main/{path}"
+                    _resp = _hf_open(url, timeout=60, endpoint=endpoint)
+                else:
+                    raise
+            with _resp as r:
                 total = int(r.headers.get("Content-Length", 0) or 0)
                 got, last = 0, -1
                 with open(tmp, "wb") as f:
@@ -2566,13 +2666,15 @@ def api_download_models():
     if not files:
         return jsonify({"error": "No files selected."})
     owner, name = repo
+    endpoint = _hf_endpoint(data.get("endpoint"))
     with _download_lock:
         if _download_job["running"]:
             return jsonify({"error": "A download is already running."})
         _download_job["running"] = True
         _download_job["done"] = None
-        _download_job["log"] = f"Downloading {len(files)} file(s) from {owner}/{name} into models/...\n"
-    threading.Thread(target=_run_download, args=(owner, name, files), daemon=True).start()
+        _download_job["log"] = (f"Downloading {len(files)} file(s) from {owner}/{name} into models/ "
+                                f"via {endpoint} ...\n")
+    threading.Thread(target=_run_download, args=(owner, name, files, endpoint), daemon=True).start()
     return jsonify({"ok": True, "started": True, "count": len(files)})
 
 
@@ -3033,14 +3135,33 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
     _instance_n = port - 5100 + 1
     from chitramaya.console_buffer import install as _install_console
     try:
+        # CM-195 (field 2026-09-13): every launch used to overwrite
+        # ChitraMaya-console.log, so the log of the run you wanted was gone
+        # the moment you restarted the app. The name now carries the launch
+        # time; the newest 20 are kept, older ones are deleted at launch.
+        import datetime as _dt_mod
+        _stamp = _dt_mod.datetime.now().strftime("%Y%m%d-%H%M%S")
         if _instance_n == 1:
-            _log_name = "ChitraMaya-console.log"
+            _log_name = f"ChitraMaya-console-{_stamp}.log"
         else:
-            _log_name = f"ChitraMaya-console-{os.getpid()}.log"
+            _log_name = f"ChitraMaya-console-{_stamp}-{os.getpid()}.log"
         _log_path = str(_app_base_dir() / _log_name)
+        try:
+            _old = sorted(
+                (q for q in _app_base_dir().glob("ChitraMaya-console*.log") if q.is_file()),
+                key=lambda q: q.stat().st_mtime, reverse=True)
+            for q in _old[19:]:          # keep 19 + the one about to be created
+                try:
+                    q.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     except Exception:
         _log_path = None
     _install_console(log_path=_log_path)
+    if _log_path:
+        print(f"[ChitraMaya] console log: {_log_name} (the newest 20 launches are kept)")
     if _instance_n > 1:
         print(f"[ChitraMaya] Instance {_instance_n}: port 5100 busy; "
               f"running on port {port} (console log: {_log_name})")

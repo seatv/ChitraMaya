@@ -76,12 +76,17 @@ class Decoder:
         trim_negative_pts: bool = True,
         output_format: str = "RGBP",          # "RGBP" or "RGB"
         ffmpeg_input_args: str = "",          # injected BEFORE -i (CPU fallback)
+        threaded_buffer_size: Optional[int] = None,   # CM-191: explicit NVDEC prefetch depth
     ) -> None:
         self.input_path = str(Path(input_path))
         self.gpu_id = int(gpu_id)
         self.batch_size = int(batch_size)
         self.output_format = str(output_format or "RGBP").upper()
         self.ffmpeg_input_args = str(ffmpeg_input_args or "")
+        # CM-191: the lagging re-decode instance asks for a small prefetch
+        # queue (it is read one frame at a time); None keeps the default.
+        self._threaded_buffer_override: Optional[int] = (
+            int(threaded_buffer_size) if threaded_buffer_size else None)
 
         # Probe once up front
         self._probe_meta: VideoMetadata | None = None
@@ -392,6 +397,8 @@ class Decoder:
             pass
 
     def _threaded_buffer_size(self) -> int:
+        if getattr(self, "_threaded_buffer_override", None):
+            return max(2, int(self._threaded_buffer_override))
         env = os.environ.get("GR_NVDEC_BUFFER_SIZE", "").strip()
         if env:
             try:
@@ -404,7 +411,20 @@ class Decoder:
         # ThreadedDecoder buffer_size is a prefetch queue depth, not a consumer batch size.
         # Keep it modest by default to avoid excessive GPU memory use on 4K streams while
         # still giving the background decoder room to stay ahead of inference.
-        return max(8, min(max(self.batch_size, 16), 32))
+        depth = max(8, min(max(self.batch_size, 16), 32))
+        # CM-196: on cards under 10 GB keep the queue at twice the batch (the
+        # ratio the re-decode instance runs with; never below 8): with the
+        # UI's default batch 4 that is 8 frames instead of 16 -- ~200 MB of
+        # VRAM back at 4K RGBP, on the cards where a full-stack 4K run sits
+        # at the ceiling from the first hour. Bigger cards keep 16.
+        try:
+            if torch.cuda.is_available():
+                _total = int(torch.cuda.get_device_properties(int(self.gpu_id)).total_memory)
+                if _total < 10 * 1024 ** 3:
+                    depth = max(8, min(2 * int(self.batch_size), depth))
+        except Exception:
+            pass
+        return depth
 
     @staticmethod
     def _looks_like_nvdec_unsupported(e: Exception) -> bool:
@@ -592,11 +612,21 @@ class Decoder:
             part_path.unlink(missing_ok=True)  # stale orphan from a crash
         except Exception:
             pass
+        # CM-190 (field 2026-09-12): the CM-125 ".part" suffix hid the .mp4
+        # extension from ffmpeg, which cannot choose a muxer for
+        # "*.mp4.part" -> "Error initializing the muxer ... Invalid
+        # argument" on EVERY TS source since v1.61.00, so every TS capture
+        # was decoded directly with dropped frames (the CM-150 "fallback").
+        # `-f mp4` names the muxer explicitly. Video only: the temp exists
+        # for the DECODER; the finalize takes audio from the source (or the
+        # CM-187 sidecar), and TS captures with LATM/odd audio used to fail
+        # this copy too. No faststart: the temp is read once, sequentially
+        # -- the rewrite pass was pure cost (CM-187).
         cmd = [
-            "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
+            "ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostdin",
             "-i", str(src),
-            "-map", "0:v:0", "-map", "0:a?",
-            "-c", "copy", "-movflags", "+faststart",
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-c", "copy", "-f", "mp4",
             str(part_path),
         ]
         try:
@@ -610,7 +640,7 @@ class Decoder:
                                encoding="utf-8", errors="replace",
                                timeout=timeout_s, **NOWINDOW)
             if r.returncode != 0:
-                tail = (r.stderr or "").strip().splitlines()[-3:]
+                tail = (r.stderr or "").strip().splitlines()[-5:]
                 print("[Decoder] MPEG-TS remux FAILED (decoding the TS "
                       "directly; frames may be dropped -- CM-120):")
                 for ln in tail:

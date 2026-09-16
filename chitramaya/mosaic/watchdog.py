@@ -274,6 +274,7 @@ class StallWatchdog:
         flap_pending = None         # (held_since, alarm_text) or None
         flap_escalated = False      # an escalated alarm awaits its all-clear
         flap_count = 0
+        self.flap_count = 0
         flap_last_summary = 0.0
         while not self._stop.wait(self.POLL_SECONDS):
             now = time.monotonic()
@@ -293,6 +294,7 @@ class StallWatchdog:
                     else:
                         flap_pending = (now, alarm)
                         flap_count += 1
+                        self.flap_count = flap_count   # CM-180: read by the run report
                 # v1.50.00: close the loop on transient down-trains -- a
                 # recovered link gets an explicit all-clear so a completed
                 # run never ends on an unresolved alarm.

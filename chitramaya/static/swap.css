@@ -41,6 +41,47 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 }
 .header-btn:hover { background: var(--hover); color: var(--text); }
 
+/* Header bar fields (CM-202 tidy): one height for every button, label and
+   box; the folder/suffix group keeps its content width, the video-name box
+   yields with an ellipsis. */
+.hdr-item {
+  height: 26px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+.hdr-static { cursor: default; }
+.hdr-static:hover { background: var(--surface2); color: var(--text-dim); }
+.hdr-fields {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: max-content;
+  margin: 0 8px 0 14px;
+}
+.hdr-video {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 4 1 0;               /* the video name gets most of the free width (Gman 09-15) */
+  min-width: 0;
+  margin-right: 10px;
+}
+.hdr-video-name {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  font-size: 11px;
+  display: block;            /* ellipsis needs a block box, not inline-flex */
+  line-height: 24px;         /* 26px minus the border, keeps the text centred */
+}
+
 .header-path {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -85,6 +126,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   min-width: 160px;
 }
 .config-menu.hidden { display: none; }
+
+/* CM-182: the language row in the gear menu (a select, not a button) */
+.config-menu-lang { display: flex; align-items: center; gap: 6px; cursor: default; }
+.config-menu-lang:hover { background: none; }
 
 .config-menu-item {
   display: block;
@@ -690,6 +735,19 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   padding: 3px 6px;
   border-radius: var(--radius-sm);
 }
+
+/* CM-202: free-text control in a ctrl-row, styled like .ctrl-select (unused by the header) */
+.ctrl-text {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-mono, var(--font-sans));
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+.ctrl-text:focus { outline: 1px solid var(--accent); }
 
 .ctrl-checkbox {
   accent-color: var(--accent);

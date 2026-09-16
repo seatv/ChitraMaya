@@ -27,30 +27,90 @@ import sys
 # -train-det, -make-pairs, -train-rest) still dispatch below but are not
 # listed here until the training UI ships -- WIP, undocumented on purpose.
 USAGE = """\
-Usage:
-  ChitraMaya                       Launch the UI server
-  ChitraMaya -restore     [opts]   Run the mosaic-restoration CLI
-  ChitraMaya -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
-  ChitraMaya -compile-det  [opts]  Build/rebuild the YOLO detection engine
-  ChitraMaya -self-check           Verify this install (imports, GPU, ffmpeg)
-  ChitraMaya -verify-blend-mask    Diagnostic: blend-mask equivalence + timing (CM-172)
-  ChitraMaya -probe-decode         Diagnostic: decode-path layer timings (CM-171)
-  ChitraMaya -h | --help           Show this help
+Usage (installed build -- the subcommands need the CONSOLE exe, ChitraMaya-cli.exe;
+ChitraMaya.exe is the windowed UI and has no console to print to):
+  ChitraMaya.exe                           Launch the UI (windowed)
+  ChitraMaya-cli.exe                       Launch the UI with a console window
+  ChitraMaya-cli.exe -restore     [opts]   Run the mosaic-restoration CLI
+  ChitraMaya-cli.exe -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
+  ChitraMaya-cli.exe -compile-det  [opts]  Build/rebuild the YOLO detection engine (CM-201 profile)
+  ChitraMaya-cli.exe -self-check           Verify this install (imports, GPU, ffmpeg)
+  ChitraMaya-cli.exe -verify-blend-mask    Diagnostic: blend-mask equivalence + timing (CM-172)
+  ChitraMaya-cli.exe -probe-decode         Diagnostic: decode-path layer timings (CM-171)
+  ChitraMaya-cli.exe -verify-finalize      Diagnostic: one-pass finalize on this ffmpeg (CM-187)
+  ChitraMaya-cli.exe -verify-redecode A B  Diagnostic: compare two outputs frame by frame (CM-191 A/B)
+  ChitraMaya-cli.exe -h | --help           Show this help
+From source: python -m chitramaya <the same arguments>.
 
 Forward all remaining arguments to the chosen CLI. For example:
-  ChitraMaya -restore --input video.mp4 --output out.mp4 \\
+  ChitraMaya-cli.exe -restore --input video.mp4 --output out.mp4 \\
       --det-model models/det.pt --rest-model models/rest.pth \\
-      --det-conf 0.01 --det-imgsz 640
+      --det-conf 0.15 --det-imgsz 800
 
 For the full CLI option list, run:
-  ChitraMaya -restore      --help
-  ChitraMaya -compile-rest --help
-  ChitraMaya -compile-det  --help
+  ChitraMaya-cli.exe -restore      --help
+  ChitraMaya-cli.exe -compile-rest --help
+  ChitraMaya-cli.exe -compile-det  --help
+
+Every CLI run writes its own console log next to the exe
+(ChitraMaya-console-<stamp>-cli.log; the newest 20 launches are kept).
 """
 
 
 def _print_usage() -> None:
     print(USAGE)
+
+
+def _windowed_exe_without_console() -> bool:
+    """True inside the WINDOWED PyInstaller exe (ChitraMaya.exe): there is no
+    console, sys.stdout/sys.stderr are None. A subcommand launched from it
+    ran blind and died silently in the field (2026-09-14: `ChitraMaya.exe
+    -restore ...` -- no console, no log, nothing)."""
+    return bool(getattr(sys, "frozen", False)) and (sys.stdout is None or sys.stderr is None)
+
+
+def _refuse_subcommand_windowed(args) -> int:
+    """Tell the user which exe to use, the only way a windowed exe can."""
+    text = ("This is the windowed UI executable and has no console.\n\n"
+            "Run subcommands with the console executable instead:\n\n"
+            f"    ChitraMaya-cli.exe {' '.join(str(a) for a in args[:1])} ...\n\n"
+            "Both live in the same folder.")
+    try:
+        import ctypes
+        MB_OK, MB_ICONWARNING, MB_TOPMOST = 0x0, 0x30, 0x40000
+        ctypes.windll.user32.MessageBoxW(None, text, "ChitraMaya", MB_OK | MB_ICONWARNING | MB_TOPMOST)
+    except Exception:
+        pass
+    return 2
+
+
+def _install_cli_console(tag: str = "cli") -> None:
+    """CM-195 for the CLI paths (field 2026-09-14: `-restore` runs wrote no
+    console log, and the run report's per-run <stem>.log stayed empty --
+    it is a slice of this buffer). Same naming and pruning as the UI server:
+    ChitraMaya-console-<stamp>-cli.log next to the exe, newest 20 kept."""
+    try:
+        import datetime as _dt
+        import os as _os
+        from pathlib import Path as _P
+        from chitramaya.console_buffer import install as _install_console
+        base = _P(sys.executable).resolve().parent if getattr(sys, "frozen", False) else _P.cwd()
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"ChitraMaya-console-{stamp}-{tag}.log"
+        try:
+            old = sorted((q for q in base.glob("ChitraMaya-console*.log") if q.is_file()),
+                         key=lambda q: q.stat().st_mtime, reverse=True)
+            for q in old[19:]:
+                try:
+                    q.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _install_console(log_path=str(base / name))
+        print(f"[ChitraMaya] console log: {name} (the newest 20 launches are kept)")
+    except Exception:
+        pass
 
 
 def _apply_cuda_alloc_conf() -> None:
@@ -199,26 +259,52 @@ def main() -> int:
     # kill a run; see chitramaya/safe_console.py. The GUI path is already
     # covered (console_buffer's tee swallows real-stream write errors).
     if args:
+        # The windowed exe cannot run a subcommand visibly; say so and stop
+        # before anything allocates a GPU or touches an output path.
+        if _windowed_exe_without_console() and str(args[0]).startswith("-"):
+            return _refuse_subcommand_windowed(args)
         try:
             from chitramaya.safe_console import install as _safe_console
             _safe_console()
         except Exception:
             pass
+        # Every CLI subcommand gets its own console log (the per-run
+        # <stem>.log of the run report is a slice of this buffer).
+        _install_cli_console("cli")
+
+    def _run_sub(label: str, fn) -> int:
+        """CM-157 / GitHub #9: a subcommand that raises must end as ONE
+        error line and a non-zero exit -- not as PyInstaller's "Unhandled
+        exception in script" dialog (which the UI's compile job cannot see
+        and which blocks the frozen exe until someone clicks it). The
+        traceback still goes to the console log."""
+        try:
+            return int(fn() or 0)
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            print(f"[ChitraMaya] {label}: interrupted")
+            return 130
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ChitraMaya] {label} failed: {type(e).__name__}: {e}")
+            return 1
 
     if args and args[0] in ("-restore", "--restore", "restore"):
         sys.argv = ["ChitraMaya -restore"] + args[1:]
         from tools.process_mosaic import main as restore_main
-        return int(restore_main() or 0)
+        return _run_sub("-restore", restore_main)
 
     if args and args[0] in ("-compile-rest", "--compile-rest"):
         sys.argv = ["ChitraMaya -compile-rest"] + args[1:]
         from tools.compile_basicvsrpp import main as compile_rest_main
-        return int(compile_rest_main() or 0)
+        return _run_sub("-compile-rest", compile_rest_main)
 
     if args and args[0] in ("-compile-det", "--compile-det"):
         sys.argv = ["ChitraMaya -compile-det"] + args[1:]
         from tools.compile_yolo import main as compile_det_main
-        return int(compile_det_main() or 0)
+        return _run_sub("-compile-det", compile_det_main)
 
     # T9 diagnostics (AMD hold): the same tools/ scripts, runnable from an
     # INSTALLED build -- the AMD and Intel boxes have no source tree or venv.
@@ -233,6 +319,15 @@ def main() -> int:
         sys.argv = ["ChitraMaya -probe-decode"] + args[1:]
         from tools.probe_decode_path import main as probe_decode_main
         return int(probe_decode_main() or 0)
+
+    if args and args[0] in ("-verify-finalize", "--verify-finalize"):
+        sys.argv = ["ChitraMaya -verify-finalize"] + args[1:]
+        from tools.verify_finalize import main as verify_finalize_main
+        return int(verify_finalize_main() or 0)
+    if args and args[0] in ("-verify-redecode", "--verify-redecode"):
+        sys.argv = ["ChitraMaya -verify-redecode"] + args[1:]
+        from tools.verify_redecode import main as verify_redecode_main
+        return int(verify_redecode_main() or 0)
 
     # CM-112 training subcommands (Batch 79): same shape as the compile
     # paths -- thin dispatch onto the proven Phase-A tools, so the UI can

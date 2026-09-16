@@ -185,13 +185,32 @@ def create_parser() -> argparse.ArgumentParser:
     # [CHANGE 2] FrameStore backpressure
     p.add_argument("--store-max-frames", type=int, default=None,
                    help="Max frames in FrameStore (0=auto, -1=unlimited; controls VRAM backpressure)")
+    # CM-196: where the re-decode path parks pending patches
+    p.add_argument("--redecode-patches", choices=["host", "device"], default=None,
+                   help="Re-decode path only: where restored patches wait for their "
+                        "frame. host (default): pinned system RAM (~3 MB per frame with "
+                        "a 4x secondary; nothing at frame size ever leaves the GPU). "
+                        "device: VRAM (the v1.71 preview behaviour).")
+    p.add_argument("--vram-cache-release", action=argparse.BooleanOptionalAction, default=None,
+                   help="Hand torch's idle VRAM cache back to the driver after drains "
+                        "(at most every 30 s). OFF by default: at the 8 GB ceiling the "
+                        "released space is taken by the video engines and the next "
+                        "allocation evicts them (CM-196).")
     # CM-084 (Batch 36): FrameStore backend
-    p.add_argument("--store-backend", choices=["auto", "device", "host"],
+    p.add_argument("--store-backend", choices=["auto", "device", "host", "redecode"],
                    default=None,
-                   help="Where FrameStore holds decoded frames. auto (default): "
-                        "device VRAM when the store fits, system RAM when it "
-                        "would not (enables long --rest-max-clip-length runs); "
-                        "device/host force the choice.")
+                   help="Where decoded frames wait for paste-back. auto (default): "
+                        "'redecode' on the NVDEC path (CM-191: no frame store at all -- "
+                        "a second decoder re-produces each frame when it is due, so "
+                        "Max Clip Length costs no RAM/VRAM); on ffmpeg-decode editions "
+                        "auto keeps the frame store (device VRAM when it fits, system "
+                        "RAM when it would not). device/host/redecode force the choice.")
+
+    # CM-180: run report
+    p.add_argument("--run-report", choices=["beside", "temp", "off"], default=None,
+                   help="Where the run record (<output stem>.run.json + .log) goes: beside the "
+                        "output (default), in the Temp folder, or nowhere (off). Support requests "
+                        "need this file; turn it off only if you never want to report a problem.")
 
     # CM-081 (Batch 23): stall watchdog + PCIe canary
     p.add_argument("--watchdog-stall-seconds", type=int, default=None,
@@ -368,9 +387,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "feather_radius"), args.rest_feather_radius)
     _set_if_not_none(cfg, ("restoration", "blendmask"), args.rest_blendmask)
     _set_if_not_none(cfg, ("restoration", "analysis_use_synth_rois"), args.analysis_use_synth_rois)
+    _set_if_not_none(cfg, ("runReport",), getattr(args, "run_report", None))
 
     # [CHANGE 2] FrameStore backpressure
     _set_if_not_none(cfg, ("store_max_frames",), args.store_max_frames)
+    # CM-196: pending-patch home on the re-decode path
+    _set_if_not_none(cfg, ("redecode_patches",), getattr(args, "redecode_patches", None))
+    # CM-196 T10f: opt-in torch cache release after drains
+    _set_if_not_none(cfg, ("vram_cache_release",), getattr(args, "vram_cache_release", None))
     # CM-084 (Batch 36): FrameStore backend (auto | device | host)
     _set_if_not_none(cfg, ("store_backend",), getattr(args, "store_backend", None))
 

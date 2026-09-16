@@ -52,6 +52,8 @@ def main() -> int:
         secondary_restoration="rtx-2x",
         secondary_denoise="high",        # Batch 74 (CM-146) -- the hop Batch 70 missed  # Batch 20 (CM-077) — secondary upscale
         temporal_stability=2,            # Batch 26 (CM-078) — temporal stabilizer
+        store_backend="redecode",        # CM-191 -- the value the dropdown lacked on 09-13
+        run_report="temp",               # CM-202 -- the panel's Run Files switch
     )
 
     # Drive _build_base_config without constructing detector/restorer.
@@ -83,7 +85,82 @@ def main() -> int:
         "secondary_restoration (CM-077 rtx-2x)": (host.secondary_restoration, "rtx-2x"),
         "secondary_denoise (CM-146 high)": (host.secondary_denoise, "high"),
         "temporal_stability (CM-078 strength 2)": (host.temporal_stability, 2),
+        "store_backend (CM-191 redecode)": (host.store_backend, "redecode"),
+        "redecode_patches default (CM-196 host)": (host.redecode_patches, "host"),
+        "run_report_mode (CM-202 panel 'temp' wins)": (host.run_report_mode, "temp"),
     }
+
+    # CM-196: the pending-patch home has NO panel control on purpose (a
+    # hand-edit key + CLI flag for A/B); check both channels reach the
+    # pipeline so the report's effective.redecode_patches can be trusted.
+    try:
+        base.set("redecode_patches", value="device")
+        checks["redecode_patches config key (CM-196 device)"] = (Pipeline(base).redecode_patches, "device")
+    except Exception as _e:
+        checks["redecode_patches config key (CM-196 device)"] = (f"raised {type(_e).__name__}: {_e}", "device")
+    checks["vram_cache_release default (CM-196 T10f off)"] = (host.vram_cache_release, False)
+    try:
+        base.set("vram_cache_release", value=True)
+        checks["vram_cache_release config key (CM-196 T10f)"] = (Pipeline(base).vram_cache_release, True)
+    except Exception as _e:
+        checks["vram_cache_release config key (CM-196 T10f)"] = (f"raised {type(_e).__name__}: {_e}", True)
+    try:
+        from chitramaya.mosaic.cli_config import create_parser
+        _ns2 = create_parser().parse_args(["--input", "in.mp4", "--output", "out.mp4", "--vram-cache-release"])
+        checks["--vram-cache-release CLI flag (CM-196 T10f)"] = (getattr(_ns2, "vram_cache_release", None), True)
+    except SystemExit:
+        checks["--vram-cache-release CLI flag (CM-196 T10f)"] = ("parser rejected the flag", True)
+    try:
+        from chitramaya.mosaic.cli_config import create_parser
+        _ns = create_parser().parse_args(["--input", "in.mp4", "--output", "out.mp4",
+                                          "--redecode-patches", "device"])
+        checks["--redecode-patches CLI flag (CM-196)"] = (getattr(_ns, "redecode_patches", None), "device")
+    except SystemExit:
+        checks["--redecode-patches CLI flag (CM-196)"] = ("parser rejected the flag", "device")
+
+    # CM-191 lesson (2026-09-14): a value the pipeline accepts but the UI
+    # dropdown does not offer makes a preset load BLANK and save as "".
+    # Every enumerated control must offer exactly the values the pipeline
+    # accepts, and nothing else. Parsed from ui.html, compared to the
+    # pipeline's own validation lists.
+    import re
+    from pathlib import Path as _P
+    _html = (_P(__file__).resolve().parents[1] / "chitramaya" / "templates" / "ui.html").read_text(encoding="utf-8")
+
+    def _options(select_id: str) -> set:
+        m = re.search(r'<select[^>]*id="%s"[^>]*>(.*?)</select>' % re.escape(select_id), _html, re.S)
+        if not m:
+            return set()
+        return set(re.findall(r'<option[^>]*value="([^"]*)"', m.group(1)))
+
+    enum_checks = {
+        "ctrlStoreBackend": {"auto", "redecode", "device", "host"},
+        "ctrlMosaicBlendMask": {"none", "facefusion"},
+        "ctrlRunReport": {"beside", "temp", "off"},          # CM-202
+    }
+    # CM-202: the two new panel controls must exist in the markup and ride in
+    # the preset schema (MOSAIC_CONFIG_CONTROLS) -- the 09-13 lesson again.
+    _js = (_P(__file__).resolve().parents[1] / "chitramaya" / "static" / "js" / "mosaic.js").read_text(encoding="utf-8")
+    for _cid in ("ctrlOutputSuffix", "ctrlRunReport"):
+        checks[f"control {_cid} in ui.html"] = (bool(re.search(r'id="%s"' % _cid, _html)), True)
+        checks[f"control {_cid} in MOSAIC_CONFIG_CONTROLS"] = (("'%s'" % _cid) in _js, True)
+    # and the models.py -> pipeline hop for the suffix (server-side field)
+    try:
+        from chitramaya.models import MosaicConfig as _MC
+        _mc = _MC.from_dict({"mosaic_output_suffix": "-clean", "mosaic_run_report": "off"})
+        checks["mosaic_output_suffix (models.py)"] = (_mc.mosaic_output_suffix, "-clean")
+        checks["mosaic_run_report -> run_report (to_pipeline_config)"] = (
+            _mc.to_pipeline_config(encoder={}).run_report, "off")
+    except Exception as _e:
+        checks["mosaic_output_suffix (models.py)"] = (f"raised {type(_e).__name__}: {_e}", "-clean")
+    for sel_id, accepted in enum_checks.items():
+        offered = _options(sel_id)
+        ok = bool(offered) and offered == accepted
+        print(f"[{'OK ' if ok else 'BAD'}] dropdown {sel_id}: offers={sorted(offered)} pipeline accepts={sorted(accepted)}")
+        if not ok:
+            failed_enum = checks.setdefault("_enum_failures", (None, None))
+            checks[f"dropdown {sel_id}"] = (sorted(offered), sorted(accepted))
+    checks.pop("_enum_failures", None)
 
     failed = []
     for name, (got, want) in checks.items():
