@@ -111,6 +111,7 @@ def run_add_mosaic(
     qp: int = 18,
     progress_cb: Optional[Callable[[int, int, float], None]] = None,
     cancel_flag=None,
+    hw_decode: str = "auto",     # T20d: panel 'Hardware decode' (auto | off) for the ffmpeg lane
 ) -> int:
     """Decode -> pixelate ROIs -> encode. Returns frames written.
 
@@ -127,6 +128,7 @@ def run_add_mosaic(
         gpu_id=gpu_id,
         batch_size=8,
         trim_negative_pts=False,
+        hw_accel=str(hw_decode or "auto"),   # T20d
     )
     w = int(decoder.metadata.width)
     h = int(decoder.metadata.height)
@@ -154,6 +156,11 @@ def run_add_mosaic(
 
     frames = 0
     t_start = time.perf_counter()
+    # T20d (CM-234): the same ffmpeg lane, the same unfinished-chroma frames
+    # (the synthetic source of 09-24 was made through this path on the AMD
+    # box) -- the same guard, its own lane.
+    from chitramaya.video.chroma_guard import Nv12ChromaGuard
+    _guard = Nv12ChromaGuard("add-mosaic")
     # Batch 32: censor runs can be hours long too -- same keep-awake
     # contract as the restore pipeline (system stays up, display may sleep).
     from chitramaya.keep_awake import acquire as _ka_acquire, \
@@ -167,6 +174,7 @@ def run_add_mosaic(
             batch = decoder.read_batch()
             if not batch:
                 break
+            _batch_first = frames
             for item in batch:
                 if isinstance(item, torch.Tensor):
                     # CPU lane (ffmpeg fallback): NV12 [H*3/2, W] or RGB HWC u8
@@ -175,6 +183,7 @@ def run_add_mosaic(
                                and int(item.shape[1]) == w)
                     if is_nv12:
                         nv12 = item.to(device, non_blocking=True) if device.type != "cpu" else item
+                        nv12 = _guard.apply(nv12, h)
                         rgb = nv12_to_rgb_hwc_u8(nv12, width=w, height=h)
                     else:
                         rgb = item.to(device, non_blocking=True) if device.type != "cpu" else item
@@ -191,6 +200,15 @@ def run_add_mosaic(
                 encoder.encode_frame(bgr_u8_to_bgra_u8(bgr))
                 frames += 1
 
+            _hits = _guard.flush()     # one sync per batch
+            if _hits:
+                _fns = [_batch_first + int(_p) for (_p, _ny, _nuv, _fp) in _hits]
+                _guard.frames_repaired.extend(_fns)
+                if _guard.hits == len(_hits):
+                    print(f"[AddMosaic] WARNING (decode guard, T20d/e/f): frame {_fns[0]} arrived unfinished "
+                          f"from the hardware decoder ({_guard.describe_rows(_hits[0][1], _hits[0][2])} at 0/255); "
+                          f"those rows were completed from the previous frame. Counted; summary at the end.")
+
             if progress_cb is not None:
                 elapsed = max(1e-6, time.perf_counter() - t_start)
                 progress_cb(frames, total, frames / elapsed)
@@ -202,5 +220,9 @@ def run_add_mosaic(
         encoder.close()
         decoder.close()
 
+    _cs = _guard.summary()
+    if _cs:
+        print(f"[AddMosaic] WARNING: decode guard: {_cs}. Hardware Decode = Off in the panel "
+              f"avoids it at CPU cost.")
     print(f"[AddMosaic] done: frames={frames} -> {output_path}")
     return frames

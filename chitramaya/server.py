@@ -30,6 +30,7 @@ from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.serving import WSGIRequestHandler
 
 from chitramaya.winproc import NOWINDOW
+from chitramaya.video.source_format import input_args as _src_args   # CM-246
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ def _resolve_output_suffix(mosaic_cfg, *, out_dir, source_dir, batch: bool = Fal
     if getattr(mosaic_cfg, "mosaic_mask_preview", False):
         return "-mask"
     raw = getattr(mosaic_cfg, "mosaic_output_suffix", "-restored")
+    if getattr(mosaic_cfg, "mosaic_upscale_only", False) and str(raw or "-restored") == "-restored":
+        return "-upscaled"          # CM-228: nothing was restored; the panel's own suffix still wins
     suf = sanitize_output_suffix(raw, default="-restored")
     if suf != str(raw if raw is not None else "-restored"):
         print(f"[Output] suffix {raw!r} cleaned to {suf!r} (path characters are not allowed).")
@@ -169,6 +172,16 @@ class SwapServer:
     def __init__(self, models_dir: str | Path, gpu_id: int = 0):
         import torch
         torch.set_grad_enabled(False)
+        # CM-229 field fix (09-21): import torchvision ONCE, here, before any
+        # request. Two requests importing it concurrently on Flask's threads
+        # (/api/list-mosaic-models via BasicVSR++, /api/upscale-models via
+        # spandrel) each saw the other's half-initialised module:
+        # "cannot import name 'InterpolationMode' from partially initialized
+        # module 'torchvision.transforms'". Serialised here it cannot happen.
+        try:
+            import torchvision  # noqa: F401
+        except Exception as _tv_e:
+            logger.warning("torchvision preload failed: %s", _tv_e)
 
         # Anchor a relative models dir (the default "./models", or a relative
         # --models-dir) to the app base dir, so the models folder resolves
@@ -292,6 +305,7 @@ class SwapServer:
         try:
             cmd = [
                 "ffprobe", "-v", "quiet",
+                *_src_args(str(path)),
                 "-print_format", "json",
                 "-show_streams", "-show_format",
                 str(path),
@@ -385,7 +399,7 @@ class SwapServer:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-ss", f"{time_sec:.4f}",
-            "-i", self.video_path,
+            *_src_args(self.video_path), "-i", self.video_path,
             "-vframes", "1",
             "-f", "rawvideo",
             "-pix_fmt", "rgb24",
@@ -520,8 +534,9 @@ class SwapServer:
         # gone on purpose. When nothing is compiled the request passes
         # through unchanged so the pipeline raises the clean "compile
         # first" error (backend=trt) or falls back to PyTorch (auto).
+        _upscale_only = bool(getattr(mosaic_cfg, "mosaic_upscale_only", False))   # CM-228: no models at all
         if (mosaic_cfg.mosaic_restoration_trt and mosaic_cfg.restoration_model
-                and not mosaic_cfg.mosaic_mask_preview):
+                and not mosaic_cfg.mosaic_mask_preview and not _upscale_only):
             from chitramaya.mosaic.models.basicvsrpp.engine_paths import (
                 basicvsrpp_engines_usable,
             )
@@ -540,32 +555,35 @@ class SwapServer:
         # selected detection .pt, run detection on the engine (TRT). If the
         # engine is missing, fall back to the .pt (PyTorch) gracefully — the UI
         # warns on toggle, but detection is fast either way so we don't hard-fail.
-        if mosaic_cfg.mosaic_detection_trt and mosaic_cfg.detection_model:
+        if _upscale_only:
+            print("[mosaic] Upscale only: no detector, no restorer, no tracker -- decode -> scale -> encode (CM-228)")
+        if mosaic_cfg.mosaic_detection_trt and mosaic_cfg.detection_model and not _upscale_only:
             det = str(mosaic_cfg.detection_model)
             if det.lower().endswith(".pt"):
-                eng = _detection_engine_path(det)
-                if eng and os.path.isfile(eng):
-                    # The engine's input size is baked at compile time. If the
-                    # user asked for a different Image Size, honor the USER
-                    # (PyTorch at the requested size) and say so loudly —
-                    # never silently detect at a size they didn't choose.
-                    eng_sz = _detection_engine_imgsz(eng)
-                    want_sz = int(getattr(mosaic_cfg, "mosaic_det_imgsz", 640) or 640)
-                    if eng_sz is not None and eng_sz != want_sz:
-                        print(f"[Detector] Image Size {want_sz} requested but the "
-                              f"compiled engine is {eng_sz}; using PyTorch (.pt) at "
-                              f"{want_sz}. For TRT speed, recompile the detection "
-                              f"engine at {want_sz} in Manage Models.")
-                    else:
-                        import dataclasses
-                        mosaic_cfg = dataclasses.replace(
-                            mosaic_cfg, detection_model=eng.replace("\\", "/"),
-                        )
-                else:
+                # CM-218: pick the compiled FLAVOR matching the panel (Image
+                # Size exact; batch profile covering Detection Batch; then
+                # precision). No flavor at that size -> honor the USER
+                # (PyTorch at the requested size) and say so loudly -- never
+                # silently detect at a size they didn't choose.
+                from chitramaya.mosaic.detector.engine_flavors import pick_detection_engine
+                want_sz = int(getattr(mosaic_cfg, "mosaic_det_imgsz", 640) or 640)
+                want_b = int(getattr(mosaic_cfg, "mosaic_detection_batch_size", 4) or 4)
+                flavor, why = pick_detection_engine(det, want_sz, want_b,
+                                                    bool(getattr(mosaic_cfg, "mosaic_detection_fp16", True)))
+                if flavor is not None:
+                    print(f"[Detector] engine {why} for Image Size {want_sz} / Detection Batch {want_b}: "
+                          f"{os.path.basename(flavor.path)}")
+                    import dataclasses
+                    mosaic_cfg = dataclasses.replace(mosaic_cfg, detection_model=flavor.path)
+                elif why == "no compiled engine":
                     logger.warning(
                         "[mosaic] Tensor Detection requested but no engine for %s; "
                         "using PyTorch (.pt).", det,
                     )
+                else:
+                    print(f"[Detector] Image Size {want_sz} requested but {why}; using PyTorch (.pt) at "
+                          f"{want_sz}. For TRT speed, compile a {want_sz} flavor in Manage Models "
+                          f"(existing flavors are kept) (CM-218).")
 
         key = (
             mosaic_cfg.detection_model,
@@ -579,9 +597,11 @@ class SwapServer:
             int(mosaic_cfg.mosaic_detection_batch_size),
             round(float(mosaic_cfg.mosaic_iou), 4),
             int(mosaic_cfg.mosaic_roi_dilate),
+            int(mosaic_cfg.mosaic_crop_cap),                     # CM-227
             int(mosaic_cfg.mosaic_feather_radius),
             str(mosaic_cfg.mosaic_blend_mask),
             bool(mosaic_cfg.mosaic_use_seg_masks),
+            bool(mosaic_cfg.mosaic_residual_scan),               # CM-205
             str(mosaic_cfg.mosaic_mask_color),
             round(float(mosaic_cfg.mosaic_mask_opacity), 4),
             bool(mosaic_cfg.mosaic_sbs_split),
@@ -594,9 +614,20 @@ class SwapServer:
             str(mosaic_cfg.mosaic_vr_projection),                # CM-045 (Batch 19)
             str(mosaic_cfg.mosaic_secondary),                    # CM-077 (Batch 20)
             str(mosaic_cfg.mosaic_secondary_denoise),            # CM-146 (Batch 70)
+            str(mosaic_cfg.mosaic_secondary_quality),            # CM-217
+            str(mosaic_cfg.mosaic_output_upscale),               # CM-219
+            str(getattr(mosaic_cfg, "mosaic_upscale_scaler", "esrgan")),   # CM-228
+            bool(getattr(mosaic_cfg, "mosaic_upscale_only", False)),       # CM-228 (mode none)
             str(mosaic_cfg.mosaic_temporal_stability),           # CM-078 (Batch 26)
+            int(mosaic_cfg.mosaic_temporal_overlap),             # CM-213
+            bool(mosaic_cfg.mosaic_crossfade),                   # CM-213
         )
         pipeline_cfg = mosaic_cfg.to_pipeline_config(encoder=encoder_dict)
+        # CM-229: the user's own scaler weights live beside the models folder
+        try:
+            pipeline_cfg.custom_scaler_dir = str(self.models_dir / "upscalers")
+        except Exception:
+            pass
 
         if self._mosaic_pipeline is None or self._mosaic_pipeline_key != key:
             if self._mosaic_pipeline is not None:
@@ -609,17 +640,10 @@ class SwapServer:
             self._mosaic_pipeline_key = key
             return self._mosaic_pipeline
 
-        # Cached pipeline — apply runtime-only config delta in place.
+        # Cached pipeline -- apply runtime-only config delta in place. Every
+        # run rebuilds the host's nested config from .config, so the CM-213
+        # overlap / crossfade values ride along without a model reload.
         self._mosaic_pipeline.config = pipeline_cfg
-        d = max(0, int(pipeline_cfg.temporal_overlap))
-        if pipeline_cfg.blend_frames < 0:
-            bf = (d // 3) if pipeline_cfg.crossfade else 0
-        else:
-            bf = min(int(pipeline_cfg.blend_frames), d)
-        if not pipeline_cfg.crossfade:
-            bf = 0
-        self._mosaic_pipeline._discard_margin = d
-        self._mosaic_pipeline._blend_frames = bf
         # Detector score is read at detect-time from the live model
         # (_detector.model.conf). Writing _detector.score_threshold is a no-op
         # the detector never reads, so use the pipeline's own updater — otherwise
@@ -750,23 +774,33 @@ class SwapServer:
 
         mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
         encoder_dict = params.get("encoder", {})
-        if not mosaic_cfg.detection_model:
+        _uo = bool(getattr(mosaic_cfg, "mosaic_upscale_only", False))       # CM-228: no models needed
+        if not mosaic_cfg.detection_model and not _uo:
             raise RuntimeError("Detection model path not set")
         if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
-                and not mosaic_cfg.mosaic_censor):
+                and not mosaic_cfg.mosaic_censor and not _uo):
             raise RuntimeError("Restoration model path not set")
 
+        # CM-245: the source is captured ONCE here. Model loading below can
+        # take a minute (an RTX Super-Res output upscaler alone is seconds of
+        # init), and a video loaded in that window used to be picked up by
+        # process_file while the output kept the first file's name (field,
+        # 10-07: the Stepdaughter title encoded into "Nude Model ...-restored
+        # -18RC2-restored-18RC2.av1"). /api/load-video now also refuses while
+        # a run holds the lock; this is the belt.
+        src_video = str(self.video_path)
         # Output path. Priority: payload output_dir (the value in the UI box at
         # submit-time) -> persisted self.output_dir -> input's parent directory.
         payload_out = str(params.get("output_dir", "") or "").strip().strip('"').strip("'").strip()
         if payload_out:
             self.output_dir = payload_out
-        input_path = Path(self.video_path)
+        input_path = Path(src_video)
         out_dir = self.output_dir or str(input_path.parent)
         os.makedirs(out_dir, exist_ok=True)
         suffix = _resolve_output_suffix(mosaic_cfg, out_dir=out_dir, source_dir=str(input_path.parent))
+        from chitramaya.mosaic.batch import output_stem_for as _stem_for
         output_path = self._unique_output_path(
-            str(Path(out_dir) / f"{input_path.stem}{suffix}.mp4"))
+            str(Path(out_dir) / f"{_stem_for(input_path.stem, suffix, upscale_only=_uo)}.mp4"))
 
         info = self.video_info or {}
         total_frames = info.get("num_frames", 0)
@@ -781,14 +815,15 @@ class SwapServer:
             "restorations": 0,
             "buffered": 0,
             "output_path": output_path,
-            "mosaic_mode": "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore",
+            "mosaic_mode": ("upscale-only" if getattr(mosaic_cfg, "mosaic_upscale_only", False)
+                            else "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore"),
         }
 
         pipeline = self._ensure_mosaic_pipeline(mosaic_cfg, encoder_dict=encoder_dict)
 
         try:
             result = pipeline.process_file(
-                self.video_path, output_path,
+                src_video, output_path,                      # CM-245: the captured source, never re-read
                 progress_cb=self._mosaic_progress_cb,
                 use_tqdm=False,
                 cancel_flag=self._cancel_flag,
@@ -806,6 +841,9 @@ class SwapServer:
             self._progress["frame"] = result.frames
             self._progress["detections"] = result.detections
             self._progress["restorations"] = result.restorations
+            # T20c: a run that completed but had guard hits / skipped stabilizer
+            # windows says so in the Complete panel, not only in the console.
+            self._progress["warnings"] = list(getattr(result, "warnings", []) or [])
             if result.diag_path:
                 self._progress["diag_path"] = result.diag_path
             # Let Preview play the full output. It's a real deliverable, so mark
@@ -848,6 +886,7 @@ class SwapServer:
         files = params.get("files") or None
 
         mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
+        _upscale_only = bool(getattr(mosaic_cfg, "mosaic_upscale_only", False))   # CM-245
         # CM-202: the folder batch needs a NON-empty suffix to recognise its
         # own outputs on a re-run; an empty one falls back with a note.
         suffix = _resolve_output_suffix(mosaic_cfg, out_dir=None, source_dir=None, batch=True)
@@ -872,14 +911,19 @@ class SwapServer:
                 raise RuntimeError(f"Not a folder: {folder}")
             recursive = bool(params.get("recursive", False))
             exts = params.get("video_extensions") or None
+            # CM-245: in Upscale mode the folder's "-restored" files are the
+            # INPUT (a restored title brought to 4K in a second pass); only
+            # this mode's own outputs are excluded.
+            _own = ([_batch.UPSCALE_SUFFIX, f"{suffix}{_batch.UPSCALE_SUFFIX}"]
+                    if _upscale_only else None)
             inputs = _batch.enumerate_videos(folder, extensions=exts,
-                                             recursive=recursive)
+                                             recursive=recursive, own_suffixes=_own)
             skip_existing = bool(params.get("skip_existing", True))
 
         payload_out = self._clean_path(params.get("output_dir", ""))
         out_dir = payload_out or self.output_dir or folder
         plan = _batch.plan_batch(inputs, out_dir, suffix,
-                                 skip_existing=skip_existing)
+                                 skip_existing=skip_existing, upscale_only=_upscale_only)
         return {
             "folder": folder,
             "out_dir": out_dir,
@@ -914,10 +958,11 @@ class SwapServer:
         mosaic_cfg = target["mosaic_cfg"]
         encoder_dict = params.get("encoder", {})
 
-        if not mosaic_cfg.detection_model:
+        _uo = bool(getattr(mosaic_cfg, "mosaic_upscale_only", False))       # CM-228: no models needed
+        if not mosaic_cfg.detection_model and not _uo:
             raise RuntimeError("Detection model path not set")
         if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
-                and not mosaic_cfg.mosaic_censor):
+                and not mosaic_cfg.mosaic_censor and not _uo):
             raise RuntimeError("Restoration model path not set")
 
         if target["payload_out"]:
@@ -1085,7 +1130,7 @@ class SwapServer:
             # Same crf-10 NVDEC-safe frame-exact extraction as mosaic_segment.
             extract_cmd = [
                 "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
-                "-ss", f"{start_time:.3f}", "-i", self.video_path,
+                "-ss", f"{start_time:.3f}", *_src_args(self.video_path), "-i", self.video_path,
                 "-frames:v", str(n_seg_frames),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
                 "-pix_fmt", "yuv420p", "-bf", "0", "-an", src,
@@ -1217,7 +1262,7 @@ class SwapServer:
             extract_cmd = [
                 "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
                 "-ss", f"{start_time:.3f}",
-                "-i", self.video_path,
+                *_src_args(self.video_path), "-i", self.video_path,
                 "-frames:v", str(n_seg_frames),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
                 "-pix_fmt", "yuv420p", "-bf", "0",
@@ -1244,6 +1289,7 @@ class SwapServer:
             frames = run_add_mosaic(
                 src, output_path, rois,
                 block=block, sbs=sbs,
+                hw_decode=str(params.get("hw_decode", "auto") or "auto"),   # T20d
                 codec=str(enc.get("codec", "hevc")),
                 preset=str(enc.get("preset", "P5")),
                 qp=int(enc.get("qp", 18)),
@@ -1293,10 +1339,11 @@ class SwapServer:
 
         mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
         encoder_dict = params.get("encoder", {})
-        if not mosaic_cfg.detection_model:
+        _uo = bool(getattr(mosaic_cfg, "mosaic_upscale_only", False))       # CM-228: no models needed
+        if not mosaic_cfg.detection_model and not _uo:
             raise RuntimeError("Detection model path not set")
         if (not mosaic_cfg.restoration_model and not mosaic_cfg.mosaic_mask_preview
-                and not mosaic_cfg.mosaic_censor):
+                and not mosaic_cfg.mosaic_censor and not _uo):
             raise RuntimeError("Restoration model path not set")
 
         # Temp files. Priority: payload temp_dir -> persisted self.temp_dir ->
@@ -1323,7 +1370,8 @@ class SwapServer:
             "detections": 0,
             "restorations": 0,
             "buffered": 0,
-            "mosaic_mode": "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore",
+            "mosaic_mode": ("upscale-only" if getattr(mosaic_cfg, "mosaic_upscale_only", False)
+                            else "mask-preview" if mosaic_cfg.mosaic_mask_preview else "restore"),
         }
 
         # ── Phase 1: ffmpeg extract ─────────────────────────────────────
@@ -1341,7 +1389,7 @@ class SwapServer:
         extract_cmd = [
             "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
             "-ss", f"{start_time:.3f}",
-            "-i", self.video_path,
+            *_src_args(self.video_path), "-i", self.video_path,
             "-frames:v", str(n_seg_frames),
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
             "-pix_fmt", "yuv420p", "-bf", "0",
@@ -1463,7 +1511,7 @@ class SwapServer:
             extract_cmd = [
                 "ffmpeg", "-hide_banner", "-y", "-loglevel", "error",
                 "-ss", f"{start_time:.4f}",
-                "-i", self.video_path,
+                *_src_args(self.video_path), "-i", self.video_path,
                 "-frames:v", str(int(n_window)),
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "10",
                 "-pix_fmt", "yuv420p", "-bf", "0",
@@ -1672,6 +1720,14 @@ def api_load_video():
     path = data.get("path", "")
     if not path or not Path(path).exists():
         return jsonify({"error": f"File not found: {path}"}), 400
+    if _op_lock.locked():
+        # CM-245: a run (or Test Frame / segment) is in progress; swapping the
+        # loaded video under it used to hand the run a different source than
+        # its output name. The UI keeps the current file and says why.
+        _opn = (_op_state or {}).get("name") or "an operation"
+        print(f"[ChitraMaya] load-video REFUSED while {_opn} runs: {Path(path).name}")
+        return jsonify({"error": "A run is in progress -- cancel it or wait for it to finish "
+                                 "before loading another video.", "busy": True}), 409
     try:
         result = _get_server().load_video(path)
         return jsonify(result)
@@ -1699,6 +1755,43 @@ def api_seek():
 
 # ── Mosaic restoration endpoints ─────────────────────────────────────────
 
+_CUDA_INIT_SIGNS = ("factory function returned nullptr", "cudaGetDeviceCount", "CUDA initialization",
+                    "CUDA driver initialization failed", "no CUDA-capable device", "CUDA_ERROR_")
+
+
+def _cuda_init_failure_message(exc: BaseException) -> str:
+    """CM-223: when a run dies because the CUDA driver would not come up
+    (09-19: `cudaGetDeviceCount() ... Error 1: invalid argument`, then
+    TensorRT's `pybind11::init(): factory function returned nullptr`), say so
+    in words instead of the trace, and drop the GPU gate's pass cache so the
+    next launch probes the card again (CM-163's message box then shows).
+    Empty string when the failure is something else."""
+    try:
+        text = str(exc)
+        looks = any(s in text for s in _CUDA_INIT_SIGNS)
+        cuda_down = False
+        try:
+            import torch
+            cuda_down = (torch.version.cuda is not None) and (not torch.cuda.is_available())
+        except Exception:
+            pass
+        if not (looks or cuda_down):
+            return ""
+        try:
+            from chitramaya.gpu_gate import _cache_path
+            cp = _cache_path(_app_base_dir())
+            if cp.exists():
+                cp.unlink()
+        except Exception:
+            pass
+        return ("The GPU driver did not initialise (CUDA is unavailable to this process). This happens "
+                "after a driver reset, a sleep/resume, or when the card has fallen off the bus -- "
+                "check that nvidia-smi still lists the card, then REBOOT and try again. "
+                "The GPU check runs again at the next launch.")
+    except Exception:
+        return ""
+
+
 def _run_mosaic_threaded(op_name: str, data: dict, fn):
     """Shared launcher for mosaic-{segment,full}. ``fn`` takes the server.
 
@@ -1725,8 +1818,11 @@ def _run_mosaic_threaded(op_name: str, data: dict, fn):
         except Exception as e:
             print(f"[ChitraMaya] {op_name} EXCEPTION: {e}")
             logger.exception(f"{op_name} thread failed")
+            _msg = _cuda_init_failure_message(e)          # CM-223
+            if _msg:
+                print(f"[ChitraMaya] {_msg}")
             server._progress["status"] = "error"
-            server._progress["error"] = str(e)
+            server._progress["error"] = _msg or str(e)
         finally:
             _clear_op()
             _op_lock.release()
@@ -1735,6 +1831,76 @@ def _run_mosaic_threaded(op_name: str, data: dict, fn):
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return jsonify({"status": "started"})
+
+
+def _segment_stamp(t: float) -> str:
+    """T17: 12.5 s -> '00m12.500s' -- sortable, no colons (file-name safe)."""
+    t = max(0.0, float(t))
+    m = int(t // 60)
+    sec = t - 60 * m
+    return f"{m:02d}m{sec:06.3f}s"
+
+
+@app.route("/api/save-segment", methods=["POST"])
+def api_save_segment():
+    """T17 (CM-228): save the previewed SEGMENT as a file. The segment run
+    left a finished mp4 at server.preview_path (a temp file); this copies it
+    into the output folder as <stem><suffix>-<start>-<end>.mp4 -- no
+    re-encode -- and writes a small .run.json beside it naming the slice.
+    Refused when the preview is the full output (already saved) or gone."""
+    import shutil
+    from chitramaya.models import MosaicConfig
+    data = request.get_json(force=True) or {}
+    server = _get_server()
+    try:
+        src = server.preview_path
+        if not src or not os.path.isfile(src):
+            return jsonify({"status": "error", "error": "no segment preview to save (run a segment first)"}), 400
+        if not getattr(server, "_preview_is_temp", True):
+            return jsonify({"status": "error", "error": "the preview is the full output file, already saved"}), 400
+        if not server.video_path:
+            return jsonify({"status": "error", "error": "no video loaded"}), 400
+        start = float(data.get("start_time", 0.0) or 0.0)
+        end = float(data.get("end_time", 0.0) or 0.0)
+        params = data.get("params", {}) or {}
+        mosaic_cfg = MosaicConfig.from_dict(params.get("mosaic", params))
+        src_path = Path(server.video_path)
+        out_dir = str(data.get("output_dir", "") or "").strip().strip('"').strip("'").strip()
+        if out_dir:
+            server.output_dir = out_dir
+        out_dir = server.output_dir or str(src_path.parent)
+        os.makedirs(out_dir, exist_ok=True)
+        suffix = _resolve_output_suffix(mosaic_cfg, out_dir=out_dir, source_dir=str(src_path.parent))
+        name = f"{src_path.stem}{suffix}-{_segment_stamp(start)}-{_segment_stamp(end)}{Path(src).suffix or '.mp4'}"
+        dest = os.path.join(out_dir, name)
+        n = 2
+        while os.path.exists(dest):
+            dest = os.path.join(out_dir, f"{Path(name).stem}-{n}{Path(name).suffix}")
+            n += 1
+        shutil.copy2(src, dest)
+        # a small report beside it: which slice of which file, in times and frames
+        try:
+            info = server.video_info or {}
+            fps = float(info.get("fps", 0) or 0)
+            rep = {
+                "chitramaya": {"version": _CM_VERSION, "kind": "segment"},
+                "run": {
+                    "input": str(src_path), "output": dest, "mode": server._progress.get("mosaic_mode", ""),
+                    "segment": {"start_s": round(start, 3), "end_s": round(end, 3),
+                                "start_frame": int(round(start * fps)) if fps else None,
+                                "end_frame": int(round(end * fps)) if fps else None, "fps": fps or None},
+                },
+                "panel": params.get("panel"),
+            }
+            with open(os.path.splitext(dest)[0] + ".run.json", "w", encoding="utf-8") as f:
+                json.dump(rep, f, indent=2)
+        except Exception as _re:
+            print(f"[Segment] report beside the saved segment not written ({_re})")
+        print(f"[Segment] saved the previewed segment {_segment_stamp(start)}-{_segment_stamp(end)} -> {dest}")
+        return jsonify({"status": "ok", "output": dest, "name": os.path.basename(dest), "folder": out_dir})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("save-segment failed")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/mosaic-segment", methods=["POST"])
@@ -1807,6 +1973,68 @@ def api_mosaic_folder_plan():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/vram-preflight", methods=["POST"])
+def api_vram_preflight():
+    """CM-236 (T22): the VRAM preflight BEFORE the run. Body: { params:
+    { mosaic:{...}, encoder:{...} }, files?: [paths] }. Without ``files``
+    the loaded video is checked; with them (Process Folder) every file is
+    probed and the largest frame decides. No GPU work: free VRAM from the
+    driver, the resident-models footprint from the ledger this card's
+    earlier runs wrote (or the per-edition table, and the answer says
+    which), the working set from the same arithmetic the run prints.
+    Read-only; the levers come back as values the page applies to the
+    panel controls in plain view, never here."""
+    from chitramaya.vram_preflight import preflight as _pf
+    data = request.get_json(force=True) or {}
+    params = data.get("params", {}) or {}
+    m = params.get("mosaic", {}) or {}
+    enc = params.get("encoder", {}) or {}
+    files = data.get("files") or []
+    srv = _get_server()
+    try:
+        # the frame that sizes the run: the loaded video, or the largest in the plan
+        probes = []
+        if files:
+            for fp in list(files)[:200]:
+                info = srv._probe_video(str(fp))
+                if int(info.get("width", 0)) > 0:
+                    probes.append(info)
+        elif srv.video_info and int(srv.video_info.get("width", 0)) > 0:
+            probes.append(dict(srv.video_info))
+        if not probes:
+            return jsonify({"skipped": "no video to size the run from", "fits": None})
+        biggest = max(probes, key=lambda i: int(i["width"]) * int(i["height"]))
+        gpu_name = ""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_name = str(torch.cuda.get_device_name(0))
+        except Exception:
+            gpu_name = ""
+        sec = str(m.get("mosaic_secondary", "none") or "none")
+        res = _pf(
+            edition=_ui_edition(), gpu_name=gpu_name, gpu_id=0,
+            width=int(biggest["width"]), height=int(biggest["height"]),
+            crop_cap_px=int(m.get("mosaic_crop_cap", 0) or 0),
+            max_clip=int(m.get("mosaic_max_clip_size", 180) or 180),
+            overlap=int(m.get("mosaic_temporal_overlap", 0) or 0),
+            batch_size=int(m.get("mosaic_detection_batch_size", 8) or 8),
+            det_imgsz=int(m.get("mosaic_det_imgsz", 640) or 640),
+            det_fp16=bool(m.get("mosaic_detection_fp16", True)),
+            det_trt=bool(m.get("mosaic_detection_trt", True)),
+            rest_trt=bool(m.get("mosaic_restoration_trt", True)),
+            secondary=sec, temporal_fix=bool(int(m.get("mosaic_temporal_stability", 0) or 0) > 0),
+            output_upscale=str(m.get("mosaic_output_upscale", "none") or "none"),
+            upscale_scaler=str(m.get("mosaic_upscale_scaler", "esrgan") or "esrgan"),
+            async_on=bool(enc.get("async_encoder", False)),
+            async_queue=16, upscale_only=bool(m.get("mosaic_upscale_only", False)))
+        res["file"] = Path(str(biggest.get("path", ""))).name
+        res["files_checked"] = len(probes)
+        return jsonify(res)
+    except Exception as e:
+        return jsonify({"skipped": f"preflight failed: {e}", "fits": None})
 
 
 @app.route("/api/console")
@@ -1922,15 +2150,32 @@ def _detection_engine_imgsz(engine_path: str) -> int | None:
     return None
 
 
-def _detection_engine_path(pt_path: str) -> str:
-    """Map a detection ``.pt`` checkpoint to its compiled TRT engine path.
-
-    Mirrors tools/compile_yolo.py: the engine lands in
-    ``<models>/engines/<stem>.engine``.
-    """
+def _detection_engine_max_batch(engine_path: str) -> int | None:
+    """CM-203: the largest batch a compiled detector engine accepts, from the
+    CM-201 sidecar (<engine>.json, key max_batch). An engine without a
+    sidecar was exported before CM-201 with a batch-8 profile. None = no
+    engine."""
+    import json
     try:
-        p = Path(pt_path)
-        return str(p.parent / "engines" / f"{p.stem}.engine")
+        if not engine_path or not os.path.isfile(engine_path):
+            return None
+        sc = engine_path + ".json"
+        if os.path.isfile(sc):
+            with open(sc, "r", encoding="utf-8") as f:
+                mb = json.load(f).get("max_batch")
+            return int(mb) if mb else 8
+        return 8
+    except Exception:
+        return None
+
+
+def _detection_engine_path(pt_path: str) -> str:
+    """Pre-CM-218 location of a detection model's one engine
+    (``<models>/engines/<stem>.engine``) -- now the "legacy" flavor. Kept
+    for callers that only want to know whether the old file exists."""
+    try:
+        from chitramaya.mosaic.detector.engine_flavors import legacy_engine_path
+        return legacy_engine_path(pt_path)
     except Exception:
         return ""
 
@@ -1964,20 +2209,28 @@ def api_list_mosaic_models():
                 continue
             ext = p.suffix.lower()
             if ext == ".pt":
-                eng = _detection_engine_path(str(p))
-                _has_eng = bool(eng and os.path.isfile(eng))
+                # CM-218: every compiled flavor of this model (Image Size x
+                # batch profile x precision), the legacy <stem>.engine included.
+                from chitramaya.mosaic.detector.engine_flavors import list_detection_flavors
+                _flavors = list_detection_flavors(str(p))
+                _has_eng = bool(_flavors)
+                _first = _flavors[0] if _flavors else None
                 detection.append({
                     "path": str(p).replace("\\", "/"),
                     "label": p.stem,
                     "has_engine": _has_eng,
-                    # CM-148 (Batch 76): the imgsz the engine was compiled at
-                    # (None = unknown). The submit-time gate warns when this
-                    # differs from the Image Size dial -- previously the run
-                    # silently fell back to PyTorch with only a console line
-                    # (field case 2026-09-01: a 2h45m 5060 benchmark spent
-                    # 57 min detecting on PyTorch, engine 800 vs dial 640).
-                    "engine_imgsz": (_detection_engine_imgsz(eng)
-                                     if _has_eng else None),
+                    # CM-148 (Batch 76) kept for older JS: the imgsz of the
+                    # first flavor. CM-218: engine_imgszs lists them all --
+                    # the submit-time gate warns only when NO flavor has the
+                    # dial's Image Size (field case 2026-09-01: a 2h45m 5060
+                    # benchmark spent 57 min detecting on PyTorch, engine 800
+                    # vs dial 640).
+                    "engine_imgsz": (_first.imgsz if _first else None),
+                    "engine_imgszs": sorted({int(f.imgsz) for f in _flavors if f.imgsz}),
+                    # CM-203: the batch profile the engine accepts (1..N);
+                    # the badge shows it and the run clamps to it.
+                    "engine_max_batch": (_first.max_batch if _first else None),
+                    "engine_flavors": [f.as_dict() for f in _flavors],
                 })
             elif ext == ".pth":
                 mp = str(p)
@@ -2118,8 +2371,9 @@ def api_compile_engines():
         _compile_job["returncode"] = None
         _compile_job["log"] = (
             f"Compiling {len(safe)} model(s) for THIS machine's GPU "
-            f"(Image Size={imgsz}, Max Clip Length={max_clip}"
-            f"{', force rebuild' if force else ''})...\n"
+            f"(detection flavor: Image Size {imgsz}, batch 1..{max_batch}, fp16 -- "
+            f"other compiled flavors are kept"
+            f"{'; force rebuilds this flavor' if force else ''})...\n"
         )
 
     threading.Thread(target=_run_compile, args=(safe, imgsz, max_clip, force, max_batch),
@@ -2656,6 +2910,165 @@ def _run_download(owner, name, files, endpoint=_HF_MAIN):
         _download_job["log"] += "\n=== Download complete ===\n"
 
 
+# ── CM-232: the standard model set, one button ─────────────────────────────
+# The four files every install needs (three lada + one zelefans) and, on
+# the NVIDIA edition, their engines for the panel's Image Size / Detection
+# Batch. One background job sequences the existing download and compile
+# runners; the UI polls /api/standard-models for step/stage/log and shows
+# "done" when everything is present and compiled (a health check, not a
+# hidden button).
+_STANDARD_MODELS = [
+    {"owner": "ladaapp", "name": "lada", "file": "lada_mosaic_detection_model_v2.pt",
+     "kind": "detection", "label": "lada detection v2"},
+    {"owner": "ladaapp", "name": "lada", "file": "lada_mosaic_detection_model_v4_fast.pt",
+     "kind": "detection", "label": "lada detection v4 fast"},
+    {"owner": "zelefans", "name": "vrmr", "file": "lada_vr_mosaic_detection_model_v2_accurate.pt",
+     "kind": "detection", "label": "zelefans VR detection v2 accurate"},
+    {"owner": "ladaapp", "name": "lada", "file": "lada_mosaic_restoration_model_generic_v1.2.pth",
+     "kind": "restoration", "label": "lada restoration generic v1.2"},
+]
+_standard_job = {"running": False, "log": "", "step": 0, "total": 0, "stage": "", "done": None}
+_standard_lock = threading.Lock()
+
+
+def _standard_model_status(imgsz: int, max_batch: int) -> list:
+    """Per standard model: present on disk, compiled for this flavor."""
+    models_dir = _get_server().models_dir
+    out = []
+    for m in _STANDARD_MODELS:
+        p = models_dir / m["file"]
+        present = p.is_file()
+        compiled = False
+        flavors = []
+        if present:
+            try:
+                if m["kind"] == "detection":
+                    from chitramaya.mosaic.detector.engine_flavors import list_detection_flavors
+                    fl = list_detection_flavors(str(p))
+                    flavors = [f.label() for f in fl]
+                    compiled = any((int(f.imgsz or 0) == int(imgsz)) and (int(f.max_batch or 0) >= int(max_batch))
+                                   for f in fl)
+                else:
+                    from chitramaya.mosaic.models.basicvsrpp.engine_paths import find_basicvsrpp_engine_files
+                    compiled = (find_basicvsrpp_engine_files(str(p), True) is not None
+                                or find_basicvsrpp_engine_files(str(p), False) is not None)
+            except Exception:
+                compiled = False
+        out.append({**m, "path": str(p).replace("\\", "/"), "present": present, "compiled": compiled,
+                    "flavors": flavors, "size_mb": (int(p.stat().st_size / 1048576) if present else 0)})
+    return out
+
+
+def _standard_log_snapshot() -> str:
+    with _standard_lock:
+        head = _standard_job["log"]
+    with _download_lock:
+        dl = _download_job["log"]
+    with _compile_lock:
+        cp = _compile_job["log"]
+    return head + ("\n" + dl if dl else "") + ("\n" + cp if cp else "")
+
+
+def _run_standard(imgsz: int, max_batch: int, endpoint: str, compile_engines: bool) -> None:
+    try:
+        status = _standard_model_status(imgsz, max_batch)
+        missing = [m for m in status if not m["present"]]
+        # group the downloads by repo (one download job per repo, in sequence)
+        groups: dict = {}
+        for m in missing:
+            groups.setdefault((m["owner"], m["name"]), []).append(m["file"])
+        to_compile = [m for m in status if m["present"] and not m["compiled"]] if compile_engines else []
+        total = len(missing) + (len(to_compile) + len(missing) if compile_engines else 0)
+        with _standard_lock:
+            _standard_job["total"] = max(1, total)
+            _standard_job["step"] = 0
+            _standard_job["log"] = (f"Standard models: {len(missing)} to download"
+                                    + (f", then compile engines for Image Size {imgsz} / Detection Batch 1..{max_batch}"
+                                       if compile_engines else " (no engine compile on this edition)") + "\n")
+        with _download_lock:
+            _download_job["log"] = ""
+        with _compile_lock:
+            _compile_job["log"] = ""
+        step = 0
+        for (owner, name), files in groups.items():
+            with _standard_lock:
+                _standard_job["stage"] = f"downloading {', '.join(files)} from {owner}/{name}"
+            with _download_lock:
+                _download_job["running"] = True
+                _download_job["done"] = None
+            _run_download(owner, name, files, endpoint)     # sets running False when finished
+            step += len(files)
+            with _standard_lock:
+                _standard_job["step"] = step
+        if compile_engines:
+            status = _standard_model_status(imgsz, max_batch)
+            todo = [m["path"] for m in status if m["present"] and not m["compiled"]]
+            if todo:
+                with _standard_lock:
+                    _standard_job["stage"] = f"compiling {len(todo)} engine(s)"
+                with _compile_lock:
+                    _compile_job["running"] = True
+                    _compile_job["returncode"] = None
+                _run_compile(todo, int(imgsz), 60, False, int(max_batch))
+                step += len(todo)
+        status = _standard_model_status(imgsz, max_batch)
+        ok = all(m["present"] for m in status) and (not compile_engines or all(m["compiled"] for m in status))
+        with _standard_lock:
+            _standard_job["step"] = _standard_job["total"]
+            _standard_job["stage"] = "done" if ok else "finished with problems (see the log)"
+            _standard_job["done"] = ok
+    except Exception as e:
+        logger.exception("standard models job failed")
+        with _standard_lock:
+            _standard_job["stage"] = f"failed: {e}"
+            _standard_job["done"] = False
+    finally:
+        with _standard_lock:
+            _standard_job["running"] = False
+
+
+@app.route("/api/standard-models", methods=["GET"])
+def api_standard_models():
+    try:
+        imgsz = int(request.args.get("imgsz", 640) or 640)
+        max_batch = int(request.args.get("max_batch", 4) or 4)
+    except (TypeError, ValueError):
+        imgsz, max_batch = 640, 4
+    edition = _ui_edition()
+    status = _standard_model_status(imgsz, max_batch)
+    with _standard_lock:
+        job = {k: _standard_job[k] for k in ("running", "step", "total", "stage", "done")}
+    all_present = all(m["present"] for m in status)
+    all_compiled = all(m["compiled"] for m in status)
+    return jsonify({"models": status, "edition": edition, "compiles": edition == "cuda",
+                    "all_present": all_present, "all_compiled": all_compiled,
+                    "job": job, "log": _standard_log_snapshot() if job["running"] or job["done"] is not None else ""})
+
+
+@app.route("/api/standard-models/run", methods=["POST"])
+def api_standard_models_run():
+    data = request.get_json(force=True) or {}
+    try:
+        imgsz = int(data.get("imgsz", 640) or 640)
+        max_batch = int(data.get("max_batch", 4) or 4)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Image Size and Detection Batch must be integers."})
+    endpoint = _hf_endpoint(data.get("endpoint"))
+    with _download_lock:
+        if _download_job["running"]:
+            return jsonify({"error": "A download is already running."})
+    with _compile_lock:
+        if _compile_job["running"]:
+            return jsonify({"error": "A compile is already running."})
+    with _standard_lock:
+        if _standard_job["running"]:
+            return jsonify({"error": "The standard-models job is already running."})
+        _standard_job.update({"running": True, "step": 0, "total": 1, "stage": "starting", "done": None, "log": ""})
+    threading.Thread(target=_run_standard, args=(imgsz, max_batch, endpoint, _ui_edition() == "cuda"),
+                     daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
 @app.route("/api/download-models", methods=["POST"])
 def api_download_models():
     data = request.get_json(force=True) or {}
@@ -2841,11 +3254,38 @@ def _presets_dir() -> Path:
     return _app_base_dir() / "presets"
 
 
+# T20b: built-in presets ship with the app (chitramaya/static/presets/*.json,
+# bundled with the static tree). They carry PANEL VALUES ONLY -- no folders,
+# no machine paths -- and are read-only: saving a preset under the same name
+# makes a user copy that shadows the built-in; Delete refuses a built-in.
+def _bundled_presets_dir() -> Path:
+    return Path(__file__).resolve().parent / "static" / "presets"
+
+
+def _bundled_preset_names() -> list:
+    try:
+        d = _bundled_presets_dir()
+        return sorted((p.stem for p in d.glob("*.json")), key=str.lower) if d.is_dir() else []
+    except Exception:
+        return []
+
+
 def _preset_path(name: str) -> Path | None:
     name = (name or "").strip()
     if not _PRESET_NAME_RE.match(name) or name.endswith("."):
         return None
     return _presets_dir() / f"{name}.json"
+
+
+def _preset_read_path(name: str) -> Path | None:
+    """The file a GET reads: the user's copy when present, else the built-in."""
+    p = _preset_path(name)
+    if p is None:
+        return None
+    if p.exists():
+        return p
+    b = _bundled_presets_dir() / p.name
+    return b if b.exists() else p
 
 
 def _preset_filter(data: dict) -> dict:
@@ -2854,19 +3294,141 @@ def _preset_filter(data: dict) -> dict:
             if isinstance(k, str) and (k.startswith(_PRESET_KEY_PREFIXES) or k in _PRESET_KEY_EXACT)}
 
 
+# ── CM-229: custom scalers (models/upscalers) ────────────────────────────
+@app.route("/api/upscale-models", methods=["GET"])
+def api_upscale_models():
+    """The user's own SR models for the Secondary and Upscale Scaler
+    dropdowns: [{id: 'custom:<file>', label, arch, name, scale, half}].
+    ?rescan=1 re-identifies every file (else the .index.json cache is used)."""
+    try:
+        from chitramaya.mosaic.restorer.custom_sr import scan_custom_models
+        folder = _get_server().models_dir / "upscalers"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)   # so there is a folder to drop a file into
+        except Exception:
+            pass
+        force = str(request.args.get("rescan", "")).lower() in ("1", "true", "yes")
+        models = scan_custom_models(force=force, log=lambda m: print(m), dirs=[folder])
+        folder = str(folder)
+        return jsonify({"models": [{k: v for k, v in m.items() if k != "path"} for m in models],
+                        "dir": folder})
+    except Exception as e:
+        return jsonify({"models": [], "error": str(e)}), 200
+
+
+# CM-232: managing the custom scalers from Manage Models. Add copies a file
+# the user picked into the folder and identifies it (the skip reason comes
+# back inline); Remove takes a file OUT OF SCOPE by moving it to
+# models/upscalers/_removed (never deletes -- the user fetched it once, we
+# do not make them fetch it again); Open shows the folder.
+_UPSCALER_EXTS = (".pth", ".pt", ".safetensors", ".ckpt")
+
+
+def _upscalers_dir() -> Path:
+    d = _get_server().models_dir / "upscalers"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+@app.route("/api/upscale-models/add", methods=["POST"])
+def api_upscale_models_add():
+    import shutil
+    data = request.get_json(force=True) or {}
+    src = Path(str(data.get("path", "")).strip())
+    if not src.is_file():
+        return jsonify({"error": "No such file."})
+    if src.suffix.lower() not in _UPSCALER_EXTS:
+        return jsonify({"error": f"Not a model file ({', '.join(_UPSCALER_EXTS)})."})
+    folder = _upscalers_dir()
+    dest = folder / src.name
+    try:
+        if dest.exists() and dest.resolve() == src.resolve():
+            pass                                      # already in the folder
+        elif dest.exists():
+            return jsonify({"error": f"{src.name} is already in the folder."})
+        else:
+            shutil.copy2(str(src), str(dest))
+        from chitramaya.mosaic.restorer.custom_sr import identify_file, scan_custom_models
+        info = identify_file(dest)
+        models = scan_custom_models(force=False, log=lambda m: print(m), dirs=[folder])
+        entry = next((m for m in models if m["file"] == dest.name), None)
+        print(f"[Scalers] added {dest.name}: " + (f"{info.get('name') or info.get('arch')} {info.get('scale')}x"
+                                                 if info.get("ok") else f"skipped -- {info.get('reason')}"))
+        return jsonify({"ok": True, "file": dest.name, "usable": bool(info.get("ok")),
+                        "reason": info.get("reason", ""), "entry": ({k: v for k, v in entry.items() if k != "path"}
+                                                                    if entry else None)})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/upscale-models/remove", methods=["POST"])
+def api_upscale_models_remove():
+    import shutil
+    data = request.get_json(force=True) or {}
+    name = str(data.get("file", "")).strip()
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return jsonify({"error": "Invalid file name."})
+    folder = _upscalers_dir()
+    src = folder / name
+    if not src.is_file():
+        return jsonify({"error": f"{name} is not in the folder."})
+    removed = folder / "_removed"
+    try:
+        removed.mkdir(parents=True, exist_ok=True)
+        dest = removed / name
+        n = 2
+        while dest.exists():
+            dest = removed / f"{src.stem}-{n}{src.suffix}"
+            n += 1
+        shutil.move(str(src), str(dest))
+        # drop it from the index so the next scan does not re-identify a ghost
+        try:
+            idx_path = folder / ".index.json"
+            idx = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.is_file() else {}
+            if name in idx:
+                idx.pop(name, None)
+                idx_path.write_text(json.dumps(idx, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+        print(f"[Scalers] removed {name} from scope -> {dest} (the file is kept; delete it yourself if you want it gone)")
+        return jsonify({"ok": True, "moved_to": str(dest)})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/upscale-models/open", methods=["POST"])
+def api_upscale_models_open():
+    folder = _upscalers_dir()
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(folder)])
+        return jsonify({"ok": True, "dir": str(folder)})
+    except Exception as e:
+        return jsonify({"error": str(e), "dir": str(folder)})
+
+
 @app.route("/api/presets", methods=["GET"])
 def api_presets_list():
     try:
         d = _presets_dir()
-        names = sorted((p.stem for p in d.glob("*.json")), key=str.lower) if d.is_dir() else []
-        return jsonify({"presets": names, "dir": str(d)})
+        user = [p.stem for p in d.glob("*.json")] if d.is_dir() else []
+        builtin = _bundled_preset_names()
+        names = sorted(set(user) | set(builtin), key=str.lower)
+        return jsonify({"presets": names, "dir": str(d),
+                        "builtin": [n for n in builtin if n not in user]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/presets/<name>", methods=["GET"])
 def api_presets_get(name: str):
-    path = _preset_path(name)
+    path = _preset_read_path(name)
     if path is None:
         return jsonify({"error": "invalid preset name"}), 400
     if not path.exists():
@@ -2906,6 +3468,9 @@ def api_presets_delete(name: str):
     try:
         if path.exists():
             path.unlink()
+        elif name.strip() in _bundled_preset_names():
+            return jsonify({"error": f"'{name.strip()}' is a built-in preset and cannot be deleted "
+                                     f"(save your own under another name)"}), 400
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2958,15 +3523,25 @@ def api_default_config():
         # Restoration
         "ctrlMosaicRestModel": m.restoration_model,
         "ctrlMosaicMaxClip": str(m.mosaic_max_clip_size),
+        "ctrlMosaicOverlap": str(m.mosaic_temporal_overlap),     # CM-213
+        "ctrlMosaicCrossfade": bool(m.mosaic_crossfade),         # CM-213
         "ctrlMosaicRestFp16": m.mosaic_restoration_fp16,
         "ctrlMosaicRoiDilate": str(m.mosaic_roi_dilate),
+        "ctrlMosaicCropCap": str(m.mosaic_crop_cap),             # CM-227
         "ctrlMosaicFeather": str(m.mosaic_feather_radius),
         "ctrlMosaicBlendMask": m.mosaic_blend_mask,
         "ctrlMosaicSegMasks": m.mosaic_use_seg_masks,
+        "ctrlMosaicResidualScan": m.mosaic_residual_scan,
         "ctrlMosaicRestTrt": m.mosaic_restoration_trt,
-        "ctrlMosaicSecondary": m.mosaic_secondary,
+        # T20b: the recommended secondary is baked in (rtx-4x); Maxine is NVIDIA-only,
+        # so AMD / Intel start on the bundled Real-ESRGAN instead of a fallback line.
+        "ctrlMosaicSecondary": (m.mosaic_secondary
+                                if _ui_edition() == "cuda" or not str(m.mosaic_secondary).startswith("rtx")
+                                else "esrgan-4x"),
         "ctrlMosaicSecondaryDenoise": m.mosaic_secondary_denoise,  # CM-146
+        "ctrlMosaicSecondaryQuality": m.mosaic_secondary_quality,  # CM-217
         "ctrlMosaicTemporalFix": str(m.mosaic_temporal_stability),
+        "ctrlHwDecode": m.mosaic_hw_decode,                       # T20d (CM-234)
 
         # Batch folder (CM-079) — modal defaults. (Batch 23: the skip-existing
         # checkbox was replaced by the visible dual-list queue; already-
@@ -2983,6 +3558,9 @@ def api_default_config():
         "ctrlPreset": "P5",
         "ctrlQP": "18",
         "ctrlAsyncEncoder": False,
+        "ctrlOutputUpscale": m.mosaic_output_upscale,            # CM-219
+        "ctrlUpscaleScaler": m.mosaic_upscale_scaler,            # CM-228
+        "ctrlUpscaleOnly": m.mosaic_upscale_only,                # CM-228
 
         # Transport
         "skipBackward": "5",
@@ -3165,6 +3743,15 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
     if _instance_n > 1:
         print(f"[ChitraMaya] Instance {_instance_n}: port 5100 busy; "
               f"running on port {port} (console log: {_log_name})")
+    # T24: the [Alloc] lines were printed before this tee existed (first
+    # thing in main(), before torch), so the .log never carried them and the
+    # windowed exe showed them to nobody. Re-print them into the log now.
+    try:
+        import chitramaya as _pkg
+        for _ln in list(getattr(_pkg, "ALLOC_BANNER", ())):
+            print(_ln)
+    except Exception:
+        pass
 
     # CM-163: GPU gate. Probe the device in a child process BEFORE this
     # process touches torch; on the wrong edition / missing driver show the
@@ -3253,6 +3840,22 @@ def run(models_dir: str = "./models", gpu_id: int = 0, debug: bool = False, cons
                     )
                 except AttributeError:
                     # Fallback for older pywebview
+                    result = webview.windows[0].create_file_dialog(
+                        webview.OPEN_DIALOG, file_types=types,
+                    )
+                if result and len(result) > 0:
+                    return str(result[0])
+                return None
+
+            @staticmethod
+            def select_model_file():
+                # CM-232: a custom scaler file for models/upscalers (Manage Models -> Add)
+                types = ('Model files (*.pth;*.safetensors;*.pt;*.ckpt)', 'All files (*.*)')
+                try:
+                    result = webview.windows[0].create_file_dialog(
+                        webview.FileDialog.OPEN, file_types=types,
+                    )
+                except AttributeError:
                     result = webview.windows[0].create_file_dialog(
                         webview.OPEN_DIALOG, file_types=types,
                     )

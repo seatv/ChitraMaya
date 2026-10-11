@@ -105,8 +105,10 @@ class MosaicConfig:
     restoration_model: str = ""         # e.g. ./models/lada_mosaic_restoration_model_generic_v1.2.pth
 
     # Detection
-    mosaic_detection_score: float = 0.25
-    mosaic_detection_batch_size: int = 4
+    # T20b: 0.20 and batch 8 = the recommended set baked in (Gman's field practice; 8 is
+    # what the standard-set button compiles for). A run clamps the batch to its engine.
+    mosaic_detection_score: float = 0.20
+    mosaic_detection_batch_size: int = 8
     mosaic_det_imgsz: int = 640         # detector input size (multiple of 32); 960 for dense VR
     mosaic_iou: float = 0.70            # detection NMS IoU threshold
     mosaic_detection_fp16: bool = True  # detection engine precision
@@ -131,23 +133,46 @@ class MosaicConfig:
     mosaic_blend_frames: int = -1       # -1 = auto (temporal_overlap // 3 if crossfade else 0)
     mosaic_restoration_fp16: bool = True  # restoration engine precision
     mosaic_roi_dilate: int = 0          # grow detected ROI by N px before restoring (0 = off)
-    mosaic_feather_radius: int = 0      # soften restored-region mask edge by N px (0 = hard)
-    mosaic_blend_mask: str = "none"     # compositor blend-mask mode: none | facefusion
+    mosaic_crop_cap: int = 0            # CM-227: open-scene crop storage cap, px on the long side (0 = off)
+    mosaic_feather_radius: int = 0      # Face Swap feather px; 0 = auto (CM-214: 2.8 % of frame height)
+    mosaic_blend_mask: str = "facefusion"   # compositor blend-mask mode: none | facefusion (CM-214: default since 1.80)
     mosaic_use_seg_masks: bool = True   # per-pixel seg masks vs bounding boxes
+    # CM-205: after a real run, the detector scans the OUTPUT's key frames and
+    # reports where mosaic is still visible (console + run report).
+    mosaic_residual_scan: bool = True
 
     # CM-077 secondary restoration: "none" | "rtx-2x" | "rtx-4x". Upscales
     # restored crops with NVIDIA Maxine RTX Super-Res before paste-back, so
     # regions larger than the 256 clip size are downscaled into place instead
     # of stretched. Real restoration mode only; needs an RTX GPU + nvidia-vfx.
-    mosaic_secondary: str = "none"
+    # T20b: ON by default -- the field verdict ('RTXSR4 is still the king') sat behind
+    # an Off default for every newcomer. Off-CUDA the server's default-config route
+    # hands out esrgan-4x instead (CM-184 also maps rtx-* -> esrgan-4x at run time).
+    mosaic_secondary: str = "rtx-4x"
     # Batch 70 (CM-146): Maxine denoise pass chained after the RTX
     # secondary's upscale (none|low|medium|high|ultra). RTX modes only;
     # ignored by the Real-ESRGAN secondary.
     mosaic_secondary_denoise: str = "none"
+    # CM-217: Maxine Super-Res quality level for the RTX secondary
+    # (low|medium|high|ultra; high = the pre-1.80 hardcoded value).
+    mosaic_secondary_quality: str = "high"
+    # CM-219 / CM-228: whole-frame upscale before encode -- a factor (2x |
+    # 4x) or a target (1080p | 1440p | 2160p). Real restoration and the
+    # upscale-only mode.
+    mosaic_output_upscale: str = "none"
+    # CM-228: which scaler does the whole frame: esrgan (Real-ESRGAN, all
+    # GPUs) | rtx (Maxine VideoSuperRes, NVIDIA; falls back to esrgan).
+    mosaic_upscale_scaler: str = "esrgan"
+    # CM-228: Upscale only -- decode -> scale -> encode, no detector, no
+    # restorer, no tracker (pipeline mode "none"). For SFW content you just
+    # want bigger.
+    mosaic_upscale_only: bool = False
 
     # CM-078: temporal stabilization of restored crops (vs_temporalfix).
     # 0 = off, 1..3 = strength (higher = more aggressive smoothing).
-    mosaic_temporal_stability: int = 0
+    # T20b: 1 by default (Gman: 'either 1 or 3, two was most expensive'; 3 may look
+    # better and takes longer -- the tooltip says so).
+    mosaic_temporal_stability: int = 1
 
     # CM-202 (GitHub #10): the suffix appended to the output file name in
     # restoration mode ("-restored" by default; "-censored"/"-mask" for the
@@ -161,6 +186,12 @@ class MosaicConfig:
     # auto keeps frames in VRAM when they fit, offloads to system RAM when
     # the projected store would not (the long-Max-Clip enabler).
     mosaic_store_backend: str = "auto"
+
+    # T20d (CM-234): Hardware decode for the ffmpeg lane (AMD / Intel; NVIDIA
+    # only when NVDEC declines a stream) -- "auto" (probe qsv -> d3d11va ->
+    # CPU) | "off" (CPU decode). The chroma guard repairs the d3d11va
+    # download fault either way; Off is the way to avoid it outright.
+    mosaic_hw_decode: str = "auto"
 
     # Spatial denoising on restored crops. Currently a no-op placeholder
     # (UI control removed; pipeline support added in a tuning session).
@@ -212,17 +243,26 @@ class MosaicConfig:
             color_match=bool(self.mosaic_color_match),
             det_iou=float(self.mosaic_iou),
             roi_dilate=int(self.mosaic_roi_dilate),
+            crop_cap_px=int(self.mosaic_crop_cap),          # CM-227
             use_seg_masks=bool(self.mosaic_use_seg_masks),
+            residual_scan=bool(self.mosaic_residual_scan),
             feather_radius=int(self.mosaic_feather_radius),
             blendmask=str(self.mosaic_blend_mask),
             sbs_enabled=bool(self.mosaic_sbs_split),
             sbs_layout="lr",
             sbs_det_split=bool(self.mosaic_sbs_split),
             vr_projection=str(self.mosaic_vr_projection or "none").lower(),
-            secondary_restoration=str(self.mosaic_secondary or "none").lower(),
+            secondary_restoration=(str(self.mosaic_secondary) if str(self.mosaic_secondary or "").startswith("custom:")
+                                   else str(self.mosaic_secondary or "none").lower()),   # CM-229: a file name keeps its case
             secondary_denoise=str(self.mosaic_secondary_denoise or "none").lower(),
+            secondary_quality=str(self.mosaic_secondary_quality or "high").lower(),   # CM-217
+            output_upscale=str(self.mosaic_output_upscale or "none").lower(),         # CM-219
+            upscale_scaler=(str(self.mosaic_upscale_scaler) if str(self.mosaic_upscale_scaler or "").startswith("custom:")
+                            else str(self.mosaic_upscale_scaler or "esrgan").lower()),   # CM-228 / CM-229
+            upscale_only=bool(self.mosaic_upscale_only),                                # CM-228
             temporal_stability=int(self.mosaic_temporal_stability or 0),
             store_backend=str(self.mosaic_store_backend or "auto").lower(),
+            hw_decode=str(self.mosaic_hw_decode or "auto").lower(),          # T20d
             run_report=str(self.mosaic_run_report or "").strip().lower(),   # CM-202
             codec=str(enc.get("codec", "hevc")),
             preset=str(enc.get("preset", "P5")),

@@ -290,6 +290,13 @@ _expected_modules = [
                                       "Batch 29 bundled stabilizer weights s3"),
     ("chitramaya/mosaic/restorer/weights/LICENSE-vs_temporalfix.txt",
                                       "Batch 29 upstream Apache-2.0 license"),
+    # T20b: the built-in preset rides the static tree (panel values only)
+    ("chitramaya/static/presets/VR 4K.json",
+                                      "T20b built-in 'VR 4K' preset"),
+    ("chitramaya/video/chroma_guard.py",
+                                      "T20d/e decoded-frame decode guard (CM-234)"),
+    ("chitramaya/vram_preflight.py",
+                                      "T22 pre-run VRAM preflight + models-footprint ledger (CM-236)"),
 ]
 _missing_modules = [(p, why) for (p, why) in _expected_modules
                     if not (project_root / p).is_file()]
@@ -306,8 +313,15 @@ hiddenimports += [
     "chitramaya.console_buffer", "chitramaya.winproc",
     "chitramaya.mosaic.restorer.temporalfix_arch",
     "chitramaya.mosaic.restorer.temporal_stabilizer",
+    "chitramaya.video.chroma_guard",
+    "chitramaya.vram_preflight",
 ]
 hiddenimports += collect_submodules("ultralytics")
+# CM-229: spandrel identifies custom SR models by importing its 42 architecture
+# modules through a static registry; collect them all so a model the user drops
+# into models/upscalers loads in the frozen build (einops rides along).
+hiddenimports += collect_submodules("spandrel")
+hiddenimports += collect_submodules("einops")
 hiddenimports += collect_submodules("cv2")
 
 # ── torch submodule walk, CRASH-SAFE (r3, field crash #2 2026-08-15) ──────

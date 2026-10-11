@@ -42,6 +42,7 @@ _OUTPUT_STEM_SUFFIXES: tuple[str, ...] = (
     "-restored", "-censored", "-mask", "-mosaic",
     "-censored-seg", "-mosaic-seg",
     "-FIXED", "-PARTIAL",          # Batch 21b recovery products
+    "-upscaled",                   # CM-228/CM-245: the Upscale mode's output
 )
 # Sidecar / intermediate extensions to always ignore.
 _IGNORE_EXTS: tuple[str, ...] = (".hevc", ".av1", ".h264", ".ps1", ".json", ".txt")
@@ -112,8 +113,13 @@ def register_output_suffix(suffix: str) -> None:
         _EXTRA_OUTPUT_SUFFIXES.add(s)
 
 
-def _is_own_output(stem: str) -> bool:
+def _is_own_output(stem: str, own_suffixes: Optional[Sequence[str]] = None) -> bool:
+    """``own_suffixes`` (CM-245): when given, ONLY these stems count as our
+    own output -- the Upscale mode's folder is full of ``-restored`` files
+    that are its intended INPUT, so there the default lists must not apply."""
     low = stem.lower()
+    if own_suffixes is not None:
+        return any(low.endswith(str(suf).lower()) for suf in own_suffixes if str(suf))
     if any(low.endswith(suf.lower()) for suf in _OUTPUT_STEM_SUFFIXES):
         return True
     return any(low.endswith(suf.lower()) for suf in _EXTRA_OUTPUT_SUFFIXES)
@@ -123,9 +129,12 @@ def enumerate_videos(
     folder: str | Path,
     extensions: Optional[Sequence[str]] = None,
     recursive: bool = False,
+    own_suffixes: Optional[Sequence[str]] = None,
 ) -> List[Path]:
     """Return sorted source videos in `folder`, excluding ChitraMaya's own
-    outputs and intermediates. Raises FileNotFoundError if the folder is bad."""
+    outputs and intermediates. Raises FileNotFoundError if the folder is bad.
+    ``own_suffixes`` (CM-245): the Upscale mode passes its own suffix set so
+    restored outputs are listed as inputs (see _is_own_output)."""
     root = Path(folder)
     if not root.is_dir():
         raise FileNotFoundError(f"Not a folder: {folder}")
@@ -143,16 +152,30 @@ def enumerate_videos(
             continue
         if p.suffix.lower() not in exts:
             continue
-        if _is_own_output(p.stem):
+        if _is_own_output(p.stem, own_suffixes):
             continue
         out.append(p)
     return sorted(out, key=lambda q: str(q).lower())
 
 
-def output_path_for(input_path: str | Path, out_dir: str | Path, suffix: str) -> str:
+UPSCALE_SUFFIX = "-upscaled"
+
+
+def output_stem_for(stem: str, suffix: str, *, upscale_only: bool = False) -> str:
+    """<stem><suffix>, except (CM-245) in Upscale mode when the stem already
+    ends with that suffix -- a restored output being brought to 4K -- where
+    doubling it ("-restored-18RC2-restored-18RC2") says nothing; "-upscaled"
+    is appended instead."""
+    if upscale_only and suffix and stem.lower().endswith(str(suffix).lower()):
+        return f"{stem}{UPSCALE_SUFFIX}"
+    return f"{stem}{suffix}"
+
+
+def output_path_for(input_path: str | Path, out_dir: str | Path, suffix: str,
+                    *, upscale_only: bool = False) -> str:
     """Mirror the server's single-file output naming: <out_dir>/<stem><suffix>.mp4."""
     stem = Path(input_path).stem
-    return str(Path(out_dir) / f"{stem}{suffix}.mp4")
+    return str(Path(out_dir) / f"{output_stem_for(stem, suffix, upscale_only=upscale_only)}.mp4")
 
 
 def plan_batch(
@@ -160,11 +183,12 @@ def plan_batch(
     out_dir: str | Path,
     suffix: str,
     skip_existing: bool,
+    upscale_only: bool = False,
 ) -> List[BatchItem]:
     """Compute output paths and mark skips. Does not touch the GPU."""
     items: List[BatchItem] = []
     for src in inputs:
-        outp = output_path_for(src, out_dir, suffix)
+        outp = output_path_for(src, out_dir, suffix, upscale_only=upscale_only)
         skip = bool(skip_existing) and Path(outp).exists()
         items.append(BatchItem(
             input_path=str(src),

@@ -8,6 +8,19 @@ from typing import Any, Optional, Sequence, Tuple
 from chitramaya.mosaic.utils.config_util import Config
 
 
+def _scaler_choice(builtins):
+    """CM-229: a scaler argument is one of the built-in ids OR 'custom:<file>'
+    (a model in models/upscalers; the file name keeps its case)."""
+    def _parse(v):
+        s = str(v or "").strip()
+        if s.startswith("custom:") and len(s) > 7:
+            return s
+        if s.lower() in builtins:
+            return s.lower()
+        raise argparse.ArgumentTypeError(f"expected one of {builtins} or custom:<file>, got {v!r}")
+    return _parse
+
+
 def _parse_rgb_triplet(s: str) -> Tuple[int, int, int]:
     parts = [p.strip() for p in s.split(",")]
     if len(parts) != 3:
@@ -80,7 +93,18 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-id", type=int, default=None, help="GPU index (decoder/encoder/inference)")
 
     # --- Root knobs ---
-    p.add_argument("--roi-dilate", type=int, default=None, help="Dilate detected ROIs by N pixels")
+    p.add_argument("--roi-dilate", type=int, default=None,
+                   help="Region Margin: widen every detected region (box and mask) by N frame pixels (CM-208)")
+    p.add_argument("--crop-cap", type=int, default=None, choices=[0, 512, 768, 1024],
+                   help="Crop Cap: store open-scene crops at most N px on the long side (0 = off = native; "
+                        "the lever for 4K on 8 GB, costs some fine texture on crops above N) (CM-227)")
+    p.add_argument(
+        "--residual-scan",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="After a real run, scan the output's key frames with the detector and report "
+             "where mosaic is still visible (CM-205; default on)",
+    )
     p.add_argument("--batch-size", type=int, default=None, help="Decode/processing batch size")
     p.add_argument(
         "--use-seg-masks",
@@ -93,6 +117,8 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--dec-gpu-id", type=int, default=None)
     p.add_argument("--dec-output-format", choices=["RGB", "RGBP"], default=None)
     p.add_argument("--dec-ffmpeg-input-args", default=None, help="Extra ffmpeg input args for CPU decode fallback (inserted before -i; must not contain -i)")
+    p.add_argument("--hw-decode", default=None, choices=["auto", "off"],
+                   help="T20d: hardware decode on the ffmpeg lane (AMD/Intel): auto = probe qsv -> d3d11va -> CPU; off = CPU decode. CM_HW_DECODE in the environment overrides.")
 
     # --- Encoder base (simplified API: preset + quality only) ---
     # Advanced NVENC knobs (tune, spatial_aq, bf, lookahead, etc.) are baked
@@ -158,6 +184,18 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-fp16", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--rest-max-clip-length", type=int, default=None,
                    help="Max frames per restoration clip (default: 30, higher=smoother but more VRAM)")
+    # CM-213: overlap + crossfade at Max Clip cuts (design: jasna's
+    # temporal_overlap / enable_crossfade, kruk2, AGPL; ours in the tracker).
+    p.add_argument("--rest-overlap", type=int, default=None,
+                   help="Overlap N at Max Clip cuts: the next clip re-restores the cut clip's last 2*N "
+                        "frames as lead-in; the first N are discarded, the rest replace the cut clip's "
+                        "cold tail. Costs 2*N restorer frames per cut. 0 = hard cuts (default: 8)")
+    p.add_argument("--rest-crossfade", action=argparse.BooleanOptionalAction, default=None,
+                   help="With --rest-overlap > 0, fade between the two clips at the seam over "
+                        "2*blend-frames frames instead of a one-frame hand-off (default: on)")
+    p.add_argument("--rest-blend-frames", type=int, default=None,
+                   help="Crossfade half-width in frames; -1 = auto (overlap // 3). Experiments only; "
+                        "the panel keeps auto.")
     p.add_argument("--restore-chunk-frames", type=int, default=None,
                    help="PyTorch path only: cap the temporal window fed to "
                         "BasicVSR++ per forward. 0 (default) = whole clip, "
@@ -174,11 +212,12 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--rest-pad-mode", default=None)
     p.add_argument("--rest-feather-radius", type=int, default=None,
                    help="Feather (px) for the restored-region edge when --rest-blendmask "
-                        "facefusion is set (0 = auto). No effect with blendmask none.")
+                        "facefusion is set. 0 = auto: 2.8%% of the frame height (CM-214; "
+                        "60 px at 4K, 30 px at 1080p). No effect with blendmask none.")
     p.add_argument("--rest-blendmask", choices=["none", "facefusion"], default=None,
-                   help="Compositor blend-mask mode: none = legacy rectangular mask; "
-                        "facefusion = shape-aware soft edge following the mosaic mask "
-                        "(tuned by --rest-feather-radius).")
+                   help="Compositor blend-mask mode: facefusion (default since 1.80) = shape-aware "
+                        "soft edge following the mosaic mask (tuned by --rest-feather-radius); "
+                        "none = legacy rectangular mask.")
     p.add_argument("--analysis-use-synth-rois", action=argparse.BooleanOptionalAction, default=None,
                    help="Analysis/tuning mode: use fixed synth_mosaic.rois for every frame instead of detector boxes")
 
@@ -261,13 +300,30 @@ def create_parser() -> argparse.ArgumentParser:
                         "the headset, warped in the raw frame) and inverse-warps "
                         "restored regions back. Requires --sbs.")
     p.add_argument("--secondary-restoration",
-                   choices=["none", "rtx-2x", "rtx-4x", "esrgan-4x"],
+                   type=_scaler_choice(["none", "rtx-2x", "rtx-4x", "esrgan-4x"]),
                    default=None,
                    help="CM-077: upscale restored crops with NVIDIA Maxine RTX "
                         "Super-Res (2x or 4x) before paste-back, sharpening regions "
                         "larger than the 256 clip size. Needs an RTX GPU, a recent "
                         "driver, and 'pip install nvidia-vfx'; ~1.5 GB extra VRAM. "
                         "Falls back gracefully if unavailable.")
+    p.add_argument("--output-upscale", choices=["none", "2x", "4x", "1080p", "1440p", "2160p"], default=None,
+                   help="CM-219/CM-228: upscale every OUTPUT frame before encoding, to a factor (2x, 4x) or a "
+                        "target height (1080p, 1440p, 2160p; aspect kept). Whole-frame stage; H.264 is "
+                        "limited to 4096 px on a side, HEVC/AV1 to 8192 -- past the limit the run continues "
+                        "without the upscale. Real restoration and --upscale-only.")
+    p.add_argument("--upscale-scaler", type=_scaler_choice(["esrgan", "rtx"]), default=None,
+                   help="CM-228: the whole-frame scaler: esrgan = Real-ESRGAN (bundled, all GPUs, ~0.5 s per "
+                        "1080p frame on a 3060); rtx = NVIDIA Maxine VideoSuperRes (needs an RTX GPU and "
+                        "nvidia-vfx; native 4/3, 1.5, 2, 3, 4x; --secondary-quality / --secondary-denoise "
+                        "apply). rtx falls back to esrgan when Maxine refuses the size.")
+    p.add_argument("--upscale-only", action="store_true", default=None,
+                   help="CM-228: decode -> scale -> encode only: no detector, no restorer, no tracker "
+                        "(mode none). Pair with --output-upscale; without it this is a plain re-encode.")
+    p.add_argument("--secondary-quality",
+                   choices=["low", "medium", "high", "ultra"], default=None,
+                   help="CM-217: RTX Super-Res quality level (Maxine QualityLevel; default high). "
+                        "RTX modes only -- ignored by esrgan-4x.")
     p.add_argument("--secondary-denoise",
                    choices=["none", "low", "medium", "high", "ultra"],
                    default=None,
@@ -328,7 +384,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if cfg.get("restorer", default=None) is None:
         cfg.set("restorer", value="basicvsrpp")
     if cfg.get("restoration", "blendmask", default=None) is None:
-        cfg.set("restoration", "blendmask", value="none")
+        cfg.set("restoration", "blendmask", value="facefusion")   # CM-214: the 1.80 default
 
     # High-level overrides
     _set_if_not_none(cfg, ("mode",), args.mode)
@@ -341,13 +397,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     # Root knobs
     _set_if_not_none(cfg, ("roi_dilate",), args.roi_dilate)
+    _set_if_not_none(cfg, ("crop_cap_px",), args.crop_cap)     # CM-227
     _set_if_not_none(cfg, ("batch_size",), args.batch_size)
     _set_if_not_none(cfg, ("use_seg_masks",), args.use_seg_masks)
+    _set_if_not_none(cfg, ("residual_scan",), args.residual_scan)
 
     # Decoder
     _set_if_not_none(cfg, ("decoder", "gpu_id"), args.dec_gpu_id)
     _set_if_not_none(cfg, ("decoder", "output_format"), args.dec_output_format)
     _set_if_not_none(cfg, ("decoder", "ffmpeg_input_args"), args.dec_ffmpeg_input_args)
+    _set_if_not_none(cfg, ("decoder", "hw_accel"), getattr(args, "hw_decode", None))   # T20d
 
     # Encoder base (simplified)
     _set_if_not_none(cfg, ("encoder", "codec"), args.enc_codec)
@@ -376,6 +435,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("restoration", "rest_model_path"), args.rest_model)
     _set_if_not_none(cfg, ("restoration", "fp16"), args.rest_fp16)
     _set_if_not_none(cfg, ("restoration", "max_clip_length"), args.rest_max_clip_length)
+    _set_if_not_none(cfg, ("restoration", "temporal_overlap"), args.rest_overlap)     # CM-213
+    _set_if_not_none(cfg, ("restoration", "crossfade"), args.rest_crossfade)          # CM-213
+    _set_if_not_none(cfg, ("restoration", "blend_frames"), args.rest_blend_frames)    # CM-213
     _set_if_not_none(cfg, ("restoration", "chunk_frames"),
                      getattr(args, "restore_chunk_frames", None))
     _set_if_not_none(cfg, ("detection", "dump_rois"),
@@ -432,6 +494,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
     _set_if_not_none(cfg, ("secondary_restoration",), args.secondary_restoration)
     _set_if_not_none(cfg, ("secondary_denoise",),
                      getattr(args, "secondary_denoise", None))
+    _set_if_not_none(cfg, ("secondary_quality",),
+                     getattr(args, "secondary_quality", None))   # CM-217
+    _set_if_not_none(cfg, ("output_upscale",),
+                     getattr(args, "output_upscale", None))      # CM-219
+    _set_if_not_none(cfg, ("upscale_scaler",),
+                     getattr(args, "upscale_scaler", None))      # CM-228
+    if getattr(args, "upscale_only", None):                       # CM-228: same as --mode none
+        cfg.set("mode", value="none")
     _set_if_not_none(cfg, ("temporal_stability",), args.temporal_stability)
 
     # Detector Switch (CLI overrides config/default)

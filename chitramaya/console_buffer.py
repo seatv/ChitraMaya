@@ -228,7 +228,31 @@ def install(max_lines: int = 2000, log_path: str | None = None) -> ConsoleBuffer
         sys.stdout = _TeeStream(sys.stdout, buf)
         sys.stderr = _TeeStream(sys.stderr, buf)
         _buffer = buf
+        _enable_faulthandler(buf.log_path)
         return buf
+
+
+_fault_fh = None   # kept open for the life of the process: faulthandler writes to its fd
+
+
+def _enable_faulthandler(log_path: Optional[str]) -> None:
+    """CM-225: a native crash (a failed cudaMalloc inside TensorRT, NVDEC,
+    NVENC or Maxine aborts the process; an access violation in a driver
+    DLL) ends the process with NOTHING in the console log -- the run just
+    stops (09-19: a 4K run's log ended at 'frame 1000' and the app was
+    gone). faulthandler writes the Python stacks of every thread to a raw fd
+    at that moment, and the tee streams are not raw fds, so the console log
+    file is opened a second time in append mode for it. Best-effort: never
+    the reason a launch fails."""
+    global _fault_fh
+    if not log_path:
+        return
+    try:
+        import faulthandler
+        _fault_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        faulthandler.enable(file=_fault_fh, all_threads=True)
+    except Exception:
+        _fault_fh = None
 
 
 def get_buffer() -> Optional[ConsoleBuffer]:

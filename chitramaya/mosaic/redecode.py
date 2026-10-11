@@ -71,6 +71,7 @@ class Patch:
     border_ratio: float
     blendmask: str
     feather_radius: int
+    weight: float = 1.0       # CM-213: paste weight (continuation crossfade)
 
     def nbytes(self) -> int:
         try:
@@ -184,7 +185,11 @@ class RedecodeStore(FrameStore):
         queue one Patch per frame. Returns the number of patches queued."""
         n = min(len(restored_frames_u8), len(clip.frame_nums))
         added = 0
+        _wt = getattr(clip, "weight_at", None)
         for i in range(n):
+            weight = float(_wt(i)) if _wt is not None else 1.0
+            if weight <= 0.0:
+                continue   # CM-213: a seeded frame the parent clip owns
             prepared = prepare_patch(clip, i, restored_frames_u8[i], secondary)
             if prepared is None:
                 continue
@@ -207,6 +212,7 @@ class RedecodeStore(FrameStore):
                 mask_u8=msk_keep, pad=pad, orig_shape_hw=orig_shape_hw,
                 box=orig_box, model_dtype=model_dtype, border_ratio=float(border_ratio),
                 blendmask=str(blendmask), feather_radius=int(feather_radius),
+                weight=float(weight),
             ))
             added += 1
         self.clips_planned += 1
@@ -243,6 +249,8 @@ class LagDecoder:
             ffmpeg_input_args=str(getattr(primary, "ffmpeg_input_args", "") or ""),
             trim_negative_pts=False,
             threaded_buffer_size=max(4, 2 * int(batch_size)),
+            hw_accel=str(getattr(primary, "hw_accel", "auto") or "auto"),   # T20d: same lane rules
+            scan_stream=False,   # T23f (CM-240): no second whole-file scan; the primary's count rules
         )
         if self._dec.backend != primary.backend:
             # Different backends can deliver different frame sequences
@@ -400,6 +408,7 @@ def drain_plan_to_encoder(
                 frm_bgr, img, msk, box,
                 model_dtype=p.model_dtype, border_ratio=p.border_ratio,
                 blendmask=p.blendmask, feather_radius=p.feather_radius,
+                weight=float(getattr(p, "weight", 1.0)),
             )
         if foi_capture is not None and foi_target is not None and k == int(foi_target):
             foi_capture["composited"] = frm_bgr.detach().clone()

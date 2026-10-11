@@ -45,6 +45,7 @@ gswapper-config.json
 *.7z.*
 ChitraMaya-ReleaseNotes*
 ChitraMaya-config.json
+vram-ledger.json
 Forum*
 !packaging/windows/vendor/7zr.exe
 !packaging/windows/vendor/7zSD.sfx
@@ -57,3 +58,5 @@ runs/*
 RELEASE*
 .gpu-gate-ok
 presets/
+# T20b: the built-in presets ship with the app (panel values only)
+!chitramaya/static/presets/

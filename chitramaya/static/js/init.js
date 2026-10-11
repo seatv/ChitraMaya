@@ -71,7 +71,10 @@ function setCurrentFileDisplay(path) {
     el.style.color = 'var(--text, #ddd)';
     if (wrap) wrap.title = path;
   } else {
-    el.textContent = 'No video loaded';
+    // CM-235: the current language's string (the i18n pass no longer
+    // rewrites this element once a path is shown).
+    el.textContent = (window.I18N && typeof window.I18N.t === 'function')
+      ? window.I18N.t('currentFileName.text', 'No video loaded') : 'No video loaded';
     el.style.color = 'var(--text-dim, #9a9a9a)';
     if (wrap) wrap.title = '';
   }

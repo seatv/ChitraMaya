@@ -75,15 +75,22 @@ const MOSAIC_CONFIG_CONTROLS = [
   'ctrlMosaicDetBatch', 'ctrlMosaicDetImgsz', 'ctrlMosaicDetFp16', 'ctrlMosaicDetTrt',
   'ctrlMosaicSbsSplit', 'ctrlMosaicVrProjection',
   'ctrlMosaicRestModel', 'ctrlMosaicMaxClip', 'ctrlMosaicRestFp16',
+  'ctrlMosaicOverlap', 'ctrlMosaicCrossfade',   // CM-213
   'ctrlMosaicSecondary',
   'ctrlMosaicSecondaryDenoise',  // Batch 74 (CM-146 fix): was missing -- Save/Load Settings silently reset denoise to none
+  'ctrlMosaicSecondaryQuality',  // CM-217
   'ctrlMosaicTemporalFix',
   'ctrlMosaicRoiDilate', 'ctrlMosaicFeather', 'ctrlMosaicBlendMask',
-  'ctrlMosaicSegMasks', 'ctrlMosaicRestTrt',
+  'ctrlMosaicCropCap',   // CM-227: open-scene crop storage cap (Off / 1024 / 768 / 512)
+  'ctrlMosaicSegMasks', 'ctrlMosaicResidualScan', 'ctrlMosaicRestTrt',
   'ctrlMosaicMaskPreview', 'ctrlMosaicMaskColor', 'ctrlMosaicMaskOpacity',
   'ctrlMosaicCensor', 'ctrlMosaicCensorBlock',
   'ctrlAsyncEncoder',
+  'ctrlOutputUpscale',  // CM-219/CM-228: whole-frame upscale before encode (factor or target)
+  'ctrlUpscaleScaler',  // CM-228: esrgan | rtx
+  'ctrlMosaicUpscale',  // CM-228: the Upscale alternate execution mode (decode -> scale -> encode, no models)
   'ctrlStoreBackend',   // CM-084 (Batch 38): FrameStore backend
+  'ctrlHwDecode',       // T20d (CM-234): Hardware decode on the ffmpeg lane (auto | off)
   'ctrlOutputSuffix',   // CM-202 (GitHub #10): output file suffix
   'ctrlRunReport',      // CM-202 (GitHub #10): run files beside | temp | off
   'mmEndpoint',         // CM-199 (GitHub #13): model download endpoint (Manage Models)
@@ -195,6 +202,8 @@ let _mosaicRestEngines = {};
 // Populated by populateMosaicModelDropdowns() from /api/list-mosaic-models.
 let _mosaicDetEngines = {};
 // CM-148 (Batch 76): compiled imgsz per detection model (null = unknown).
+// CM-218: several flavors can coexist -- this holds the LIST of compiled
+// Image Sizes (sorted) so the gate fires only when none matches the dial.
 let _mosaicDetEngineImgsz = {};
 
 // Max Clip range when TRT is NOT constraining it. Batch 42: on the
@@ -265,9 +274,61 @@ async function _refreshEngineCaches() {
   _mosaicDetEngineImgsz = {};
   for (const item of data.detection || []) {
     _mosaicDetEngines[item.path] = !!item.has_engine;
-    _mosaicDetEngineImgsz[item.path] =
-      (item.engine_imgsz == null ? null : Number(item.engine_imgsz));
+    _mosaicDetEngineImgsz[item.path] = _detEngineSizes(item);   // CM-218
   }
+}
+
+// CM-218: the compiled Image Sizes of a detection model's engine flavors
+// (falls back to the single engine_imgsz of an older server). null = none known.
+// T20b: the Manage Models button says what a new user must do next, in colour.
+// GREEN "Get Models" when there is nothing to run with (no detection or no
+// restoration model); AMBER "Compile Models" on the NVIDIA edition when
+// models are present, TensorRT is ticked, and no detection engine matches
+// the panel's Image Size (or no restoration engine exists) -- the run would
+// work, in PyTorch, at a fraction of the speed, and nothing said so. Grey
+// "Manage Models" otherwise. Off-CUDA there is nothing to compile: never amber.
+let _mmLastModelData = null;
+function _updateManageModelsButton() {
+  const btn = document.getElementById('manageModelsBtn');
+  if (!btn) return;
+  const data = _mmLastModelData;
+  btn.classList.remove('mm-btn-get', 'mm-btn-compile');
+  if (!data) return;
+  const det = Array.isArray(data.detection) ? data.detection : [];
+  const rest = Array.isArray(data.restoration) ? data.restoration : [];
+  if (!det.length || !rest.length) {
+    btn.classList.add('mm-btn-get');
+    btn.textContent = 'Get Models';
+    btn.title = 'No models yet. Opens Manage Models; the Standard models section downloads the set in one click'
+      + ((document.documentElement.dataset.edition || 'cuda') === 'cuda' ? ' and compiles the engines for this GPU.' : '.');
+    return;
+  }
+  const ed = document.documentElement.dataset.edition || '';
+  const trt = document.getElementById('ctrlMosaicDetTrt');
+  const imgsz = parseInt((document.getElementById('ctrlMosaicDetImgsz') || {}).value || '640', 10) || 640;
+  if ((!ed || ed === 'cuda') && trt && trt.checked) {
+    const detOk = det.some(it => (_detEngineSizes(it) || []).includes(imgsz));
+    const restOk = rest.some(it => it.engines && (it.engines.fixed
+      || ((it.engines.fp16 || []).length + (it.engines.fp32 || []).length) > 0));
+    if (!detOk || !restOk) {
+      btn.classList.add('mm-btn-compile');
+      btn.textContent = 'Compile Models';
+      btn.title = (!detOk
+        ? `No detection engine is compiled for Image Size ${imgsz}; `
+        : 'No restoration engine is compiled; ')
+        + 'the run works in PyTorch at a fraction of the speed. Opens Manage Models to compile (minutes, once per GPU).';
+      return;
+    }
+  }
+  btn.textContent = 'Manage Models';
+  btn.title = 'Download, compile and manage detection / restoration models and custom scalers';
+}
+
+function _detEngineSizes(item) {
+  if (Array.isArray(item.engine_imgszs) && item.engine_imgszs.length) {
+    return item.engine_imgszs.map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+  }
+  return item.engine_imgsz == null ? null : [Number(item.engine_imgsz)];
 }
 
 // Custom in-app modal (no window.confirm — OS-inconsistent). Resolves to
@@ -288,14 +349,16 @@ function showTensorModal(missing, mismatch) {
       // PyTorch detection with only a console line -- a 2h45m benchmark
       // spent 57 min detecting on PyTorch before anyone noticed.
       if (titleEl) titleEl.textContent = 'TensorRT engine size mismatch';
+      const compiledAt = (mismatch.all && mismatch.all.length > 1)
+        ? ('The compiled detection engines were built at Image Sizes ' + mismatch.all.join(', '))
+        : ('The compiled detection engine was built at Image Size ' + mismatch.have);
       msgEl.textContent =
-        'The compiled detection engine was built at Image Size ' +
-        mismatch.have + ', but the dial is set to ' + mismatch.want +
+        compiledAt + ', but the dial is set to ' + mismatch.want +
         '.\n\nUse engine size runs this job at ' + mismatch.have +
         ' with TensorRT (fast; detection behavior matches the compiled ' +
         'size). Continue on PyTorch keeps ' + mismatch.want +
         ' but detection runs without TensorRT (slower). Manage Models ' +
-        'aborts so you can recompile at ' + mismatch.want + '.';
+        'aborts so you can compile a ' + mismatch.want + ' flavor (the compiled ones are kept).';
       if (engBtn) {
         engBtn.textContent = 'Use engine size (' + mismatch.have + ')';
         engBtn.classList.remove('hidden');
@@ -335,10 +398,154 @@ function showTensorModal(missing, mismatch) {
   });
 }
 
+// CM-236 (T22): the VRAM preflight BEFORE the run. Asks the server for the
+// estimate (free VRAM now minus the resident-models footprint this card's
+// earlier runs measured, against the working set the run will add) and,
+// when it does not fit, shows the numbers with three choices. "Apply levers"
+// changes the PANEL CONTROLS (Crop Cap to the value that fits, Async Encode
+// off) so what runs is what the panel shows; the caller re-gathers params.
+// Resolves {proceed, applied}. Any failure of the check itself = proceed
+// (the run-time preflight in the console still prints).
+function showVramModal(res) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('vramModal');
+    const msgEl = document.getElementById('vramModalMessage');
+    const cancelBtn = document.getElementById('vramModalCancel');
+    const anywayBtn = document.getElementById('vramModalAnyway');
+    const applyBtn = document.getElementById('vramModalApply');
+    if (!overlay || !msgEl || !cancelBtn || !anywayBtn || !applyBtn) { resolve('anyway'); return; }
+    const applicable = (res.levers || []).filter(l => l.kind === 'crop_cap' || l.kind === 'async_off');
+    const advice = (res.levers || []).filter(l => l.kind !== 'crop_cap' && l.kind !== 'async_off');
+    const src = res.footprint_source === 'measured'
+      ? ('measured on this card\'s last run of this shape' + (res.ledger_when ? ' (' + res.ledger_when + ')' : ''))
+      : 'estimated from the edition table (no run of this shape on this card yet)';
+    let txt = (res.files_checked > 1 ? ('Largest file in the plan: ' + res.file + ' ') : '')
+      + res.width + 'x' + res.height + '. The run may need about ' + res.need_mb + ' MB ('
+      + res.parts + ') but about ' + res.free_mb + ' MB will be free once the models are loaded ('
+      + res.free_now_mb + ' MB free now, models ' + res.footprint_mb + ' MB, ' + src
+      + ') on this ' + res.total_mb + ' MB card. An out-of-memory stop at the first large scene is likely.';
+    if (applicable.length) {
+      txt += '\n\nApply levers sets: ' + applicable.map(l => l.text).join('; ') + '.';
+    }
+    if (advice.length) {
+      txt += '\n\nFurther levers, by hand: ' + advice.map(l => l.text).join('; ') + '.';
+    }
+    msgEl.textContent = txt;
+    if (!applicable.length) applyBtn.classList.add('hidden'); else applyBtn.classList.remove('hidden');
+    overlay.classList.remove('hidden');
+    function cleanup(result) {
+      overlay.classList.add('hidden');
+      cancelBtn.removeEventListener('click', onCancel);
+      anywayBtn.removeEventListener('click', onAnyway);
+      applyBtn.removeEventListener('click', onApply);
+      overlay.removeEventListener('click', onBackdrop);
+      resolve(result);
+    }
+    function onCancel() { cleanup('cancel'); }
+    function onAnyway() { cleanup('anyway'); }
+    function onApply() { cleanup('apply'); }
+    function onBackdrop(e) { if (e.target === overlay) cleanup('cancel'); }
+    cancelBtn.addEventListener('click', onCancel);
+    anywayBtn.addEventListener('click', onAnyway);
+    applyBtn.addEventListener('click', onApply);
+    overlay.addEventListener('click', onBackdrop);
+  });
+}
+
+// T23d (CM-239): one pre-run check in flight at a time, and the button that
+// started it says so. The check reads free VRAM from the driver and can take
+// a few seconds on a busy card; a second click meanwhile used to start a
+// second check (and, with two "Run anyway" clicks, could start two runs).
+let _vramCheckInFlight = false;
+
+function _holdButton(btn, text) {
+  if (!btn) return { release: function () {} };
+  const wasDisabled = !!btn.disabled;
+  const wasText = btn.textContent;
+  btn.disabled = true;
+  try {
+    btn.textContent = (window.I18N && typeof I18N.tr === 'function') ? I18N.tr(text) : text;
+  } catch (e) { btn.textContent = text; }
+  btn.classList.add('is-checking');
+  return {
+    release: function () {
+      btn.textContent = wasText;
+      btn.disabled = wasDisabled;
+      btn.classList.remove('is-checking');
+    },
+  };
+}
+
+async function checkVramBeforeRun(params, files, btn) {
+  if (_vramCheckInFlight) {
+    console.log('[VRAM] pre-run check already in flight; this click is ignored');
+    return { proceed: false, applied: false, busy: true };
+  }
+  _vramCheckInFlight = true;
+  const held = _holdButton(btn, 'Checking VRAM...');
+  try {
+    const r = await fetch('/api/vram-preflight', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ params: params, files: files || null }),
+    });
+    if (!r.ok) return { proceed: true, applied: false };
+    const res = await r.json();
+    if (!res || res.skipped || res.fits !== false) {
+      if (res && res.skipped) console.log('[VRAM] pre-run check skipped: ' + res.skipped);
+      else if (res) console.log('[VRAM] pre-run check: ~' + res.need_mb + ' MB needed, ~' + res.free_mb
+        + ' MB free after models (' + res.footprint_source + '), fits');
+      return { proceed: true, applied: false };
+    }
+    console.log('[VRAM] pre-run check: ~' + res.need_mb + ' MB needed vs ~' + res.free_mb
+      + ' MB free after models (' + res.footprint_source + ') -- asking');
+    // The button reads normally again while the dialog is up (the dialog
+    // owns the decision now); the in-flight guard stays until we return.
+    held.release();
+    const choice = await showVramModal(res);
+    if (choice === 'cancel') return { proceed: false, applied: false };
+    if (choice === 'apply') {
+      let applied = false;
+      for (const l of (res.levers || [])) {
+        if (l.kind === 'crop_cap') {
+          const el = document.getElementById('ctrlMosaicCropCap');
+          if (el) {
+            el.value = String(l.value);
+            if (el.value !== String(l.value)) { el.value = '512'; }
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            applied = true;
+          }
+        } else if (l.kind === 'async_off') {
+          const el = document.getElementById('ctrlAsyncEncoder');
+          if (el && el.checked) {
+            el.checked = false;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            applied = true;
+          }
+        }
+      }
+      if (applied && typeof showToast === 'function') {
+        showToast('Levers applied to the panel for this run (Crop Cap / Async Encode); save settings to keep them.');
+      }
+      return { proceed: true, applied: applied };
+    }
+    return { proceed: true, applied: false };
+  } catch (e) {
+    console.warn('[VRAM] pre-run check failed: ' + e);
+    return { proceed: true, applied: false };
+  } finally {
+    held.release();
+    _vramCheckInFlight = false;
+  }
+}
+
 // Submit-time gate. Returns {proceed, override} where override marks which
 // stages to force onto PyTorch for this run. Mask Preview skips the restoration
 // check (pseudo needs no restoration engine).
 async function checkTensorBeforeRun() {
+  // CM-228: Upscale mode runs no detector and no restorer -- nothing to gate.
+  // (T16 returned a bare `true` here; every caller reads `gate.proceed`, so
+  // Restore & Save silently bailed. The click-path smoke now covers this.)
+  if (_upscaleModeOn()) return { proceed: true, override: null };
   await _refreshEngineCaches();
   const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
   // Add Mosaic (censor) skips restoration entirely, like Preview Detection —
@@ -361,9 +568,11 @@ async function checkTensorBeforeRun() {
     const mv = document.getElementById('ctrlMosaicDetModel').value;
     const dial = parseInt(
       (document.getElementById('ctrlMosaicDetImgsz') || {}).value || '640', 10);
-    const eng = (mv && !/\.engine$/i.test(mv)) ? _mosaicDetEngineImgsz[mv] : null;
-    if (eng != null && Number.isFinite(dial) && eng !== dial) {
-      mismatch = { want: dial, have: eng };
+    const sizes = (mv && !/\.engine$/i.test(mv)) ? _mosaicDetEngineImgsz[mv] : null;
+    if (sizes && sizes.length && Number.isFinite(dial) && !sizes.includes(dial)) {
+      // CM-218: no compiled flavor at the dial's size. Offer the nearest one.
+      const nearest = sizes.reduce((a, b) => (Math.abs(b - dial) < Math.abs(a - dial) ? b : a), sizes[0]);
+      mismatch = { want: dial, have: nearest, all: sizes };
     }
   }
 
@@ -431,8 +640,9 @@ async function populateMosaicModelDropdowns() {
     // field users stalled here). When the list is empty, the placeholder
     // itself says what to do; Manage Models is the button top-right.
     if (!items || items.length === 0) {
+      // CM-232: Manage Models now has one button for the standard set
       select.innerHTML =
-        '<option value="">No models installed — use Manage Models (top right) to download</option>';
+        '<option value="">No models yet \u2014 Manage Models (top right) \u2192 Get the standard models</option>';
       return;
     }
     select.innerHTML = '<option value="">— select model —</option>';
@@ -458,11 +668,10 @@ async function populateMosaicModelDropdowns() {
 
   // Cache detection engine availability for the Use Tensor toggle.
   _mosaicDetEngines = {};
-  _mosaicDetEngineImgsz = {};  // CM-148 (Batch 76)
+  _mosaicDetEngineImgsz = {};  // CM-148 (Batch 76) / CM-218 (list of flavors)
   for (const item of data.detection || []) {
     _mosaicDetEngines[item.path] = !!item.has_engine;
-    _mosaicDetEngineImgsz[item.path] =
-      (item.engine_imgsz == null ? null : Number(item.engine_imgsz));
+    _mosaicDetEngineImgsz[item.path] = _detEngineSizes(item);
   }
 
   // Restore the config's saved model selections (see applyConfig): stashed so
@@ -478,6 +687,8 @@ async function populateMosaicModelDropdowns() {
   if (typeof window !== 'undefined') delete window._pendingMosaicModels;
   fill(detSel, data.detection, _saved.det);
   fill(restSel, data.restoration, _saved.rest);
+  _mmLastModelData = data;                       // T20b: for the Manage Models button colour
+  _updateManageModelsButton();
   updateMaxClipConstraints();
   _updateRestorationButtonStates();
   // Engine availability just refreshed → recompute which controls are inert
@@ -527,22 +738,36 @@ function gatherMosaicParams() {
       mosaic_censor: document.getElementById('ctrlMosaicCensor').checked,
       mosaic_censor_block: parseInt(document.getElementById('ctrlMosaicCensorBlock').value) || 16,
       mosaic_max_clip_size: parseInt(document.getElementById('ctrlMosaicMaxClip').value),
+      // CM-213: overlap + crossfade at Max Clip cuts (blend_frames stays auto = overlap / 3)
+      mosaic_temporal_overlap: parseInt((document.getElementById('ctrlMosaicOverlap') || {}).value || '0', 10) || 0,
+      mosaic_crossfade: !!((document.getElementById('ctrlMosaicCrossfade') || {}).checked),
       mosaic_restoration_fp16: document.getElementById('ctrlMosaicRestFp16').checked,
       mosaic_roi_dilate: parseInt(document.getElementById('ctrlMosaicRoiDilate').value),
+      mosaic_crop_cap: parseInt((document.getElementById('ctrlMosaicCropCap') || {}).value || '0', 10) || 0,   // CM-227
       mosaic_feather_radius: parseInt(document.getElementById('ctrlMosaicFeather').value),
       mosaic_blend_mask: document.getElementById('ctrlMosaicBlendMask').value,
       mosaic_use_seg_masks: document.getElementById('ctrlMosaicSegMasks').checked,
+      mosaic_residual_scan: document.getElementById('ctrlMosaicResidualScan').checked,   // CM-205
       mosaic_restoration_trt: document.getElementById('ctrlMosaicRestTrt').checked,
       // CM-077: secondary restoration (RTX Super-Res upscale before paste-back)
       mosaic_secondary: ((document.getElementById('ctrlMosaicSecondary') || {}).value || 'none'),
       // CM-146 (Batch 70): Maxine denoise pass chained after the RTX upscale
       mosaic_secondary_denoise: ((document.getElementById('ctrlMosaicSecondaryDenoise') || {}).value || 'none'),
+      // CM-217: Maxine Super-Res quality level (RTX modes)
+      mosaic_secondary_quality: ((document.getElementById('ctrlMosaicSecondaryQuality') || {}).value || 'high'),
       mosaic_temporal_stability: parseInt((document.getElementById('ctrlMosaicTemporalFix') || {}).value || '0', 10) || 0,
       // CM-084 (Batch 38): FrameStore backend (auto | device | host)
       mosaic_store_backend: ((document.getElementById('ctrlStoreBackend') || {}).value || 'auto'),
+      // T20d (CM-234): Hardware decode on the ffmpeg lane (auto | off)
+      mosaic_hw_decode: ((document.getElementById('ctrlHwDecode') || {}).value || 'auto'),
       // CM-202 (GitHub #10): output suffix + the run-files switch
       mosaic_output_suffix: (document.getElementById('ctrlOutputSuffix') ? document.getElementById('ctrlOutputSuffix').value : '-restored'),
       mosaic_run_report: ((document.getElementById('ctrlRunReport') || {}).value || ''),
+      // CM-219/CM-228: Output Upscale (none | 2x | 4x | 1080p | 1440p | 2160p), Encoder section
+      mosaic_output_upscale: ((document.getElementById('ctrlOutputUpscale') || {}).value || 'none'),
+      // CM-228: the whole-frame scaler and the upscale-only mode
+      mosaic_upscale_scaler: ((document.getElementById('ctrlUpscaleScaler') || {}).value || 'esrgan'),
+      mosaic_upscale_only: _upscaleModeOn(),
     },
     encoder: {
       codec: document.getElementById('ctrlCodec').value,
@@ -557,6 +782,15 @@ function buildMosaicParamsSummary() {
   const p = gatherMosaicParams();
   const m = p.mosaic;
   const parts = [];
+  if (m.mosaic_upscale_only) {
+    // CM-228: no detector, no restorer -- the summary says only what runs
+    parts.push('UPSCALE ONLY');
+    parts.push(`Enc: ${p.encoder.codec.toUpperCase()}/${p.encoder.preset}/QP${p.encoder.qp}`);
+    parts.push((m.mosaic_output_upscale && m.mosaic_output_upscale !== 'none')
+      ? `Upscale:${m.mosaic_output_upscale}/${_scalerTag(m.mosaic_upscale_scaler)}`
+      : 'Upscale:off (re-encode)');
+    return parts.join(' · ');
+  }
   const detName = document.getElementById('ctrlMosaicDetModel').selectedOptions[0]?.textContent || '—';
   parts.push(`Det: ${detName}`);
   parts.push(`Score: ${m.mosaic_detection_score.toFixed(2)}`);
@@ -566,17 +800,23 @@ function buildMosaicParamsSummary() {
     const restName = document.getElementById('ctrlMosaicRestModel').selectedOptions[0]?.textContent || '—';
     parts.push(`Rest: ${restName}`);
     parts.push(`Clip: ${m.mosaic_max_clip_size}`);
+    if (m.mosaic_temporal_overlap > 0) {
+      parts.push(`Overlap:${m.mosaic_temporal_overlap}${m.mosaic_crossfade ? '+xf' : ''}`);   // CM-213
+    }
     parts.push(m.mosaic_restoration_fp16 ? 'FP16' : 'FP32');
     parts.push(m.mosaic_restoration_trt ? 'TRT' : 'PyTorch');
     // Batch 73: surface the scaler + denoise in the progress-modal summary.
     // Field case 2026-09-01: three denoise A/B runs went out with denoise
     // silently defaulting to none and nothing on screen said so.
     if (m.mosaic_secondary && m.mosaic_secondary !== 'none') {
-      parts.push(`Scaler:${m.mosaic_secondary}`
+      parts.push(`Scaler:${m.mosaic_secondary.startsWith('custom:') ? _scalerTag(m.mosaic_secondary) : m.mosaic_secondary}`
+        + ((m.mosaic_secondary.startsWith('rtx') && m.mosaic_secondary_quality && m.mosaic_secondary_quality !== 'high')
+           ? `/${m.mosaic_secondary_quality}` : '')   // CM-217: only when off the High default
         + ((m.mosaic_secondary_denoise && m.mosaic_secondary_denoise !== 'none')
            ? `+dn:${m.mosaic_secondary_denoise}` : ''));
     }
-    if (m.mosaic_roi_dilate > 0) parts.push(`Dilate:${m.mosaic_roi_dilate}`);
+    if (m.mosaic_roi_dilate > 0) parts.push(`Margin:${m.mosaic_roi_dilate}`);
+    if (m.mosaic_crop_cap > 0) parts.push(`CropCap:${m.mosaic_crop_cap}`);   // CM-227: only when on
     if (m.mosaic_blend_mask && m.mosaic_blend_mask !== 'none') parts.push(`Blend:${m.mosaic_blend_mask}`);
     // Feather only takes effect with the facefusion blend mask — only surface
     // it in the summary when it's actually active, so it can't read as "on"
@@ -586,11 +826,29 @@ function buildMosaicParamsSummary() {
     }
   }
   parts.push(`Enc: ${p.encoder.codec.toUpperCase()}/${p.encoder.preset}/QP${p.encoder.qp}`);
+  if (m.mosaic_output_upscale && m.mosaic_output_upscale !== 'none' && !m.mosaic_mask_preview && !m.mosaic_censor) {
+    parts.push(`Upscale:${m.mosaic_output_upscale}`
+      + (m.mosaic_upscale_scaler === 'rtx' ? '/rtx'
+         : (String(m.mosaic_upscale_scaler || '').startsWith('custom:') ? '/' + _scalerTag(m.mosaic_upscale_scaler) : '')));   // CM-219/CM-228/CM-229
+  }
   return parts.join(' · ');
 }
 
 
 // ── Button enable logic for Restoration mode ──────────────
+
+// CM-229: a short tag for the summary line -- 'rtx', 'esrgan', or the custom file's stem
+function _scalerTag(v) {
+  const s = String(v || '');
+  if (s === 'rtx') return 'rtx';
+  if (s.startsWith('custom:')) return s.slice(7).replace(/\.[^.]+$/, '');
+  return 'esrgan';
+}
+
+function _upscaleModeOn() {
+  // CM-228 / T17: the Upscale alternate execution mode (no detector, no restorer)
+  return !!document.getElementById('ctrlMosaicUpscale')?.checked;
+}
 
 function _updateRestorationButtonStates() {
   const hasVideo = !!state.videoPath;
@@ -598,29 +856,55 @@ function _updateRestorationButtonStates() {
   const restModel = document.getElementById('ctrlMosaicRestModel').value;
   const maskPreview = document.getElementById('ctrlMosaicMaskPreview').checked;
   const censor = document.getElementById('ctrlMosaicCensor').checked;
+  const upscale = _upscaleModeOn();
   // Censor and Mask Preview both skip restoration, so they only need a
-  // detection model; normal restore needs a restoration model.
-  const hasModels = detModel && (maskPreview || censor || restModel);
+  // detection model; normal restore needs a restoration model; Upscale
+  // (T17) needs no model at all.
+  const hasModels = upscale || (detModel && (maskPreview || censor || restModel));
   const hasSegment = state.segmentEndTime > state.segmentStartTime;
   const inPreview = state.previewMode || false;
+  // T17: a segment preview on screen can be saved as a file from the & Save button
+  const canSaveSegment = inPreview && !!state.previewReady && !!state.previewSegment;
 
   const restoreBtn = document.getElementById('restoreBtn');
   const restoreSaveBtn = document.getElementById('restoreSaveBtn');
   const restorePreviewBtn = document.getElementById('restorePreviewBtn');
+  const testFrameBtn = document.getElementById('restoreDetectBtn');
 
   // A missing TRT engine no longer blocks Restore — the submit-time modal
   // offers Continue-on-PyTorch or Manage Models. So buttons key off video +
   // models (+ segment) only.
-  // Restore (segment scope): needs video + models + segment marked.
+  // Restore / Upscale (segment scope): needs video + models + segment marked.
   if (restoreBtn) {
     restoreBtn.disabled = !hasVideo || !hasModels || !hasSegment || inPreview;
     restoreBtn.title = '';
+    restoreBtn.textContent = upscale ? 'Upscale' : 'Restore';   // T17
   }
 
-  // Restore & Save (full video): only needs video + models.
+  // Restore & Save / Upscale & Save (full video): only needs video + models.
+  // In a segment preview it becomes Save Segment (T17).
   if (restoreSaveBtn) {
-    restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview;
-    restoreSaveBtn.title = '';
+    if (canSaveSegment) {
+      restoreSaveBtn.disabled = false;
+      restoreSaveBtn.textContent = 'Save Segment';
+      restoreSaveBtn.title = 'Save the previewed segment to the output folder (no re-encode); start-end times go into the file name';
+    } else {
+      restoreSaveBtn.disabled = !hasVideo || !hasModels || inPreview;
+      restoreSaveBtn.title = '';
+      restoreSaveBtn.textContent = upscale ? 'Upscale & Save' : 'Restore & Save';
+    }
+  }
+
+  // T17: Test Frame restores one frame -- it means nothing in Upscale mode.
+  if (testFrameBtn) {
+    const busy = (typeof _foiRunning !== 'undefined') && _foiRunning;
+    if (upscale) {
+      testFrameBtn.disabled = true;
+      testFrameBtn.title = 'Test Frame does not apply in Upscale mode (nothing is detected or restored). Mark a segment and use Upscale, then Preview.';
+    } else if (!busy) {
+      testFrameBtn.disabled = false;
+      testFrameBtn.title = 'Process the current playhead frame with the current settings — restores a short window around it and shows each detected region (Mosaic vs Restored) so you can judge before a full run';
+    }
   }
 
   // Add Mosaic: active whenever a video is loaded; inactive only while an
@@ -668,6 +952,7 @@ function _setCtrlEnabled(el, enabled) {
 }
 
 function _updateControlEnableStates() {
+  _updateManageModelsButton();   // T20b: Image Size / Use Tensor changed -> the button's colour may
   // Feather only applies with Blend Mask = Face Swap (internal value
   // "facefusion" kept for saved-config compat; the legacy "none" mask
   // has no feather parameter). Gray it out under None so it can't read as on.
@@ -729,6 +1014,31 @@ function _updateControlEnableStates() {
   const sbsOn = !!(sbsEl && sbsEl.checked);
   _setCtrlEnabled(vrpEl, sbsOn);
   if (vrpEl) vrpEl.title = sbsOn ? '' : 'Enable Split SBS to use VR Projection.';
+
+  _applyUpscaleModeGreying();   // T17: last, so it wins over the per-control rules above
+}
+
+// T17 (CM-228): in Upscale mode nothing is detected or restored, so the
+// Detection and Restoration sections grey out -- except the rows the scaler
+// still reads. Controls greyed here are tagged so leaving the mode restores
+// exactly them and nothing the rules above decided.
+const _UPSCALE_LIVE_IDS = new Set(['ctrlOutputUpscale', 'ctrlUpscaleScaler',
+                                   'ctrlMosaicSecondaryQuality', 'ctrlMosaicSecondaryDenoise']);
+function _applyUpscaleModeGreying() {
+  const on = _upscaleModeOn();
+  ['sectMosaicDetection', 'sectMosaicRestoration'].forEach(sid => {
+    const sect = document.getElementById(sid);
+    if (!sect) return;
+    sect.querySelectorAll('input, select, button').forEach(el => {
+      if (!el.id || _UPSCALE_LIVE_IDS.has(el.id)) return;
+      if (on) {
+        if (!el.disabled) { el.dataset.upscaleGrey = '1'; _setCtrlEnabled(el, false); }
+      } else if (el.dataset.upscaleGrey === '1') {
+        delete el.dataset.upscaleGrey;
+        _setCtrlEnabled(el, true);
+      }
+    });
+  });
 }
 
 // Wrap the face-swap _updateButtonStates so any call updates both modes.
@@ -760,6 +1070,7 @@ if (typeof loadVideo === 'function') {
   loadVideo = async function _loadVideoWrapped(path) {
     const result = await _origLoadVideo(path);
     _updateRestorationButtonStates();
+    if (typeof populateCustomScalers === 'function') populateCustomScalers();   // CM-229: pick up new files
     return result;
   };
   window.loadVideo = loadVideo;
@@ -772,22 +1083,26 @@ if (typeof loadVideo === 'function') {
 (function _wireModeExclusivity() {
   const censor = document.getElementById('ctrlMosaicCensor');
   const preview = document.getElementById('ctrlMosaicMaskPreview');
+  const upscale = document.getElementById('ctrlMosaicUpscale');   // T17
+  const refresh = () => { _updateControlEnableStates(); _updateRestorationButtonStates(); };
   if (censor) censor.addEventListener('change', () => {
-    if (censor.checked && preview) preview.checked = false;
-    _updateControlEnableStates();
-    _updateRestorationButtonStates();
+    if (censor.checked) { if (preview) preview.checked = false; if (upscale) upscale.checked = false; }
+    refresh();
   });
   if (preview) preview.addEventListener('change', () => {
-    if (preview.checked && censor) censor.checked = false;
-    _updateControlEnableStates();
-    _updateRestorationButtonStates();
+    if (preview.checked) { if (censor) censor.checked = false; if (upscale) upscale.checked = false; }
+    refresh();
+  });
+  if (upscale) upscale.addEventListener('change', () => {
+    if (upscale.checked) { if (censor) censor.checked = false; if (preview) preview.checked = false; }
+    refresh();
   });
 })();
 
 
 // Re-check on relevant changes
 ['ctrlMosaicDetModel', 'ctrlMosaicRestModel', 'ctrlMosaicMaskPreview',
- 'ctrlMosaicCensor'].forEach(id => {
+ 'ctrlMosaicCensor', 'ctrlMosaicUpscale'].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateRestorationButtonStates);
 });
@@ -795,8 +1110,9 @@ if (typeof loadVideo === 'function') {
 // Controls whose value changes which OTHER controls are inert → recompute
 // enable/disable state. (Blend Mask → Feather; Mask Preview → colour/opacity;
 // Add Mosaic → Block; Det Use Tensor / Det Model → Det FP16.)
-['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicCensor',
- 'ctrlMosaicDetTrt', 'ctrlMosaicDetModel', 'ctrlMosaicSbsSplit'].forEach(id => {
+['ctrlMosaicBlendMask', 'ctrlMosaicMaskPreview', 'ctrlMosaicCensor', 'ctrlMosaicUpscale',
+ 'ctrlMosaicDetTrt', 'ctrlMosaicDetModel', 'ctrlMosaicSbsSplit',
+ 'ctrlMosaicDetImgsz'].forEach(id => {       // T20b: Image Size decides the Manage Models button colour
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', _updateControlEnableStates);
 });
@@ -832,6 +1148,33 @@ if (_restTrtEl) _restTrtEl.addEventListener('change', updateMaxClipConstraints);
     const row = el.closest('.ctrl-row');
     if (row) row.style.display = 'none';
   });
+  // CM-228: Maxine is NVIDIA-only -- off-CUDA the Upscale Scaler has one
+  // honest choice; drop the RTX option so a loaded settings file cannot
+  // select it (the pipeline would fall back and say so, but why ask).
+  const sc = document.getElementById('ctrlUpscaleScaler');
+  if (sc) {
+    Array.from(sc.options).forEach(o => { if (o.value === 'rtx') o.remove(); });
+    sc.value = 'esrgan';
+  }
+  // T20b: the same for the Secondary -- RTX Super-Res 2x/4x cannot exist off-CUDA, and
+  // the recommended default is now a scaler, so the markup's rtx-4x becomes esrgan-4x
+  // here (the server's default-config route hands out esrgan-4x for this edition too).
+  const sec = document.getElementById('ctrlMosaicSecondary');
+  if (sec) {
+    const wasRtx = String(sec.value).startsWith('rtx');
+    Array.from(sec.options).forEach(o => { if (String(o.value).startsWith('rtx')) o.remove(); });
+    if (wasRtx || !sec.value) sec.value = 'esrgan-4x';
+  }
+  // T20a/T20b: Manage Models' compile section is TensorRT, i.e. NVIDIA-only. Off-CUDA
+  // a press launched -compile-det and died in the log. Greyed, not hidden (Gman,
+  // 09-23): the section exists and is not yours yet; the note under it says why.
+  const cs = document.getElementById('mmCompileSection');
+  if (cs) {
+    cs.classList.add('mm-inert');
+    cs.querySelectorAll('input, button, select').forEach(el => { el.disabled = true; });
+  }
+  const nc = document.getElementById('mmNoCompileNote');
+  if (nc) nc.classList.remove('mm-hidden');
 })();
 
 
@@ -933,6 +1276,10 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
   // (PyTorch for that stage) or Manage Models (abort).
   const gate = await checkTensorBeforeRun();
   if (!gate.proceed) { _updateRestorationButtonStates(); return; }
+  // CM-236: the VRAM preflight, before the run (levers change the panel; re-gather).
+  const vgate = await checkVramBeforeRun(params, null, document.getElementById('restoreBtn'));
+  if (!vgate.proceed) { if (!vgate.busy) _updateRestorationButtonStates(); return; }   // T23d: busy = a check is already running; leave its button alone
+  if (vgate.applied) { const _re = gatherMosaicParams(); params.mosaic = _re.mosaic; params.encoder = _re.encoder; params.panel = _re.panel; }
   if (gate.override) {
     if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
     if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
@@ -970,6 +1317,7 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
       progressEta.textContent = '';
       progressCancel.textContent = 'Close';
       state.previewReady = true;
+      state.previewSegment = { start: startTime, end: endTime };   // T17: Save Segment applies
       _updateRestorationButtonStates();
     },
     onError: (prog) => {
@@ -980,6 +1328,7 @@ document.getElementById('restoreBtn').addEventListener('click', async () => {
         progressPercent.textContent =
           `${prog.detections || 0} det, ${prog.restorations || 0} res`;
         state.previewReady = true;
+        state.previewSegment = { start: startTime, end: endTime, partial: true };
       } else {
         progressTitle.textContent = prog.status === 'error' ? 'Error' : 'Cancelled';
         progressPercent.textContent = prog.error || 'No frames processed';
@@ -1011,6 +1360,13 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
     return;
   }
 
+  // T17: while watching a SEGMENT preview this button is "Save Segment" --
+  // copy the previewed file into the output folder, no re-encode.
+  if (state.previewMode && state.previewReady && state.previewSegment) {
+    await _saveSegment();
+    return;
+  }
+
   // Exit any preview mode
   if (state.previewMode && typeof previewBtn !== 'undefined') {
     previewBtn.click();
@@ -1022,6 +1378,10 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
   // Verify TRT engines at submit time (see segment handler).
   const gate = await checkTensorBeforeRun();
   if (!gate.proceed) { _updateRestorationButtonStates(); return; }
+  // CM-236: the VRAM preflight, before the run (levers change the panel; re-gather).
+  const vgate = await checkVramBeforeRun(params, null, document.getElementById('restoreSaveBtn'));
+  if (!vgate.proceed) { if (!vgate.busy) _updateRestorationButtonStates(); return; }   // T23d: busy = a check is already running; leave its button alone
+  if (vgate.applied) { const _re = gatherMosaicParams(); params.mosaic = _re.mosaic; params.encoder = _re.encoder; params.panel = _re.panel; }
   if (gate.override) {
     if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
     if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
@@ -1049,14 +1409,20 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
   const pollInterval = _pollMosaicProgress({
     onComplete: (prog) => {
       clearInterval(pollInterval);
-      progressTitle.textContent = 'Complete!';
+      // T20c: a completed run with warnings (CM-186 guard hits, stabilizer windows
+      // skipped) says so here -- "Complete!" over 401 refused frames was a lie (09-23)
+      const _warns = Array.isArray(prog.warnings) ? prog.warnings : [];
+      progressTitle.textContent = _warns.length ? `Complete \u2014 with ${_warns.length} warning${_warns.length > 1 ? 's' : ''}` : 'Complete!';
       progressPercent.textContent =
-        `Done — ${prog.frame} frames, ${prog.detections || 0} det, ${prog.restorations || 0} res`;
+        `Done \u2014 ${prog.frame} frames, ${prog.detections || 0} det, ${prog.restorations || 0} res`
+        + (_warns.length ? '\n\u26a0 ' + _warns.join('\n\u26a0 ') : '');
+      if (_warns.length) { progressPercent.style.whiteSpace = 'pre-line'; progressPercent.style.textAlign = 'left'; }
       progressBar.style.width = '100%';
       progressCancel.textContent = 'Close';
       // Server pointed preview at the full output — enable Preview so clicking
       // it plays the completed file (same mechanism as segment preview).
       state.previewReady = true;
+      state.previewSegment = null;          // T17: already saved; no Save Segment
       _updateRestorationButtonStates();
       console.log('[ChitraMaya] Restore & Save complete:', prog);
     },
@@ -1243,6 +1609,13 @@ document.getElementById('restoreSaveBtn').addEventListener('click', async () => 
     // Same TRT-engine gate as the single-file runs.
     const gate = await checkTensorBeforeRun();
     if (!gate.proceed) { return; }
+    // CM-236: the VRAM preflight over the whole plan (largest file decides).
+    const vgate = await checkVramBeforeRun(params, params.files, startBtn);
+    if (!vgate.proceed) { return; }
+    if (vgate.applied) {
+      const _re = gatherMosaicParams();
+      params.mosaic = _re.mosaic; params.encoder = _re.encoder; params.panel = _re.panel;
+    }
     if (gate.override) {
       if (gate.override.det) params.mosaic.mosaic_detection_trt = false;
       if (gate.override.rest) params.mosaic.mosaic_restoration_trt = false;
@@ -1344,6 +1717,7 @@ document.getElementById('restorePreviewBtn').addEventListener('click', () => {
     btn.textContent = '◀ Back';
     btn.classList.remove('highlight');
     btn.classList.add('primary');
+    _updateRestorationButtonStates();   // T17: & Save -> Save Segment
     console.log('[ChitraMaya] Entered restoration Preview mode');
   } else {
     // Exit preview — switch back to original video
@@ -1359,9 +1733,39 @@ document.getElementById('restorePreviewBtn').addEventListener('click', () => {
     btn.textContent = 'Preview';
     btn.classList.remove('primary');
     if (state.previewReady) btn.classList.add('highlight');
+    _updateRestorationButtonStates();   // T17: back to Restore/Upscale & Save
     console.log('[ChitraMaya] Exited restoration Preview mode');
   }
 });
+
+// T17: Save Segment -- the previewed segment file goes to the output folder
+// under <stem><suffix>-<start>-<end>.mp4; the server copies, no re-encode.
+async function _saveSegment() {
+  const seg = state.previewSegment;
+  if (!seg) return;
+  const btn = document.getElementById('restoreSaveBtn');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const params = gatherMosaicParams();
+    const res = await apiPost('/api/save-segment', {
+      start_time: seg.start, end_time: seg.end,
+      output_dir: params.output_dir || '',
+      params,
+    });
+    if (res && res.status === 'ok') {
+      console.log('[ChitraMaya] Segment saved:', res.output);
+      alert(`Saved ${res.name}\nin ${res.folder}`);
+    } else {
+      alert('Could not save the segment: ' + ((res && (res.error || res.message)) || 'unknown error'));
+    }
+  } catch (e) {
+    alert('Could not save the segment: ' + e);
+  } finally {
+    if (btn) { btn.textContent = oldText; }
+    _updateRestorationButtonStates();
+  }
+}
 
 
 // (restoreDetectBtn is repurposed as the "Test Frame N" trigger — wired in the
@@ -1385,9 +1789,24 @@ async function mmPopulateList() {
   const data = await apiGet('/api/list-mosaic-models');
   if (!data || data.error) { el.textContent = 'Failed to list models.'; return; }
   _mmModels = [];
-  (data.detection || []).forEach(m =>
+  (data.detection || []).forEach(m => {
+    // CM-203: say what the engine on disk accepts. The run clamps the
+    // Detection Batch to this; the badge is where the user learns it.
+    let detail = '';
+    if (m.has_engine) {
+      // CM-218: one badge entry per compiled flavor: imgsz/bN (fp32, * = legacy file).
+      if (Array.isArray(m.engine_flavors) && m.engine_flavors.length) {
+        detail = m.engine_flavors.map(f => f.label).join(', ');
+      } else {
+        const parts = [];
+        if (m.engine_imgsz) parts.push('imgsz ' + m.engine_imgsz);
+        if (m.engine_max_batch) parts.push('batch 1..' + m.engine_max_batch);
+        detail = parts.join(', ');
+      }
+    }
     _mmModels.push({ path: m.path, label: m.label, kind: 'det',
-                     compiled: !!m.has_engine, detail: '' }));
+                     compiled: !!m.has_engine, detail });
+  });
   (data.restoration || []).forEach(m => {
     // v1.60 (CM-104): a usable set serves ANY clip length. Badge wording:
     // canonical fixed-batch set = "any clip length"; legacy ladder files =
@@ -1416,9 +1835,13 @@ function mmRenderList() {
     mmUpdateControls();
     return;
   }
+  // T20a: off-CUDA there is nothing to compile -- "Not compiled" read as a fault
+  const _edMM = document.documentElement.dataset.edition || '';
   const badge = (ok, detail) =>
-    `<span class="mm-badge ${ok ? 'mm-ok' : 'mm-no'}">`
-    + (ok ? ('Compiled' + (detail ? ' · ' + detail : '')) : 'Not compiled') + '</span>';
+    (_edMM && _edMM !== 'cuda')
+      ? '<span class="mm-badge mm-ok">PyTorch (this edition)</span>'
+      : `<span class="mm-badge ${ok ? 'mm-ok' : 'mm-no'}">`
+        + (ok ? ('Compiled' + (detail ? ' \u00b7 ' + detail : '')) : 'Not compiled') + '</span>';
   el.innerHTML = _mmModels.map(m => {
     const sel = _mmSelected.has(m.path) ? ' mm-selected' : '';
     const ext = m.kind === 'det' ? '.pt detection' : '.pth restoration';
@@ -1440,8 +1863,11 @@ function mmRenderList() {
 function mmUpdateControls() {
   const btn = document.getElementById('mmCompile');
   const n = _mmSelected.size;
+  // T20b: off-CUDA the whole compile section is inert; the button stays disabled
+  const _cs = document.getElementById('mmCompileSection');
+  const _inert = !!(_cs && _cs.classList.contains('mm-inert'));
   if (btn && !btn.classList.contains('mm-compiling')) {
-    btn.disabled = n === 0;
+    btn.disabled = _inert || n === 0;
     btn.textContent = `Compile (${n} selected)`;
   }
   // Image Size applies to detection, Max Clip to restoration. Dim the slider
@@ -1478,8 +1904,12 @@ function _mmStartPolling() {
     if (!s.running) {
       clearInterval(_mmPoll); _mmPoll = null;
       _mmSetCompiling(false);
+      _mmSelected.clear();                     // T20b: every compile starts from an empty pick
       mmPopulateList();                        // Manage Models badges refresh
-      if (typeof populateMosaicModelDropdowns === 'function') populateMosaicModelDropdowns();  // Control Panel dropdowns + engine caches
+      if (typeof populateMosaicModelDropdowns === 'function') {                                  // Control Panel dropdowns + engine caches
+        Promise.resolve(populateMosaicModelDropdowns()).catch(() => {})
+          .then(() => { if (typeof populateCustomScalers === 'function') populateCustomScalers(); });   // CM-229, after
+      }
     }
   }, 1000);
 }
@@ -1501,10 +1931,11 @@ async function mmCompile() {
   const force = document.getElementById('mmForce').checked;
   _mmSetCompiling(true);
   if (log) log.textContent = 'Starting…';
-  // CM-201: the detector engine's batch profile follows the panel's
-  // Detection Batch (shapes that never run are VRAM thrown away).
-  const detBatchEl = document.getElementById('ctrlMosaicDetBatch');
-  const maxBatch = Math.max(1, parseInt(detBatchEl ? detBatchEl.value : '4', 10) || 4);
+  // CM-201 / T20a: the detector engine's batch profile is the modal's own
+  // Detection Batch slider (2..16). It USED to follow the panel's run-time
+  // slider silently -- a 640/b4 engine came out of a compile the user
+  // expected to be b8 (clean-machine test, 09-23). Nothing hidden now.
+  const maxBatch = _mmDetBatchValue();
   const res = await apiPost('/api/compile-engines',
     { models: [..._mmSelected], imgsz, max_clip: maxClip, force, max_batch: maxBatch });
   if (!res || res.error) {
@@ -1516,13 +1947,19 @@ async function mmCompile() {
 }
 
 async function openManageModels() {
+  mmSyncDetBatchHint();   // CM-203: settings may have been loaded after the dial listener
   const modal = document.getElementById('manageModelsModal');
   if (!modal) return;
   modal.classList.remove('hidden');
   await mmLoadSources();
   await mmPopulateList();
+  await mmUpPopulate();          // CM-232: custom scalers
+  await mmStdRefresh();          // CM-232: standard set status
   // Resume whichever background job is still running server-side (either, not
-  // both — they can't run concurrently). Check compile first, then download.
+  // both — they can't run concurrently). Standard job first (it owns the other
+  // two while it runs), then compile, then download.
+  const ss = await apiGet('/api/standard-models');
+  if (ss && ss.job && ss.job.running) { _mmStdStartPolling(); return; }
   const cs = await apiGet('/api/compile-log');
   if (cs && cs.running) {
     const log = document.getElementById('mmLog');
@@ -1737,18 +2174,196 @@ async function mmDownload() {
 // Slider readouts — self-contained (kept out of the config system).
 // (mmMaxClip removed in v1.60 — engines are clip-size independent; the
 // forEach tolerates the missing element either way.)
-['mmImgsz', 'mmMaxClip'].forEach(id => {
+['mmImgsz', 'mmMaxClip', 'mmDetBatch'].forEach(id => {
   const dial = document.getElementById(id);
   const val = document.getElementById(id + 'Val');
   if (dial && val) { const upd = () => { val.textContent = dial.value; }; dial.addEventListener('input', upd); upd(); }
 });
+// CM-232: the standard-set status is per flavor (Image Size x Detection Batch)
+(function _wireStdFlavorRefresh() {
+  const modal = document.getElementById('manageModelsModal');
+  const refresh = () => { if (modal && !modal.classList.contains('hidden') && typeof mmStdRefresh === 'function') mmStdRefresh(); };
+  ['mmImgsz', 'mmDetBatch'].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', refresh); });
+})();
+
+// CM-203: the compile section shows the batch the next detector engine
+// will be built for -- the panel's Detection Batch, live.
+function mmSyncDetBatchHint() {
+  // T20a: the modal has its own Detection Batch slider (mmDetBatch); the
+  // panel's run-time slider no longer drives the compile. Kept as a no-op
+  // for the callers that still name it.
+}
+
+// ── CM-232: Standard models (one button) ───────────────────
+// Four files every install needs; on NVIDIA their engines too. The server
+// sequences the existing download + compile jobs; we poll /api/standard-models
+// for step / stage / combined log and show Done as a health check.
+let _mmStdPoll = null;
+function _mmDetBatchValue() {
+  const el = document.getElementById('mmDetBatch');
+  return Math.max(1, parseInt(el ? el.value : '8', 10) || 8);
+}
+function _mmStdFlavor() {
+  const imgsz = parseInt((document.getElementById('mmImgsz') || {}).value || '640', 10) || 640;
+  return { imgsz, max_batch: _mmDetBatchValue() };
+}
+function _mmStdRender(st) {
+  const list = document.getElementById('mmStdList');
+  const status = document.getElementById('mmStdStatus');
+  const btn = document.getElementById('mmStdRun');
+  if (!list || !st) return;
+  const compiles = !!st.compiles;
+  list.innerHTML = (st.models || []).map(m => {
+    let badge;
+    if (!m.present) badge = '<span class="mm-badge mm-no">Not downloaded</span>';
+    else if (!compiles) badge = '<span class="mm-badge mm-ok">Downloaded</span>';
+    else if (m.compiled) badge = '<span class="mm-badge mm-ok">Compiled' + (m.flavors && m.flavors.length ? ' · ' + m.flavors.join(', ') : '') + '</span>';
+    else badge = '<span class="mm-badge mm-no">Downloaded · not compiled for this flavor</span>';
+    return `<div class="mm-row"><span class="mm-name">${m.label} <span class="mm-ext">${m.file}</span></span>${badge}</div>`;
+  }).join('');
+  const job = st.job || {};
+  const done = st.all_present && (!compiles || st.all_compiled);
+  if (btn) {
+    btn.disabled = !!job.running;
+    btn.textContent = job.running ? `\u23f3 ${job.step}/${job.total}\u2026`
+                    : (done ? '\u2713 Done \u2014 check again' : 'Get the standard models');
+  }
+  if (status) {
+    if (job.running) status.textContent = job.stage || 'working\u2026';
+    else if (done) status.textContent = compiles
+      ? `All four present and compiled for ${_mmStdFlavor().imgsz}/b${_mmStdFlavor().max_batch}.`
+      : 'All four present (no engines on this edition).';
+    else if (job.done === false) status.textContent = job.stage || 'finished with problems (see the log)';
+    else {
+      const miss = (st.models || []).filter(m => !m.present).length;
+      const unc = (st.models || []).filter(m => m.present && !m.compiled).length;
+      status.textContent = (miss ? `${miss} to download` : '') + (miss && compiles && unc ? ', ' : '')
+        + (compiles && unc ? `${unc} to compile for ${_mmStdFlavor().imgsz}/b${_mmStdFlavor().max_batch}` : '');
+    }
+  }
+}
+async function mmStdRefresh() {
+  const f = _mmStdFlavor();
+  const st = await apiGet(`/api/standard-models?imgsz=${f.imgsz}&max_batch=${f.max_batch}`);
+  if (!st || st.error) { const l = document.getElementById('mmStdList'); if (l) l.textContent = 'Could not check the standard models.'; return null; }
+  _mmStdRender(st);
+  return st;
+}
+function _mmStdStartPolling() {
+  const log = document.getElementById('mmLog');
+  if (_mmStdPoll) clearInterval(_mmStdPoll);
+  _mmStdPoll = setInterval(async () => {
+    const st = await mmStdRefresh();
+    if (!st) return;
+    if (log && st.log) { log.textContent = st.log; log.scrollTop = log.scrollHeight; }
+    if (!(st.job && st.job.running)) {
+      clearInterval(_mmStdPoll); _mmStdPoll = null;
+      mmPopulateList();
+      if (typeof populateMosaicModelDropdowns === 'function') {
+        Promise.resolve(populateMosaicModelDropdowns()).catch(() => {})
+          .then(() => { if (typeof populateCustomScalers === 'function') populateCustomScalers(); });
+      }
+    }
+  }, 1000);
+}
+async function mmStdRun() {
+  const log = document.getElementById('mmLog');
+  if (_mmPoll || _mmDlPoll) {
+    if (log) log.textContent = 'A compile or download is running \u2014 wait for it to finish first.';
+    return;
+  }
+  const f = _mmStdFlavor();
+  const endpoint = (document.getElementById('mmEndpoint') || {}).value || undefined;
+  if (log) log.textContent = 'Starting\u2026';
+  const res = await apiPost('/api/standard-models/run', { imgsz: f.imgsz, max_batch: f.max_batch, endpoint });
+  if (!res || res.error) { if (log) log.textContent = (res && res.error) || 'Could not start.'; return; }
+  _mmStdStartPolling();
+}
+
+// ── CM-232: Custom scalers (models/upscalers) ──────────────
+let _mmUpModels = [];
+let _mmUpSelected = null;
+function _mmUpRender() {
+  const el = document.getElementById('mmUpList');
+  const rm = document.getElementById('mmUpRemove');
+  if (!el) return;
+  if (!_mmUpModels.length) {
+    el.innerHTML = '<div class="mm-empty">No custom scalers. Add\u2026 a .pth / .safetensors super-resolution model, or drop one into models/upscalers and Rescan.</div>';
+    _mmUpSelected = null;
+    if (rm) rm.disabled = true;
+    return;
+  }
+  el.innerHTML = _mmUpModels.map(m => {
+    const sel = _mmUpSelected === m.file ? ' mm-selected' : '';
+    const detail = `${m.name || m.arch} ${m.scale}x \u00b7 ${m.half ? 'fp16' : 'fp32'}` + (m.size_mb ? ` \u00b7 ${m.size_mb} MB` : '');
+    const badge = m.slow ? '<span class="mm-badge mm-no">slow (attention model)</span>' : '<span class="mm-badge mm-ok">ready</span>';
+    return `<div class="mm-row${sel}" data-file="${encodeURIComponent(m.file)}">`
+      + `<span class="mm-name">${m.file} <span class="mm-ext">${detail}</span></span>${badge}</div>`;
+  }).join('');
+  el.querySelectorAll('.mm-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const f = decodeURIComponent(row.dataset.file);
+      _mmUpSelected = _mmUpSelected === f ? null : f;
+      el.querySelectorAll('.mm-row').forEach(r => r.classList.toggle('mm-selected', decodeURIComponent(r.dataset.file) === _mmUpSelected));
+      if (rm) rm.disabled = !_mmUpSelected;
+    });
+  });
+  if (rm) rm.disabled = !_mmUpSelected;
+}
+async function mmUpPopulate(rescan) {
+  const el = document.getElementById('mmUpList');
+  if (el && !_mmUpModels.length) el.textContent = 'Loading\u2026';
+  const data = await apiGet('/api/upscale-models' + (rescan ? '?rescan=1' : ''));
+  _mmUpModels = (data && Array.isArray(data.models)) ? data.models : [];
+  if (_mmUpSelected && !_mmUpModels.some(m => m.file === _mmUpSelected)) _mmUpSelected = null;
+  _mmUpRender();
+  if (data && data.error) { const log = document.getElementById('mmLog'); if (log) log.textContent = data.error; }
+}
+async function mmUpAdd() {
+  const log = document.getElementById('mmLog');
+  const api = (typeof window.pywebview !== 'undefined' && window.pywebview) ? window.pywebview.api : null;
+  if (!api || typeof api.select_model_file !== 'function') {
+    if (log) log.textContent = 'The file picker needs the desktop app. Drop the file into models/upscalers and press Rescan instead.';
+    return;
+  }
+  let path = null;
+  try { path = await api.select_model_file(); } catch (e) { path = null; }
+  if (!path) return;
+  if (log) log.textContent = `Adding ${path}\u2026`;
+  const res = await apiPost('/api/upscale-models/add', { path });
+  if (!res || res.error) { if (log) log.textContent = (res && res.error) || 'Could not add the file.'; return; }
+  if (log) log.textContent = res.usable
+    ? `Added ${res.file}: ${res.entry ? res.entry.label : 'usable'} \u2014 now in the Secondary and Upscale Scaler dropdowns.`
+    : `Added ${res.file}, but it is not offered: ${res.reason}`;
+  await mmUpPopulate();
+  if (typeof populateCustomScalers === 'function') populateCustomScalers();
+}
+async function mmUpRemove() {
+  if (!_mmUpSelected) return;
+  const log = document.getElementById('mmLog');
+  if (!confirm(`Remove ${_mmUpSelected} from the scaler dropdowns?\n\nThe file is moved to models/upscalers/_removed, not deleted.`)) return;
+  const res = await apiPost('/api/upscale-models/remove', { file: _mmUpSelected });
+  if (!res || res.error) { if (log) log.textContent = (res && res.error) || 'Could not remove.'; return; }
+  if (log) log.textContent = `Moved to ${res.moved_to}`;
+  _mmUpSelected = null;
+  await mmUpPopulate();
+  if (typeof populateCustomScalers === 'function') populateCustomScalers();
+}
+async function mmUpOpen() {
+  const res = await apiPost('/api/upscale-models/open', {});
+  const log = document.getElementById('mmLog');
+  if (res && res.error && log) log.textContent = `${res.error} (folder: ${res.dir})`;
+}
 
 const manageModelsBtn = document.getElementById('manageModelsBtn');
 if (manageModelsBtn) manageModelsBtn.addEventListener('click', openManageModels);
-[['mmRefresh', mmPopulateList], ['mmSelectMissing', mmSelectMissing],
+[['mmRefresh', () => { _mmSelected.clear(); return mmPopulateList(); }], ['mmSelectMissing', mmSelectMissing],
  ['mmCompile', mmCompile], ['mmClose', closeManageModels],
  ['mmAddSource', mmAddSource], ['mmFetch', mmFetch],
- ['mmDlSelectAll', mmDlSelectAll], ['mmDownload', mmDownload]].forEach(([id, fn]) => {
+ ['mmDlSelectAll', mmDlSelectAll], ['mmDownload', mmDownload],
+ ['mmStdRun', mmStdRun],                                                   // CM-232
+ ['mmUpAdd', mmUpAdd], ['mmUpRescan', () => mmUpPopulate(true)],
+ ['mmUpOpen', mmUpOpen], ['mmUpRemove', mmUpRemove]].forEach(([id, fn]) => {
   const b = document.getElementById(id);
   if (b) b.addEventListener('click', fn);
 });
@@ -2472,7 +3087,8 @@ document.getElementById('amSubmit').addEventListener('click', async () => {
     if (!rois.length) { alert('Enter at least one rectangle (t,l,b,r), or tick Auto-detect.'); return; }
     const sbs = document.getElementById('amSbs').checked;
     result = await apiPost('/api/add-mosaic', {
-      params: { rois, block, sbs, output_dir: gp.output_dir, temp_dir: gp.temp_dir, encoder: gp.encoder },
+      params: { rois, block, sbs, output_dir: gp.output_dir, temp_dir: gp.temp_dir, encoder: gp.encoder,
+                hw_decode: gp.mosaic.mosaic_hw_decode },   // T20d: same decode lane rules as a run
       start_time: startTime, end_time: endTime,
     });
     summary = `${rois.length} rect(s), block=${block}${sbs ? ', both SBS eyes' : ''}`;
@@ -2540,6 +3156,56 @@ document.getElementById('amSubmit').addEventListener('click', async () => {
 });
 
 
+// ── CM-229: custom scalers (models\upscalers) in the Secondary and Upscale
+// Scaler dropdowns. Options carry value "custom:<file>" and read
+// "<file> (RealPLKSR 2x)". Re-populated at startup, after Manage Models
+// activity, and on every video load (a file dropped into the folder shows
+// up without a restart). A saved value naming a file that is gone falls
+// back to the built-in default with one console line -- never a dead run.
+// T20b: a missing custom secondary falls back to the edition's DEFAULT scaler (the
+// recommended set), not to Off -- the point of the fallback is "never a dead run".
+const _CUSTOM_SCALER_SELECTS = {
+  ctrlMosaicSecondary: { fallback: ((document.documentElement.dataset.edition || 'cuda') === 'cuda') ? 'rtx-4x' : 'esrgan-4x' },
+  ctrlUpscaleScaler: { fallback: 'esrgan' },
+};
+async function populateCustomScalers() {
+  let data = null;
+  try { data = await apiGet('/api/upscale-models'); } catch (e) { data = null; }
+  const models = (data && Array.isArray(data.models)) ? data.models : [];
+  const pending = window._pendingCustomScalers || {};
+  for (const [id, spec] of Object.entries(_CUSTOM_SCALER_SELECTS)) {
+    const sel = document.getElementById(id);
+    if (!sel) continue;
+    const wanted = pending[id] !== undefined ? String(pending[id]) : sel.value;
+    Array.from(sel.options).forEach(o => { if (String(o.value).startsWith('custom:')) o.remove(); });
+    for (const m of models) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = m.label;
+      o.dataset.customScaler = '1';
+      o.title = `${m.file}: ${m.name || m.arch} ${m.scale}x, ${m.half ? 'fp16' : 'fp32'}`;
+      sel.appendChild(o);
+    }
+    if (wanted && String(wanted).startsWith('custom:')) {
+      if (Array.from(sel.options).some(o => o.value === wanted)) {
+        sel.value = wanted;
+      } else {
+        sel.value = spec.fallback;
+        console.warn(`[Scalers] ${id}: saved scaler "${wanted.slice(7)}" is not in ${(data && data.dir) || 'models\\upscalers'}; using ${spec.fallback}`);
+      }
+    } else if (!sel.value) {
+      sel.value = spec.fallback;
+    }
+  }
+  delete window._pendingCustomScalers;
+  if (models.length) console.log(`[Scalers] ${models.length} custom model(s) in ${data.dir}: ${models.map(m => m.label).join(', ')}`);
+  if (data && data.error) console.warn('[Scalers] ' + data.error);
+  if (typeof _updateControlEnableStates === 'function') _updateControlEnableStates();
+}
+
 // ── Init: populate dropdowns + first state pass ───────────
-populateMosaicModelDropdowns();
+// the two fills run one after the other, not concurrently: both make the
+// server import torchvision, and two threads importing it at once raced
+// into a circular-import error in the field (09-21)
+Promise.resolve(populateMosaicModelDropdowns()).catch(() => {}).then(() => populateCustomScalers());
 _updateRestorationButtonStates();

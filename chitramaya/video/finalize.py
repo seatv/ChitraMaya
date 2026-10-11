@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from chitramaya.winproc import NOWINDOW
+from chitramaya.video.source_format import input_args as _src_args   # CM-246
 
 # Windows: run the background extraction below the encode's own priority
 # so it never competes with the run for CPU; harmless elsewhere.
@@ -64,7 +65,7 @@ def source_has_audio(ffprobe: str, src: str) -> Optional[bool]:
     """True/False, or None when ffprobe could not tell (treat as True)."""
     try:
         r = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "a",
+            [ffprobe, "-v", "error", *_src_args(str(src), ffprobe), "-select_streams", "a",
              "-show_entries", "stream=index", "-of", "csv=p=0", str(src)],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60, **NOWINDOW)
@@ -114,7 +115,8 @@ class AudioSidecar:
                   "the output will be video-only.")
             return self
         base = [self.ffmpeg, "-hide_banner", "-y", "-loglevel", "error",
-                "-nostdin", "-i", self.src, "-vn", "-sn", "-dn", "-map", "0:a"]
+                "-nostdin", *_src_args(self.src, self.ffprobe), "-i", self.src,
+                "-vn", "-sn", "-dn", "-map", "0:a"]
         # Attempt ladder (field 2026-09-12: a TS capture's audio could not
         # be stream-copied into ANY container -- the shipped source-based
         # remux failed on the same packets): 1) stream copy; 2) re-encode
@@ -303,11 +305,19 @@ def build_onepass_container_cmd(
     sidecar: Optional[str], audio_itsoffset: float,
     tag_args: List[str], timescale_args: List[str], extra_args: List[str],
     duration_s: float, moov_bytes: int, out_path: str,
+    video_itsscale: float = 1.0,
 ) -> List[str]:
     """Container video (fragmented .venc.mp4, or a wrapped temp) + audio
     sidecar -> mp4, one pass. Same offset shape the shipped code used
     (``-itsoffset`` on the video input; verified correct for container
-    inputs), only the source is replaced by the sidecar."""
+    inputs), only the source is replaced by the sidecar.
+
+    ``video_itsscale`` (CM-235): input timestamp scale on the video, used
+    when the gap filler added frames the source's count does not carry
+    (source rate / output rate, e.g. 0.998999 for 29.97 -> 30.000); 1.0 =
+    no option. Works on a stream copy, so the picture is untouched."""
+    scale_args: List[str] = (["-itsscale", f"{video_itsscale:.9f}"]
+                             if abs(float(video_itsscale) - 1.0) > 1e-9 else [])
     cmd = [ffmpeg, "-hide_banner", "-y", "-loglevel", "warning", "-nostdin"]
     if sidecar:
         if audio_itsoffset > 1e-4:
@@ -315,11 +325,13 @@ def build_onepass_container_cmd(
         cmd += ["-i", sidecar]
         if video_itsoffset > 1e-4:
             cmd += ["-itsoffset", f"{video_itsoffset:.6f}"]
+        cmd += scale_args
         cmd += ["-i", video_path, "-map", "1:v:0", "-c:v", "copy"]
         cmd += list(tag_args) + ["-map", "0:a?", "-c:a", "copy"]
     else:
         if video_itsoffset > 1e-4:
             cmd += ["-itsoffset", f"{video_itsoffset:.6f}"]
+        cmd += scale_args
         cmd += ["-i", video_path, "-map", "0:v:0", "-c:v", "copy"] + list(tag_args)
     cmd += list(timescale_args)
     if moov_bytes > 0:
@@ -394,6 +406,86 @@ def probe_av_start(ffprobe: str, path: str) -> tuple[Optional[float], Optional[f
     except Exception:
         pass
     return v, a, skip
+
+
+# -- T23a (CM-237): settle + verify the finished output ----------------------
+def flush_to_disk(path: str) -> float:
+    """Push the finished file's cached pages to the platter (fsync) and
+    return the seconds it took. Field 2026-09-27: a 4060 box lost power a
+    minute after a 4-hour remux had returned 0; the index the muxer had
+    written at the FRONT of the file was still in the OS write cache, the
+    raw bitstream was already deleted, and the run had to be repeated. On
+    Windows FlushFileBuffers needs write access, so the file is opened
+    r+b (no byte is written)."""
+    t0 = time.monotonic()
+    with open(path, "r+b") as f:
+        f.flush()
+        os.fsync(f.fileno())
+    return time.monotonic() - t0
+
+
+def verify_output(ffprobe: str, path: str, *, expect_frames: int = 0,
+                  expect_duration_s: float = 0.0) -> tuple[str, str]:
+    """Read the finished file back the way a player would: is there an
+    index, a video stream, and the frame count the run encoded?
+
+    Returns (verdict, detail): ``"ok"``; ``"unreadable"`` (no file, ffprobe
+    fails, or no video stream -- the index is missing or broken); or
+    ``"mismatch"`` (readable, but the frame count / duration is not what
+    was encoded -- the file is kept, and so is the raw bitstream).
+    nb_frames is exact for mp4 (the sample table); containers that do not
+    carry it are judged on duration alone (0.5 s or 0.5 %, whichever is
+    larger)."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return "unreadable", "the output file is missing or empty"
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_frames,duration:format=duration",
+             "-of", "default=nw=1", str(path)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=120, **NOWINDOW)
+    except Exception as e:
+        return "unreadable", f"ffprobe could not run ({type(e).__name__}: {e})"
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        return "unreadable", ("ffprobe: " + tail[-1]) if tail else "ffprobe failed"
+    kv: dict = {}
+    for ln in (r.stdout or "").splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            kv.setdefault(k.strip(), v.strip())
+    if not kv:
+        return "unreadable", "no video stream in the output (index missing?)"
+    nb = None
+    try:
+        if kv.get("nb_frames") not in (None, "", "N/A"):
+            nb = int(kv["nb_frames"])
+    except ValueError:
+        nb = None
+    dur = None
+    for key in ("duration",):
+        try:
+            if kv.get(key) not in (None, "", "N/A"):
+                dur = float(kv[key])
+                break
+        except ValueError:
+            pass
+    detail = []
+    if nb is not None:
+        detail.append(f"{nb} frames")
+    if dur is not None:
+        detail.append(f"{dur:.1f} s")
+    verdict = "ok"
+    if nb is not None and expect_frames > 0 and nb != int(expect_frames):
+        verdict = "mismatch"
+        detail.append(f"expected {int(expect_frames)} frames")
+    elif nb is None and dur is not None and expect_duration_s > 0:
+        tol = max(0.5, 0.005 * float(expect_duration_s))
+        if abs(dur - float(expect_duration_s)) > tol:
+            verdict = "mismatch"
+            detail.append(f"expected {float(expect_duration_s):.1f} s")
+    return verdict, ", ".join(detail) if detail else "video stream present"
 
 
 def first_presented_time(ffmpeg: str, path: str, kind: str = "v") -> Optional[float]:

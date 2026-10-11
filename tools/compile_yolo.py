@@ -16,7 +16,8 @@ ultralytics export path.
 Ultralytics' AutoBackend (used by ``LadaYoloDetector``) auto-detects the file
 extension, so after compilation you can swap ``--det-model X.pt`` for
 ``--det-model X.engine`` to take the TRT path. The .engine file lands in
-``<models>/engines/<stem>.engine``.
+``<models>/engines/<stem>__i<imgsz>_b<batch>_<fp16|fp32>.engine`` (CM-218: one
+file per flavor, side by side; the app picks the one matching the panel).
 
 ``--det-model`` accepts EITHER a single .pt file OR a directory. When given a
 directory, every ``*.pt`` file directly inside it is compiled in turn.
@@ -167,7 +168,13 @@ def compile_one(model_path: Path, args) -> int:
     # <pt_parent>/<stem>.engine, so we let it write there and move the file
     # after — same logic for the intermediate .onnx ultralytics leaves behind.
     engine_dir = model_path.parent / "engines"
-    engine_path = engine_dir / f"{model_path.stem}.engine"
+    # CM-218: one engine per FLAVOR (Image Size x batch profile x precision),
+    # side by side -- compiling at 800 no longer destroys the 640 engine.
+    # The run picks the flavor matching the panel (detector/engine_flavors.py);
+    # a pre-1.80 <stem>.engine is still honoured as the "legacy" flavor.
+    from chitramaya.mosaic.detector.engine_flavors import flavor_engine_path
+    engine_path = Path(flavor_engine_path(str(model_path), int(args.det_imgsz),
+                                          int(args.max_batch), bool(args.fp16)))
     ultra_engine_path = model_path.with_suffix(".engine")    # where ultralytics writes
     ultra_onnx_path = model_path.with_suffix(".onnx")        # intermediate ultralytics leaves
 
@@ -215,8 +222,8 @@ def compile_one(model_path: Path, args) -> int:
     if engine_path.is_file() and not args.force:
         size_mb = engine_path.stat().st_size / (1024 * 1024)
         print(
-            f"[compile-yolo] Engine already exists ({size_mb:.1f} MB). "
-            f"Pass --force to rebuild."
+            f"[compile-yolo] This flavor already exists ({size_mb:.1f} MB). "
+            f"Pass --force to rebuild it; other flavors are never touched."
         )
         return 0
 

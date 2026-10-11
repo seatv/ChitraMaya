@@ -8,6 +8,31 @@ import torch
 
 from chitramaya.mosaic.core.scene import Box, Scene, crop_box_to_target_v3
 from chitramaya.mosaic.core.clip import Clip
+from chitramaya.mosaic.utils.mask_utils import box_filter_2d
+
+
+def dilate_mask_u8(mask_u8: torch.Tensor, px: int) -> torch.Tensor:
+    """Grow a uint8 HW mask outward by `px` pixels (square, clipped at the
+    edges). Returns uint8 {0,255} on the same device.
+
+    CM-208. Same summed-area box filter as the blend masks (CM-172): a box
+    mean is > 0 exactly where the window touches the support, so
+    (box_mean > 0) is a dilation by the window radius -- pure tensor
+    arithmetic, no max_pool2d / conv2d, so no per-shape MIOpen compile on
+    ROCm for masks whose size changes with every region on every frame.
+    Zero padding: the support must not reflect back in from the crop edge.
+    """
+    px = int(px)
+    if px <= 0 or mask_u8 is None:
+        return mask_u8
+    m = mask_u8
+    if m.ndim == 3 and m.shape[-1] == 1:
+        m = m[:, :, 0]
+    if m.ndim != 2:
+        return mask_u8
+    support = (m > 0).to(dtype=torch.float32)   # no .any() guard: that is a device sync per crop
+    grown = box_filter_2d(support, 2 * px + 1, pad_mode="zeros") > 0
+    return grown.to(dtype=torch.uint8) * 255
 
 
 @dataclass
@@ -64,6 +89,41 @@ class TrackerConfig:
     # exactly (no linger).
     ttl_after_end: int = 3
 
+    # --- CM-208: Region Margin (the panel's "Region Margin", config key
+    # roi_dilate). The pipeline grows every detected box by this many frame
+    # pixels on each side BEFORE tracking; the tracker grows the detector's
+    # segmentation mask by the same amount inside the crop, so the margin is
+    # part of the paste-back support too. Until 09-17 only the box grew: the
+    # margin reached the restorer but the paste alpha (Blend Mask = None:
+    # rect+mask blurred; Face Swap: mask feathered) followed the un-grown
+    # mask, so the row of mosaic blocks the lever exists to catch stayed
+    # visible under both blend modes (the 4K60 cut, frame 783). 0 = off.
+    roi_dilate_px: int = 0
+
+    # --- CM-213: Overlap + crossfade at artificial clip cuts. A scene that
+    # closes because it hit max_clip_length (or was cascade-closed by one
+    # that did) is not over -- the region is still there, only the clip's
+    # frame budget ran out -- so the tracker spawns a CONTINUATION scene
+    # seeded with the parent's last 2 * temporal_overlap frames. The
+    # continuation's clip then restores those frames a second time with the
+    # frames that follow them as context; its first (overlap - blend_frames)
+    # frames are never pasted (the parent's interior wins there), the next
+    # 2 * blend_frames frames crossfade parent -> continuation, and the
+    # rest replace the parent's cold tail. Scenes that close because the
+    # detection went away (TTL) are over and get no continuation. Design:
+    # jasna's temporal_overlap / enable_crossfade (kruk2, AGPL-3.0),
+    # written for this tracker. 0 = off (the pre-1.80 hard cut).
+    temporal_overlap: int = 0
+    blend_frames: int = 0
+
+    # --- CM-227: Crop Cap (the panel's "Crop Cap", config key crop_cap_px).
+    # An open scene stores its crops at most this many px on the long side
+    # (bilinear, non-antialiased -- see scene.cap_crop_storage); 0 = native.
+    # OFF by default: a capped crop reaches the restorer with less of the
+    # fine skin texture it paints from (the close-up title, 09-22). It is
+    # the lever for 4K on an 8 GB card, where native crops fill the card.
+    crop_cap_px: int = 0
+
 
 @dataclass
 class TrackerStepResult:
@@ -72,6 +132,37 @@ class TrackerStepResult:
     active_scenes: int
     t_track: float
     t_clip_build: float
+    continuations: int = 0          # CM-213: continuation scenes spawned this step
+
+
+def continuation_weights(n_seed: int, overlap: int, blend_frames: int) -> List[float]:
+    """CM-213: paste weight of each SEEDED frame of a continuation clip.
+
+    n_seed = 2 * overlap frames were restored by the parent clip too. Index k
+    counts from the first seeded frame. Frames the parent restored with
+    context on both sides (k < overlap - bf) are the parent's: weight 0, not
+    pasted at all. Over the 2 * bf frames centred on k = overlap the weight
+    ramps linearly ((j + 0.5) / (2 * bf), never exactly 0 or 1 inside the
+    ramp), then the parent's cold tail (k >= overlap + bf) is fully replaced.
+    With bf = 0 the hand-off is a step at k = overlap (overlap + discard, no
+    crossfade). Frames after the seed are always weight 1.
+    """
+    n_seed = int(n_seed)
+    ov = int(overlap)
+    bf = max(0, min(int(blend_frames), ov))
+    out: List[float] = []
+    for k in range(n_seed):
+        if bf <= 0:
+            out.append(0.0 if k < ov else 1.0)
+            continue
+        j = k - (ov - bf)
+        if j < 0:
+            out.append(0.0)
+        elif j >= 2 * bf:
+            out.append(1.0)
+        else:
+            out.append((j + 0.5) / (2.0 * bf))
+    return out
 
 
 def _union_box(a: Box, b: Box) -> Box:
@@ -271,6 +362,7 @@ class SceneTracker:
 
     def _new_scene(self, frame_num: int) -> Scene:
         s = Scene(id=self._scene_counter, start_frame=frame_num)
+        s.crop_cap_px = int(getattr(self.cfg, "crop_cap_px", 0) or 0)   # CM-227: per run, not per class
         self._scene_counter += 1
         return s
 
@@ -332,6 +424,9 @@ class SceneTracker:
                 # if somehow seg is numpy, convert then move
                 seg = torch.as_tensor(seg, dtype=torch.uint8, device=crop_mask_out.device)
 
+            # CM-208: the margin the pipeline added to the box is added to the
+            # mask as well, so the paste-back covers it (see roi_dilate_px).
+            seg = dilate_mask_u8(seg, self.cfg.roi_dilate_px)
             crop_mask_out = torch.maximum(crop_mask_out, seg)
 
         else:
@@ -364,6 +459,7 @@ class SceneTracker:
                     # if somehow seg is numpy, convert then move
                     seg = torch.as_tensor(seg, dtype=torch.uint8, device=crop_mask_out.device)
 
+                seg = dilate_mask_u8(seg, self.cfg.roi_dilate_px)   # CM-208
                 crop_mask_out = torch.maximum(crop_mask_out, seg)
 
         # 2) Optional seg mask: OR it in (never replace rectangle)
@@ -390,7 +486,8 @@ class SceneTracker:
                         seg_crop = roi_mask.to(device=frame_bgr_u8.device)
 
                 if seg_crop is not None:
-                    crop_mask_out = torch.maximum(crop_mask_out, _mask_u8(seg_crop))
+                    seg_crop = dilate_mask_u8(_mask_u8(seg_crop), self.cfg.roi_dilate_px)   # CM-208
+                    crop_mask_out = torch.maximum(crop_mask_out, seg_crop)
 
             except Exception:
                 # Best-effort: don't crash the pipeline on mask oddities.
@@ -551,7 +648,9 @@ class SceneTracker:
 
                 # Re-crop from union ROI. IMPORTANT: pass current detection mask (if any),
                 # then union it with the previous crop-mask by mapping old->new crop coords.
-                prev_mask = matched.masks[-1] if matched.masks else None
+                # CM-227: the stored mask may be capped; the union below works
+                # in native crop coordinates, so read it at native size.
+                prev_mask = matched.last_mask_native() if matched.masks else None
                 prev_crop_box = matched.crop_boxes[-1] if matched.crop_boxes else None
 
                 if prev_mask is not None and prev_crop_box is not None:
@@ -706,6 +805,20 @@ class SceneTracker:
             completed_ids = {s.id for s in completed_unique}
             self._scenes = [s for s in self._scenes if s.id not in completed_ids]
 
+        # CM-213: a scene cut by the frame budget (max_len, or cascade-closed
+        # by a scene that hit it) continues in a new scene seeded with its
+        # last 2 * overlap frames. TTL closes are real ends: no continuation.
+        n_cont = 0
+        ov = int(getattr(self.cfg, "temporal_overlap", 0) or 0)
+        if ov > 0 and completed_unique:
+            for s in completed_unique:
+                if reason_by_scene_id.get(s.id) == "ttl_expired":
+                    continue
+                cont = self._continuation_of(s, ov)
+                if cont is not None:
+                    self._scenes.append(cont)
+                    n_cont += 1
+
         t1 = time.perf_counter()
 
         new_clips: List[Clip] = []
@@ -751,7 +864,33 @@ class SceneTracker:
             active_scenes=len(self._scenes),
             t_track=(t1 - t0),
             t_clip_build=t_clip_build,
+            continuations=n_cont,
         )
+
+    def _continuation_of(self, s: Scene, ov: int) -> Optional[Scene]:
+        """CM-213: the continuation scene of a budget-cut scene, seeded with
+        its last 2 * ov frames (shared tensors; nothing is copied). None when
+        the scene is too short to seed and still make progress (a
+        continuation must be able to add at least one frame before its own
+        budget runs out, so 2 * ov must be well under max_clip_length -- the
+        pipeline clamps overlap to max_clip_length // 4)."""
+        n_seed = 2 * int(ov)
+        if len(s) <= n_seed or n_seed + 1 > int(self.cfg.max_clip_length):
+            return None
+        cont = self._new_scene(s.frame_nums[-n_seed])
+        cont.frame_nums = list(s.frame_nums[-n_seed:])
+        cont.roi_boxes = list(s.roi_boxes[-n_seed:])
+        cont.crop_boxes = list(s.crop_boxes[-n_seed:])
+        cont.crops = list(s.crops[-n_seed:])
+        cont.masks = list(s.masks[-n_seed:])
+        cont.last_detected_frame = int(s.last_detected_frame)
+        cont.parent_scene_id = int(s.id)
+        cont.seed_weights = continuation_weights(
+            n_seed, ov, int(getattr(self.cfg, "blend_frames", 0) or 0))
+        if self.cfg.debug:
+            print(f"[Clip] continuation scene_id={cont.id:4d} of scene_id={s.id:4d} "
+                  f"seeded frames={cont.frame_start}-{cont.frame_end} ({n_seed})")
+        return cont
 
     def flush_eof(self, *_: object) -> List[Clip]:
         """Flush all remaining scenes at end-of-file."""
@@ -785,4 +924,5 @@ __all__ = [
     "TrackerConfig",
     "TrackerStepResult",
     "SceneTracker",
+    "continuation_weights",
 ]

@@ -19,7 +19,7 @@ import threading as _threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -29,10 +29,13 @@ from chitramaya.mosaic.detector.core import Detection, Detector as YoloDetector
 from chitramaya.mosaic.core.clip import Clip
 from chitramaya.mosaic.restorer.basicvsrpp_clip_restorer import BasicVSRPPClipRestorer
 from chitramaya.mosaic.restorer.compositor import composite_clip_into_store
+from chitramaya.mosaic.restorer.output_upscale import unwrap_encoder as _unwrap_encoder   # CM-219
+from chitramaya.mosaic.restorer.custom_sr import is_custom as _is_custom_scaler              # CM-229
 from chitramaya.mosaic.redecode import LagDecoder, RedecodeStore, drain_plan_to_encoder, normalize_patch_home
 from chitramaya.run_report import RunReport, format_vram, vram_snapshot
 from chitramaya.mosaic.vr_projection import composite_clip_into_store_projected
 from chitramaya.mosaic.utils.config_util import Config
+from chitramaya.video.chroma_guard import Nv12ChromaGuard   # T20d (CM-234)
 from chitramaya.video.decoder import Decoder
 from chitramaya.video.encoder import Encoder, FfmpegEncoder, nvenc_available
 
@@ -80,14 +83,18 @@ class RegionStats:
     biggest regions -- the 256/512 clip-size study and the VRAM ledger
     both need them on plain runs."""
 
-    __slots__ = ("crops", "largest_px", "frame_max_px")
+    __slots__ = ("crops", "largest_px", "frame_max_px", "capped_crops", "capped_frames")
 
     def __init__(self) -> None:
         self.crops = 0
         self.largest_px = 0
         self.frame_max_px: Dict[int, int] = {}
+        # CM-227: crops the Crop Cap downscaled at capture, and per frame
+        # the native -> stored long side, so 'what happened here' is a lookup
+        self.capped_crops = 0
+        self.capped_frames: Dict[int, Tuple[int, int]] = {}
 
-    def note(self, frame_num, orig_shape_hw) -> None:
+    def note(self, frame_num, orig_shape_hw, stored_shape_hw=None) -> None:
         try:
             dim = max(int(orig_shape_hw[0]), int(orig_shape_hw[1]))
         except Exception:
@@ -99,6 +106,18 @@ class RegionStats:
             fn = int(frame_num)
             if dim > self.frame_max_px.get(fn, 0):
                 self.frame_max_px[fn] = dim
+        if stored_shape_hw is not None:
+            try:
+                sdim = max(int(stored_shape_hw[0]), int(stored_shape_hw[1]))
+            except Exception:
+                return
+            if sdim < dim:
+                self.capped_crops += 1
+                if frame_num is not None:
+                    fn = int(frame_num)
+                    prev = self.capped_frames.get(fn)
+                    if prev is None or dim > prev[0]:
+                        self.capped_frames[fn] = (dim, sdim)
 
     def top_frames(self, n: int = 20):
         ranked = sorted(self.frame_max_px.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -224,6 +243,18 @@ class PipelineMetrics:
     # CM-186: restored clip frames the black-output guard refused (all-zero
     # restorer output for a non-black source crop); the source crop stays.
     guard_black_frames: list = field(default_factory=list)
+    # T20d/e (CM-234): decoded frames that arrived unfinished from the ffmpeg
+    # lane (zero luma and/or chroma rows) and were completed from the previous frame.
+    chroma_repair_frames: list = field(default_factory=list)
+    # T20c: one line per thing the user must know about a run that otherwise
+    # says "complete" (guard hits, stabilizer windows skipped). Printed in
+    # the summary, put in the report and shown by the UI's Complete panel.
+    warnings: list = field(default_factory=list)
+
+    # CM-213: continuation clips (a clip cut by Max Clip that carried on in
+    # the next one) and the frames restored a second time as their lead-in.
+    continuation_clips: int = 0
+    overlap_frames: int = 0
 
     def sum_parts(self) -> float:
         return self.t_decode + self.t_det + self.t_track + self.t_restore + self.t_encode
@@ -580,6 +611,13 @@ class Pipeline:
         # Decoder extra knobs
         self.dec_output_format: str = str(self.cfg.get("decoder", "output_format", default="RGBP")).upper()
         self.dec_ffmpeg_input_args: str = str(self.cfg.get("decoder", "ffmpeg_input_args", default="") or "")
+        # T20d: panel 'Hardware decode' (auto | off) for the ffmpeg lane (AMD / Intel;
+        # NVIDIA only when NVDEC declines a stream). CM_HW_DECODE in the environment
+        # still overrides it -- see Decoder._probe_hwaccel.
+        self.dec_hw_accel: str = str(self.cfg.get("decoder", "hw_accel", default="auto") or "auto").strip().lower()
+        if self.dec_hw_accel not in ("auto", "off"):
+            print(f"[Decoder] WARNING: invalid decoder.hw_accel {self.dec_hw_accel!r}; using 'auto'.")
+            self.dec_hw_accel = "auto"
 
         self.det_model: str = cfg_path(self.cfg, ("detection", "model_path"), default="")
         self.det_imgsz: int = int(self.cfg.get("detection", "imgsz", default=640))
@@ -593,7 +631,15 @@ class Pipeline:
         )
 
         self.roi_dilate: int = int(self.cfg.get("roi_dilate", default=0))
+        # CM-227: Crop Cap (panel "Crop Cap"; 0 = off = native crops). The
+        # open-scene storage bound for 4K on 8 GB; costs fine texture, so
+        # off unless the user (or the preflight's advice) turns it on.
+        self.crop_cap_px: int = int(self.cfg.get("crop_cap_px", default=0) or 0)
+        if self.crop_cap_px < 0:
+            self.crop_cap_px = 0
         self.use_seg_masks: bool = bool(self.cfg.get("use_seg_masks", default=True))
+        # CM-205: detector pass over the finished output (key frames).
+        self.residual_scan: bool = bool(self.cfg.get("residual_scan", default=True))
 
         # --- Scene tracking (stabilization + TTL gap-fill) ---
         # See TrackerConfig docstring for the rationale on each. Defaults
@@ -616,6 +662,17 @@ class Pipeline:
         self.vr_projection: str = str(
             self.cfg.get("vr_projection", default="none") or "none"
         ).lower()
+        # CM-245: the Upscale mode (mode "none") has no detector, tracker or
+        # restorer, so Split SBS and the VR projection have nothing to act on
+        # -- and the projection would force the device frame store (1.5 GB at
+        # 1080p, field 10-07) for a run that pastes nothing. Both are ignored
+        # there, said once.
+        if self.mode == "none" and (self.sbs_enabled or self.vr_projection != "none"):
+            print("[mosaic] Upscale only: Split SBS / VR Projection are ignored (nothing is detected or "
+                  "pasted back; the whole frame is scaled as it is).")
+            self.sbs_enabled = False
+            self.sbs_det_split = False
+            self.vr_projection = "none"
         from chitramaya.mosaic.vr_projection import VR_PROJECTION_MODES
         if self.vr_projection not in VR_PROJECTION_MODES:
             raise ValueError(
@@ -629,9 +686,9 @@ class Pipeline:
         # upscale of restored crops before paste-back. Validated against the
         # shared mode list; the effect itself is built in run() (needs device)
         # with graceful fallback if nvvfx/driver support is missing.
-        self.secondary_restoration: str = str(
-            self.cfg.get("secondary_restoration", default="none") or "none"
-        ).lower()
+        _sr = str(self.cfg.get("secondary_restoration", default="none") or "none").strip()
+        # CM-229: "custom:<file>" keeps its case (a file name); built-in ids are lower-case
+        self.secondary_restoration: str = _sr if _sr.startswith("custom:") else _sr.lower()
         # CM-078 (Batch 26): temporal stabilization strength (0=off, 1..3).
         self.temporal_stability: int = int(
             self.cfg.get("temporal_stability", default=0) or 0
@@ -653,16 +710,72 @@ class Pipeline:
         self.secondary_denoise: str = str(
             self.cfg.get("secondary_denoise", default="none") or "none"
         ).strip().lower()
-        if self.secondary_restoration not in SECONDARY_MODES:
+        # CM-219 / CM-228: Output Upscale -- every finished frame through a
+        # whole-frame scaler before the encoder: a factor (2x | 4x) or a
+        # target (1080p | 1440p | 2160p). Real restoration and the
+        # upscale-only mode ("none": no models, every frame passthrough).
+        from chitramaya.mosaic.restorer.output_upscale import OUTPUT_UPSCALE_MODES, OUTPUT_SCALERS
+        self.output_upscale: str = str(self.cfg.get("output_upscale", default="none") or "none").strip().lower()
+        if self.output_upscale not in OUTPUT_UPSCALE_MODES:
+            print(f"[OutputUpscale] unknown Output Upscale {self.output_upscale!r}; using none")
+            self.output_upscale = "none"
+        # CM-228: which scaler does the whole frame -- esrgan (all GPUs) | rtx (Maxine, NVIDIA)
+        _us = str(self.cfg.get("upscale_scaler", default="esrgan") or "esrgan").strip()
+        # CM-229: "custom:<file>" keeps its case (a file name); the built-ins are lower-case ids
+        self.upscale_scaler: str = _us if _is_custom_scaler(_us) else _us.lower()
+        if self.upscale_scaler not in OUTPUT_SCALERS and not _is_custom_scaler(self.upscale_scaler):
+            print(f"[OutputUpscale] unknown Upscale Scaler {self.upscale_scaler!r}; using esrgan")
+            self.upscale_scaler = "esrgan"
+        # CM-229: where the user's own scaler weights live (server: <app>/models/upscalers)
+        self.custom_scaler_dir: str = str(self.cfg.get("custom_scaler_dir", default="") or "")
+        self._output_upscaler = None
+        self._output_upscale_note: str = ""
+        self._upscale_scaler_note: str = ""
+        # CM-217: Maxine Super-Res quality level (low/medium/high/ultra);
+        # RTX modes only, Real-ESRGAN ignores it.
+        self.secondary_quality: str = str(
+            self.cfg.get("secondary_quality", default="high") or "high"
+        ).strip().lower()
+        if self.secondary_quality not in ("low", "medium", "high", "ultra"):
+            print(f"[Secondary] unknown Scaler Quality {self.secondary_quality!r}; using high")
+            self.secondary_quality = "high"
+        if self.secondary_restoration not in SECONDARY_MODES and not _is_custom_scaler(self.secondary_restoration):
             raise ValueError(
                 f"Invalid secondary_restoration: {self.secondary_restoration!r} "
                 f"(expected one of {SECONDARY_MODES})"
             )
         self._secondary = None
+        self._secondary_fallback: str = ""   # T20b: set when RTX was asked and Real-ESRGAN ran
 
         self.rest_model: str = cfg_path(self.cfg, ("restoration", "rest_model_path"), default="")
         self.rest_fp16: bool = bool(self.cfg.get("restoration", "fp16", default=True))
         self.rest_max_clip_length: int = int(self.cfg.get("restoration", "max_clip_length", default=30))
+        # CM-213: Overlap + crossfade at frame-budget clip cuts (design:
+        # jasna's temporal_overlap / enable_crossfade, kruk2, AGPL-3.0;
+        # implemented in our tracker + compositor -- see scene_tracker.py).
+        # A continuation clip re-restores 2 * overlap frames, so 2 * overlap
+        # must leave room for progress inside one clip: clamp to MCL // 4.
+        self._asked_overlap: int = max(0, int(self.cfg.get("restoration", "temporal_overlap", default=8) or 0))
+        self.rest_crossfade: bool = bool(self.cfg.get("restoration", "crossfade", default=True))
+        _bf_asked = int(self.cfg.get("restoration", "blend_frames", default=-1))
+        self._overlap_note: str = ""
+        _ov = self._asked_overlap
+        _ov_max = max(0, int(self.rest_max_clip_length) // 4)
+        if _ov > _ov_max:
+            self._overlap_note = (f"Overlap {_ov} is more than a quarter of Max Clip {self.rest_max_clip_length}; "
+                                  f"ran at {_ov_max} so every continuation clip still adds new frames")
+            _ov = _ov_max
+        self.rest_temporal_overlap: int = int(_ov)
+        if _bf_asked < 0:
+            _bf = (_ov // 3) if self.rest_crossfade else 0
+        else:
+            _bf = min(int(_bf_asked), _ov)
+        if not self.rest_crossfade:
+            _bf = 0
+        self.rest_blend_frames: int = int(max(0, _bf))
+        # Frames a scene can hold before it closes: Max Clip plus the seed a
+        # continuation keeps alive behind it. Sizes the frame store.
+        self.rest_hold_frames: int = int(self.rest_max_clip_length) + 2 * int(self.rest_temporal_overlap)
         # Restoration backend: 'auto' (use TRT engines if present, else PyTorch),
         # 'trt' (require TRT engines, fail if absent), 'pytorch' (force PyTorch).
         self.rest_backend: str = str(
@@ -687,7 +800,7 @@ class Pipeline:
         self.rest_border_ratio: float = float(self.cfg.get("restoration", "border_ratio", default=0.06))
         self.rest_pad_mode: str = str(self.cfg.get("restoration", "pad_mode", default="reflect"))
         self.feather_radius: int = int(self.cfg.get("restoration", "feather_radius", default=0))
-        self.rest_blendmask: str = str(self.cfg.get("restoration", "blendmask", default="none") or "none").lower()
+        self.rest_blendmask: str = str(self.cfg.get("restoration", "blendmask", default="facefusion") or "facefusion").lower()
         if self.rest_blendmask not in ("none", "facefusion"):
             raise ValueError(f"Invalid restoration.blendmask: {self.rest_blendmask!r}")
 
@@ -759,13 +872,32 @@ class Pipeline:
             "store_backend": str(self.store_backend),
             "secondary": str(self.secondary_restoration),
             "secondary_denoise": str(getattr(self, "secondary_denoise", "none")),
+            "secondary_quality": str(getattr(self, "secondary_quality", "high")),   # CM-217
+            "output_upscale": str(getattr(self, "output_upscale", "none")),        # CM-219
+            "upscale_scaler": str(getattr(self, "upscale_scaler", "esrgan")),      # CM-228
             "rest_backend": str(self.cfg.get("restoration", "backend", default="auto") or "auto"),
             "blendmask": str(self.rest_blendmask),
             "feather_radius": int(self.feather_radius),
             "max_clip_length": int(self.rest_max_clip_length),
+            "crop_cap_px": int(getattr(self, "crop_cap_px", 0) or 0),   # CM-227 (T18)
+            "temporal_overlap": int(self._asked_overlap),      # CM-213
             "det_imgsz": int(self.det_imgsz),
+            "det_batch": int(self.batch_size),
             "redecode_patches": str(self.redecode_patches),
         }
+        # CM-203: a Detection Batch above the compiled engine's profile fails
+        # inside detection (ultralytics assertion) instead of warning. Clamp
+        # here, before the decoder is sized, and say so; the run report
+        # carries asked vs ran. Warm detectors persist across runs, so this
+        # is per pipeline construction, which is per run.
+        self._det_batch_note = ""
+        _eng_max = self._det_engine_max_batch()
+        if _eng_max is not None and self.batch_size > _eng_max:
+            self._det_batch_note = (f"Detection Batch {self.batch_size} exceeds this engine's profile "
+                                    f"(1..{_eng_max}); ran at {_eng_max}. To use {self.batch_size}, set the "
+                                    f"slider first and Compile with Force on in Manage Models (CM-203)")
+            print(f"[Detector] {self._det_batch_note}")
+            self.batch_size = int(_eng_max)
 
         # Encoder base
         self.enc_codec: str = str(self.cfg.get("encoder", "codec", default="hevc")).lower()
@@ -824,6 +956,26 @@ class Pipeline:
                 rep.vram(str(label), snap, frame=frame, delta_mb=delta)
             except Exception:
                 pass
+
+    def _det_engine_max_batch(self) -> Optional[int]:
+        """CM-203: the largest batch the compiled detector engine accepts.
+
+        Reads the CM-201 sidecar (<engine>.json, key max_batch). An engine
+        without a sidecar was built by ultralytics' export before CM-201 with
+        a batch-8 profile. None when the detector is not a TensorRT engine
+        (PyTorch .pt: any batch runs).
+        """
+        try:
+            _mp = str(self.det_model or "")
+            if not _mp.lower().endswith(".engine"):
+                return None
+            # CM-218: the flavor file name carries the profile too; the
+            # sidecar and the batch-8 legacy rule are the fallbacks.
+            from chitramaya.mosaic.detector.engine_flavors import describe_engine
+            _fl = describe_engine(_mp, legacy=False)
+            return int(_fl.max_batch) if _fl.max_batch else 8
+        except Exception:
+            return None
 
     def _build_detector(self):
         if self.mode == "none":
@@ -1076,6 +1228,98 @@ class Pipeline:
             max_frames=_chunk,
         )
 
+    def _find_custom_scaler(self, value: str):
+        """CM-229: 'custom:<file>' -> its path, looking in the server's
+        models/upscalers, next to the restoration model, then ./models/upscalers."""
+        from chitramaya.mosaic.restorer.custom_sr import find_custom_model, custom_file
+        name = custom_file(value)
+        for d in (self.custom_scaler_dir,
+                  (os.path.join(os.path.dirname(self.rest_model), "upscalers") if self.rest_model else "")):
+            if d:
+                p = Path(d) / name
+                try:
+                    if p.is_file():
+                        return p
+                except Exception:
+                    pass
+        return find_custom_model(value)
+
+    def _vram_preflight(self, snap0: dict, w: int, h: int, store) -> None:
+        """CM-221: the working set the run will add on top of 'after models',
+        estimated from the frame size and the panel, against the VRAM that is
+        free -- the redecode path has no frame store, so until now nothing
+        modelled it and a 4K run on an 8 GB card found the wall at its first
+        big scene. The arithmetic lives in chitramaya.vram_preflight
+        (estimate_working_set) since T22, shared with the PRE-RUN check the
+        app shows before Restore & Save / Process Folder (CM-236), so the two
+        cannot disagree. Printed on every real run so the field can grade
+        it; a WARNING with the levers when it does not fit. An estimate --
+        not a gate. T22 also records this run's models footprint (after
+        models minus before models) in the ledger the pre-run check reads."""
+        try:
+            if self.mode != "real" or not snap0:
+                return
+            from chitramaya.vram_preflight import estimate_working_set, record_models_footprint, signature
+            _cap_cfg = int(getattr(self, "crop_cap_px", 0) or 0)
+            hold = int(getattr(self, "rest_hold_frames", self.rest_max_clip_length))
+            est = estimate_working_set(
+                w, h, crop_cap_px=_cap_cfg, hold_frames=hold, batch_size=int(self.batch_size),
+                det_imgsz=int(self.det_imgsz), async_on=bool(self.async_encoder),
+                async_queue=int(self.async_encoder_queue),
+                secondary_on=(self.secondary_restoration != "none"),
+                max_clip=int(self.rest_max_clip_length), free_mb=int(snap0.get("free", 0)),
+                total_mb=int(snap0.get("total", 0)))
+            need_mb = int(est["need_mb"])
+            free_mb = int(est["free_mb"])
+            parts = est["parts"]
+            self._vram_preflight_note = {k: est[k] for k in ("need_mb", "free_mb", "scenes_mb", "crop_cap_px",
+                                                              "scene_crop_px", "detector_mb", "decode_mb",
+                                                              "paste_mb", "async_mb", "slack_mb", "fits")}
+            # T22: the models footprint of this run shape on this card, for
+            # the pre-run check. before-models = the ledger's first row.
+            try:
+                _before = None
+                for _row in (self._vram_ledger or []):
+                    if str(_row.get("label", "")).startswith("before models"):
+                        _before = int(_row.get("used", 0))
+                        break
+                if _before is not None and int(snap0.get("used", 0)) > _before:
+                    _gpu = ""
+                    try:
+                        _gpu = str(torch.cuda.get_device_name(self.device.index or 0))
+                    except Exception:
+                        _gpu = ""
+                    from chitramaya.device import is_rocm as _is_rocm_
+                    _ed = "rocm" if _is_rocm_() else ("xpu" if "+xpu" in str(torch.__version__) else "cuda")
+                    _sig = signature(edition=_ed, gpu_name=_gpu, det_imgsz=int(self.det_imgsz),
+                                     det_batch=int(self.batch_size), det_fp16=bool(self.det_fp16),
+                                     det_trt=bool(self.cfg.get("detection", "trt", default=False)),
+                                     rest_trt=(str(self.rest_backend).lower() != "pytorch"),
+                                     secondary=str(self.secondary_restoration),
+                                     temporal_fix=bool(int(getattr(self, "temporal_stability", 0) or 0) > 0),
+                                     output_upscale=str(self.output_upscale),
+                                     upscale_scaler=str(self.upscale_scaler), width=w, height=h)
+                    record_models_footprint(_sig, int(snap0.get("used", 0)) - _before,
+                                            int(snap0.get("total", 0)), _gpu)
+            except Exception as _lg_e:
+                print(f"[VRAM] ledger note skipped ({_lg_e})")
+            if est["fits"]:
+                print(f"[VRAM] preflight: the run should add ~{need_mb} MB ({parts}) -- {free_mb} MB free after "
+                      f"models, fits (estimate; the ledger lines below are the truth).")
+                return
+            levers = [lv["text"] for lv in est["levers"]]
+            print(f"[VRAM] preflight WARNING: the run may need ~{need_mb} MB ({parts}) but only {free_mb} MB is free "
+                  f"after models on this {int(snap0.get('total', 0))} MB card -- an out-of-memory stop at the first "
+                  f"large scene is likely." + (" Levers: " + "; ".join(levers) + "." if levers else ""))
+            if self._report is not None:
+                try:
+                    self._report.event("vram_preflight_warning", frame=0,
+                                       message=f"estimate {need_mb} MB needed vs {free_mb} MB free after models (CM-221)")
+                except Exception:
+                    pass
+        except Exception as _pf_e:
+            print(f"[VRAM] preflight skipped ({_pf_e})")
+
     def _stabilize_restored(self, restored):
         """CM-078: apply the temporal stabilizer to a clip's restored crops.
 
@@ -1201,6 +1445,13 @@ class Pipeline:
         metrics.det_stats.dump_rois = bool(self.det_dump_rois)
         metrics.wall_start = _dt.datetime.now()
         t0_all = time.perf_counter()
+        # The 500-frame console checkpoint keeps its high-water mark on self;
+        # in a folder batch the same Pipeline runs file after file, so a 2nd
+        # file shorter than the 1st never printed a checkpoint and a longer
+        # one started printing at the 1st file's last mark (09-16 batch of
+        # ten: files 2-5 had no [Pipeline] frame lines, file 3 began at
+        # 540,501). Reset per run.
+        self._ck_last_done = 0
 
         # Batch VRAM hygiene (Batch 23c): in a warm server / folder batch the
         # PREVIOUS file's FrameStore + activations linger in PyTorch's caching
@@ -1227,6 +1478,7 @@ class Pipeline:
             output_format=self.dec_output_format,
             ffmpeg_input_args=self.dec_ffmpeg_input_args,
             trim_negative_pts=False,
+            hw_accel=self.dec_hw_accel,        # T20d
         )
         self._vram_stage("primary decoder")
 
@@ -1274,11 +1526,32 @@ class Pipeline:
             _sec_scale = scale_for_mode(self.secondary_restoration)
             if self.mode != "real":
                 print("[Secondary] Note: secondary restoration applies only to real "
-                      "restoration; ignored in preview/censor mode.")
+                      "restoration; " + ("not used in the Upscale / re-encode mode." if self.mode == "none"
+                                          else "ignored in preview/censor mode."))
             elif self.rest_clip_size != 256:
                 print(f"[Secondary] WARNING: secondary restoration requires clip "
                       f"size 256 (configured: {self.rest_clip_size}); running "
                       f"without secondary.")
+            elif _is_custom_scaler(self.secondary_restoration):
+                # CM-229: the user's own SR model (models/upscalers, spandrel)
+                try:
+                    from chitramaya.mosaic.restorer.custom_sr import (
+                        CustomSecondaryRestorer, find_custom_model, custom_file)
+                    _cpath = self._find_custom_scaler(self.secondary_restoration)
+                    if _cpath is None:
+                        raise FileNotFoundError(f"{custom_file(self.secondary_restoration)} is not in the "
+                                                f"models\\upscalers folder")
+                    self._secondary = CustomSecondaryRestorer(
+                        device=self.device, model_path=_cpath, input_size=self.rest_clip_size,
+                        color_match=True)     # CM-232 guard: a colour-shifting model must not paint a seam
+                    _sec_scale = int(self._secondary.scale)
+                    print(f"[Secondary] Custom model ACTIVE: {self._secondary.describe()} "
+                          f"(256 -> {256 * _sec_scale}). Restored regions larger than 256 px are "
+                          f"upscaled before paste-back; smaller regions keep the standard path.")
+                except Exception as _sec_err:
+                    print(f"[Secondary] WARNING: custom scaler {self.secondary_restoration!r} unavailable "
+                          f"({type(_sec_err).__name__}: {str(_sec_err)[:200]}); running without secondary.")
+                    self._secondary = None
             elif self.secondary_restoration == "esrgan-4x":
                 # Batch 68 (CM-139): Real-ESRGAN compact scaler -- plain torch,
                 # so it runs on EVERY edition (CUDA, XPU, ROCm). Bundled
@@ -1311,18 +1584,42 @@ class Pipeline:
                         device=self.device, scale=_sec_scale,
                         input_size=self.rest_clip_size,
                         denoise=self.secondary_denoise,  # Batch 70 (CM-146)
+                        quality=self.secondary_quality,  # CM-217
                     )
                     print(f"[Secondary] RTX Super-Res ACTIVE: {_sec_scale}x "
-                          f"(256 -> {256 * _sec_scale}, quality=high, "
+                          f"(256 -> {256 * _sec_scale}, quality={self.secondary_quality}, "
                           f"denoise={self.secondary_denoise}). Restored regions "
                           f"larger than 256 px are upscaled before paste-back; smaller "
                           f"regions keep the standard path.")
                 except Exception as _sec_err:
+                    # T20b (closes CM-184): rtx-4x is now the default, so a box
+                    # without Maxine (GTX, old driver, AMD / Intel with a copied
+                    # settings file) must not silently lose the secondary -- the
+                    # bundled Real-ESRGAN takes over at the same 4x, and the run
+                    # report says which one ran and why.
                     print(f"[Secondary] WARNING: RTX Super-Res unavailable "
-                          f"({_sec_err}); running without secondary. It needs an RTX "
-                          f"GPU, a recent NVIDIA driver, and the nvidia-vfx package "
-                          f"(pip install nvidia-vfx).")
+                          f"({str(_sec_err)[:200]}). It needs an RTX GPU, a recent NVIDIA "
+                          f"driver, and the nvidia-vfx package (pip install nvidia-vfx). "
+                          f"Falling back to the bundled Real-ESRGAN 4x.")
                     self._secondary = None
+                    try:
+                        from chitramaya.mosaic.restorer.esrgan_secondary import (
+                            EsrganSecondaryRestorer,
+                        )
+                        self._secondary = EsrganSecondaryRestorer(
+                            device=self.device, scale=4,
+                            input_size=self.rest_clip_size,
+                            user_weight_dirs=["models"],
+                        )
+                        self._secondary_fallback = (
+                            f"RTX Super-Res unavailable ({type(_sec_err).__name__}); "
+                            f"ran the bundled Real-ESRGAN 4x instead")
+                        print("[Secondary] Real-ESRGAN ACTIVE: 4x (256 -> 1024, model "
+                              "realesr-general-x4v3) in place of RTX Super-Res.")
+                    except Exception as _sec_err2:
+                        print(f"[Secondary] WARNING: Real-ESRGAN fallback unavailable too "
+                              f"({_sec_err2}); running without secondary.")
+                        self._secondary = None
         # CM-077b: fresh stats every run. The server keeps this pipeline
         # (and its warm secondary) alive across runs and across every file
         # of a folder batch; without a reset the [SecStats] numbers would
@@ -1330,6 +1627,11 @@ class Pipeline:
         if self._secondary is not None:
             from chitramaya.mosaic.restorer.rtx_secondary import SecondaryStats
             self._secondary.stats = SecondaryStats()
+            # CM-208: the 256-px gate judges the region BEFORE the Region
+            # Margin was added (both sides), so a small region does not buy a
+            # 4x upscale just because its box was grown. Per run, like stats:
+            # the warm secondary outlives the panel value.
+            self._secondary.gate_margin_px = 2 * int(self.roi_dilate)
 
         # CM-078 (Batch 26): temporal stabilizer -- smooths per-frame
         # restoration/VSR shimmer across each clip's restored crops BEFORE
@@ -1339,8 +1641,9 @@ class Pipeline:
         self._vram_stage("secondary upscaler")
         if self.temporal_stability > 0 and self._stabilizer is None:
             if self.mode != "real":
-                print("[TemporalFix] Note: temporal stabilization applies only "
-                      "to real restoration; ignored in preview/censor mode.")
+                print("[TemporalFix] Note: temporal stabilization applies only to real restoration; "
+                      + ("not used in the Upscale / re-encode mode." if self.mode == "none"
+                         else "ignored in preview/censor mode."))
             else:
                 from chitramaya.mosaic.restorer.temporal_stabilizer import (
                     bundled_weights_dir, load_temporal_stabilizer,
@@ -1358,10 +1661,13 @@ class Pipeline:
                     search_dirs=_ts_dirs, clip_size=self.rest_clip_size,
                 )
                 if self._stabilizer is not None:
+                    _prec = getattr(self._stabilizer, "precision", lambda: "")()
                     print(f"[TemporalFix] Temporal stabilization ACTIVE: "
                           f"strength {self.temporal_stability} "
                           f"({model_file_for_strength(self.temporal_stability)}, "
-                          f"7-frame window over restored regions only).")
+                          f"7-frame window over restored regions only"
+                          f"{', ' + _prec if _prec else ''}"
+                          f"{' -- fp32 on ROCm: fp16 returned black / wavy windows there (T20c)' if getattr(self._stabilizer, '_is_hip', False) else ''}).")
                 else:
                     print(f"[TemporalFix] WARNING: temporal stabilization "
                           f"unavailable ({_ts_err}); running without it. The "
@@ -1374,6 +1680,83 @@ class Pipeline:
         self._vram_stage("temporal stabilizer")
         # Convert mux_audio (str "auto/copy/aac/none") to ChitraMaya's bool flag.
         _mux_audio_bool = str(self.mux_audio).lower() != "none"
+        # CM-219: Output Upscale. Decide the OUTPUT size before the encoder
+        # exists; the upscaler wraps the encoder so every encode path is
+        # covered. Real restoration only; a request past the codec's side
+        # limit runs without the upscale and says so (never fails the run).
+        self._output_upscaler = None
+        self._output_upscale_note = ""
+        self._upscale_scaler_note = ""
+        out_w, out_h = int(w), int(h)
+        if self.output_upscale != "none" and foi_capture is None:
+            if self.mode not in ("real", "none"):
+                self._output_upscale_note = "not used in preview/censor mode"
+            else:
+                from chitramaya.mosaic.restorer.output_upscale import (
+                    output_size_check, resolve_output_size, OutputUpscaler, RtxOutputUpscaler)
+                _size, _label = resolve_output_size(w, h, self.output_upscale)
+                _ok, _why = (True, "") if _size is None else output_size_check(_size[0], _size[1], self.enc_codec)
+                if _size is None:
+                    self._output_upscale_note = _label
+                    print(f"[OutputUpscale] {self._output_upscale_note}")
+                elif not _ok:
+                    self._output_upscale_note = _why + "; ran without the upscale"
+                    print(f"[OutputUpscale] WARNING: {self._output_upscale_note}")
+                else:
+                    _tw, _th = int(_size[0]), int(_size[1])
+                    _ups = None
+                    if _is_custom_scaler(self.upscale_scaler):
+                        # CM-229: the user's own SR model; a missing/broken file falls back to Real-ESRGAN
+                        try:
+                            from chitramaya.mosaic.restorer.custom_sr import CustomOutputUpscaler, custom_file
+                            _cpath = self._find_custom_scaler(self.upscale_scaler)
+                            if _cpath is None:
+                                raise FileNotFoundError(f"{custom_file(self.upscale_scaler)} is not in the "
+                                                        f"models\\upscalers folder")
+                            _ups = CustomOutputUpscaler(device=self.device, in_hw=(int(h), int(w)), out_hw=(_th, _tw),
+                                                        model_path=_cpath, color_match=True)   # CM-232
+                            self._upscale_scaler_note = "custom"
+                        except Exception as _c_e:
+                            self._upscale_scaler_note = (f"custom scaler {self.upscale_scaler!r} unavailable "
+                                                         f"({type(_c_e).__name__}: {str(_c_e)[:160]}); "
+                                                         f"fell back to Real-ESRGAN")
+                            print(f"[OutputUpscale] WARNING: {self._upscale_scaler_note}")
+                    elif self.upscale_scaler == "rtx":
+                        try:
+                            _ups = RtxOutputUpscaler(device=self.device, in_hw=(int(h), int(w)), out_hw=(_th, _tw),
+                                                     quality=self.secondary_quality, denoise=self.secondary_denoise)
+                            self._upscale_scaler_note = "rtx"
+                        except Exception as _rtx_e:
+                            self._upscale_scaler_note = (f"RTX Super-Res unavailable for {w}x{h} -> {_tw}x{_th} "
+                                                         f"({type(_rtx_e).__name__}: {str(_rtx_e)[:160]}); "
+                                                         f"fell back to Real-ESRGAN")
+                            print(f"[OutputUpscale] WARNING: {self._upscale_scaler_note}")
+                    if _ups is None:
+                        try:
+                            _ups = OutputUpscaler(
+                                device=self.device, in_hw=(int(h), int(w)), out_hw=(_th, _tw),
+                                user_weight_dirs=[os.path.dirname(self.rest_model) if self.rest_model else "", "models"])
+                            if not self._upscale_scaler_note:
+                                self._upscale_scaler_note = "esrgan"
+                        except Exception as _up_e:
+                            _ups = None
+                            self._output_upscale_note = f"unavailable ({_up_e}); ran without the upscale"
+                            print(f"[OutputUpscale] WARNING: {self._output_upscale_note}")
+                    if _ups is not None:
+                        self._output_upscaler = _ups
+                        out_w, out_h = _tw, _th
+                        if isinstance(_ups, OutputUpscaler):
+                            _cost = ("Real-ESRGAN runs its network on every output pixel of every frame -- expect a "
+                                     "much longer run")
+                        elif isinstance(_ups, RtxOutputUpscaler):
+                            _cost = "Maxine is built for video streams; expect a modest slowdown"
+                        else:   # CM-229 custom model
+                            _cost = ("the network runs on every output pixel of every frame; the ms/frame line at "
+                                     "the end says what this model costs")
+                        print(f"[OutputUpscale] ACTIVE: {_label} on every output frame -- {_ups.describe()}. "
+                              f"{_cost}; the encoder does {(_tw * _th) / float(w * h):.1f}x the work "
+                              f"(CM-219/CM-228).")
+                        self._vram_stage("output upscaler")
         if foi_capture is not None:
             # FOI preview: capture-only. Never encode or mux (see _DiscardEncoder).
             encoder = _DiscardEncoder()
@@ -1383,8 +1766,8 @@ class Pipeline:
             _EncCls = Encoder if nvenc_available() else FfmpegEncoder
             encoder = _EncCls(
                 output_path=str(out),
-                width=w,
-                height=h,
+                width=out_w,
+                height=out_h,
                 fps=fps,
                 codec=self.enc_codec,
                 preset=self.enc_preset,
@@ -1417,6 +1800,12 @@ class Pipeline:
                     print(f"[Encoder] Audio sidecar not started "
                           f"({type(_sc_e).__name__}: {_sc_e}); the finalize "
                           f"will read the source file.")
+
+            # CM-219: the upscale sits between the pipeline and the encoder
+            # (inside any async wrapper: the upscaled frame is what gets queued).
+            if self._output_upscaler is not None:
+                from chitramaya.mosaic.restorer.output_upscale import UpscalingEncoder
+                encoder = UpscalingEncoder(encoder, self._output_upscaler)
 
             # Wrap in AsyncEncoder if enabled — runs encode_frame() on a
             # background thread, overlapping NVENC work with the main thread's
@@ -1455,13 +1844,24 @@ class Pipeline:
                 crop_quant_px=self.trk_crop_quant_px,
                 crop_sticky=self.trk_crop_sticky,
                 match_pad_px=self.trk_match_pad_px,
+                roi_dilate_px=int(self.roi_dilate),   # CM-208: mask grows with the box
+                temporal_overlap=int(self.rest_temporal_overlap),   # CM-213
+                blend_frames=int(self.rest_blend_frames),           # CM-213
+                crop_cap_px=int(self.crop_cap_px),                  # CM-227
             )
             tracker = SceneTracker(cfg=tracker_cfg, seg_mask_only=True)
+            if self.rest_temporal_overlap > 0:
+                if self._overlap_note:
+                    print(f"[Tracker] {self._overlap_note}")
+                print(f"[Tracker] Overlap {self.rest_temporal_overlap}: a clip cut by Max Clip continues in the "
+                      f"next clip with its last {2 * self.rest_temporal_overlap} frames re-restored as lead-in; "
+                      + (f"crossfade over {2 * self.rest_blend_frames} frames at the seam (CM-213)."
+                         if self.rest_blend_frames > 0 else "hard hand-off at the seam, no crossfade (CM-213)."))
 
         # [CHANGE 2] FrameStore with backpressure.
         # Determine the requested cap first (auto / explicit / unlimited).
         if self.store_max_frames == 0:
-            requested_cap = _compute_default_store_max(w, h, self.rest_max_clip_length)
+            requested_cap = _compute_default_store_max(w, h, self.rest_hold_frames)   # CM-213: + 2 * overlap
             store_is_auto = True
         elif self.store_max_frames < 0:
             requested_cap = 0            # unlimited
@@ -1538,13 +1938,13 @@ class Pipeline:
                     from chitramaya.device import empty_cache as _dev_empty_cache
                     _dev_empty_cache(self.device)
                 _free_b0, _total_b0 = _vram_free_total(self.device)
-                _enc_obj0 = (encoder.underlying if isinstance(encoder, AsyncEncoder) else encoder)
+                _enc_obj0 = _unwrap_encoder(encoder)
                 if (_free_b0 is not None and type(_enc_obj0).__name__ == "Encoder"
-                        and _free_b0 < max(192 * 1024 * 1024, int(w * h * 36))):
+                        and _free_b0 < max(192 * 1024 * 1024, int(out_w * out_h * 36))):
                     print(f"[Pipeline] WARNING: only ~{_free_b0 // (1024*1024)} MB VRAM "
                           f"free after models, but the NVENC encoder needs roughly "
-                          f"{max(192 * 1024 * 1024, int(w * h * 36)) // (1024*1024)} MB "
-                          f"at {w}x{h}. This run will likely FAIL mid-encode (NVENC error 8)."
+                          f"{max(192 * 1024 * 1024, int(out_w * out_h * 36)) // (1024*1024)} MB "
+                          f"at {out_w}x{out_h}. This run will likely FAIL mid-encode (NVENC error 8)."
                           f"{getattr(self, '_rest_engine_note', '') or ' Levers: a smaller restoration engine set, restore Use Tensor off, or smaller --det-imgsz.'}")
             except Exception:
                 pass
@@ -1571,7 +1971,7 @@ class Pipeline:
                 _queue_frames = int(self.async_encoder_queue) if self.async_encoder else 2
                 _reserve_b = (_VRAM_BASE_RESERVE_MB * 1024 * 1024) + _queue_frames * (w * h * 4)
                 _plan_frames, _reduced, _warn = _vram_plan(
-                    width=w, height=h, max_clip_length=self.rest_max_clip_length,
+                    width=w, height=h, max_clip_length=self.rest_hold_frames,
                     requested_frames=requested_cap,
                     free_bytes=_free_b, total_bytes=_total_b,
                     reserve_bytes=_reserve_b,
@@ -1595,7 +1995,7 @@ class Pipeline:
                         _avail_b, _total_ram_b = int(_vm.available), int(_vm.total)
                         _fits, _safe_frames, _sugg_mcl, _floor_b = _ram_plan_host(
                             width=w, height=h,
-                            max_clip_length=self.rest_max_clip_length,
+                            max_clip_length=self.rest_hold_frames,
                             requested_frames=requested_cap,
                             avail_bytes=_avail_b, total_bytes=_total_ram_b,
                         )
@@ -1659,11 +2059,9 @@ class Pipeline:
                 # ~410-460 MB free encoded 4K fine; ~0 MB free always died).
                 # Warn up front with the fix instead of failing 5 minutes in.
                 try:
-                    _enc_obj = (encoder.underlying
-                                if isinstance(encoder, AsyncEncoder)
-                                else encoder)
+                    _enc_obj = _unwrap_encoder(encoder)
                     _enc_is_nvenc = type(_enc_obj).__name__ == "Encoder"
-                    _enc_headroom_b = max(192 * 1024 * 1024, int(w * h * 36))
+                    _enc_headroom_b = max(192 * 1024 * 1024, int(out_w * out_h * 36))
                     if _enc_is_nvenc and _free_b < _enc_headroom_b:
                         print(
                             f"[Pipeline] WARNING: only "
@@ -1702,7 +2100,27 @@ class Pipeline:
                          ("MPEG-TS remuxed to a CFR temp first (CM-120)"
                           if getattr(decoder, "_ts_remux_path", None) or getattr(_lag, "_dec", None) and getattr(_lag._dec, "_ts_remux_path", None)
                           else ""))
-                _enc_obj = encoder.underlying if isinstance(encoder, AsyncEncoder) else encoder
+                # T20d: WHICH decoder ran -- nvdec | qsv | d3d11va | none (CPU) -- with the
+                # panel's Hardware decode value as 'asked'. 'ffmpeg-cpu' above is an
+                # internal lane id and says nothing about who decoded.
+                _rr.note("hw_decode", str(self.dec_hw_accel),
+                         str(getattr(decoder, "hw_decode", decoder.backend) or decoder.backend),
+                         str(getattr(decoder, "hw_decode_reason", "") or
+                             ("NVIDIA NVDEC; the panel's Hardware decode applies to the ffmpeg lane only"
+                              if decoder.backend == "nvdec" else "")))
+                # CM-246: the container ffprobe had to be TOLD about (a picture
+                # header glued in front of the stream fools auto-detection).
+                try:
+                    from chitramaya.video.source_format import describe as _src_forced
+                    _forced = _src_forced(str(inp))
+                    if _forced:
+                        _rr.note("source_format", "auto", _forced,
+                                 "ffprobe auto-detection saw an image format (a picture header in front of "
+                                 "the stream); the demuxer was forced from the file extension for every "
+                                 "ffmpeg/ffprobe call, including the audio probe and sidecar (CM-246)")
+                except Exception:
+                    pass
+                _enc_obj = _unwrap_encoder(encoder)
                 _rr.note("encoder", str(self.enc_codec),
                          f"{type(_enc_obj).__name__}:{getattr(_enc_obj, 'codec', self.enc_codec)}"
                          f" preset={getattr(_enc_obj, 'preset', '')} qp={getattr(_enc_obj, 'qp', '')}"
@@ -1717,18 +2135,65 @@ class Pipeline:
                          type(restorer).__name__ if restorer is not None else "none",
                          getattr(self, "_rest_engine_note", "") or "")
                 _sec_ran = ("none" if self._secondary is None
-                            else f"{type(self._secondary).__name__}:{getattr(self._secondary, 'scale', '')}x")
-                _rr.note("secondary", _ak.get("secondary"), _sec_ran,
-                         "requested secondary unavailable on this GPU/edition; ran without one (CM-184 pending)"
-                         if (_ak.get("secondary") not in ("none", "", None) and self._secondary is None) else "")
+                            else f"{type(self._secondary).__name__}:{getattr(self._secondary, 'scale', '')}x"
+                            + (f" ({self._secondary.describe()})" if hasattr(self._secondary, "describe") else ""))
+                # Mask preview / censor modes build no secondary and no
+                # stabilizer by design; say so instead of blaming the GPU
+                # (a mask run's report used to read "unavailable on this
+                # GPU/edition" and "denoise ran ultra"; 09-17).
+                _not_real = self.mode != "real"
+                _rr.note("secondary", _ak.get("secondary"),
+                         "none (mask preview)" if (_not_real and _ak.get("secondary") not in ("none", "", None)) else _sec_ran,
+                         "not used in preview/censor mode" if _not_real else
+                         ("requested secondary unavailable on this GPU/edition; ran without one"
+                          if (_ak.get("secondary") not in ("none", "", None) and self._secondary is None)
+                          else (getattr(self, "_secondary_fallback", "") or "")))
+                _is_rtx_sec = str(self.secondary_restoration).startswith("rtx")
                 _rr.note("secondary_denoise", _ak.get("secondary_denoise"),
-                         str(getattr(self, "secondary_denoise", "none")), "")
+                         "none" if (_not_real or self._secondary is None) else
+                         (str(getattr(self, "secondary_denoise", "none")) if _is_rtx_sec else "n/a"),
+                         "not used in preview/censor mode" if _not_real else
+                         ("Scaler Denoise is the RTX scaler's; Real-ESRGAN has none" if (self._secondary is not None and not _is_rtx_sec) else ""))
+                _rr.note("secondary_quality", _ak.get("secondary_quality"),
+                         "none" if (_not_real or self._secondary is None) else
+                         (str(getattr(self, "secondary_quality", "high")) if str(self.secondary_restoration).startswith("rtx") else "n/a"),
+                         "not used in preview/censor mode" if _not_real else
+                         ("Real-ESRGAN has no quality level" if (self._secondary is not None and not str(self.secondary_restoration).startswith("rtx")) else ""))
+                _rr.note("output_upscale", _ak.get("output_upscale"),
+                         (f"{self._output_upscaler.scale:.3g}x -> {out_w}x{out_h}" if self._output_upscaler is not None
+                          else "none"),
+                         self._output_upscale_note)
+                _rr.note("upscale_scaler", _ak.get("upscale_scaler"),                       # CM-228
+                         (getattr(self._output_upscaler, "name", "none") if self._output_upscaler is not None
+                          else "none"),
+                         "" if self._upscale_scaler_note in ("", "rtx", "esrgan", "custom") else self._upscale_scaler_note)
                 _rr.note("blendmask", _ak.get("blendmask"), str(self.rest_blendmask), "")
-                _rr.note("feather_radius", _ak.get("feather_radius"), int(self.feather_radius),
-                         "0 = auto (derived from crop size) with the facefusion mask" if self.feather_radius == 0 else "")
+                # CM-214: report the pixels auto resolves to on THIS frame size.
+                from chitramaya.mosaic.utils.mask_utils import auto_feather_px as _afp, FRAME_FEATHER_RATIO as _ffr
+                _rr.note("feather_radius", _ak.get("feather_radius"),
+                         int(self.feather_radius) if self.feather_radius > 0 else int(_afp(int(h), (int(h), int(w)))),
+                         (f"auto = {100.0 * _ffr:.1f} % of frame height {int(h)} (capped by what each region's "
+                          f"crop can hold); applies with the facefusion mask")
+                         if self.feather_radius == 0 else "")
                 _rr.note("max_clip_length", _ak.get("max_clip_length"), int(self.rest_max_clip_length), "")
-                _rr.note("temporal_stability", int(self.cfg.get("temporal_stability", default=0) or 0),
-                         int(self.cfg.get("temporal_stability", default=0) or 0), "")
+                _rr.note("crop_cap_px", _ak.get("crop_cap_px"), int(self.crop_cap_px),                # CM-227 (T18)
+                         "0 = crops stored native (default); N = open-scene crops above N px stored "
+                         "downscaled (bilinear, no antialias; resized to the clip with nearest since T26 so "
+                         "the restorer sees the native path's detail) -- the 4K-on-8-GB lever; frames "
+                         "listed in frames.capped"
+                         if self.mode != "none" else "n/a in Upscale mode (no scenes)")
+                _rr.note("temporal_overlap", _ak.get("temporal_overlap"), int(self.rest_temporal_overlap),
+                         self._overlap_note or ("0 = hard clip cuts (no continuation)" if self.rest_temporal_overlap == 0 else ""))
+                _rr.note("crossfade", bool(self.rest_crossfade), bool(self.rest_blend_frames > 0),
+                         "" if (self.rest_temporal_overlap > 0 or not self.rest_crossfade) else "needs Overlap > 0")
+                _bf_ask = int(self.cfg.get("restoration", "blend_frames", default=-1))
+                _rr.note("blend_frames", _bf_ask if _bf_ask >= 0 else None, int(self.rest_blend_frames),
+                         "auto = Overlap // 3 with Crossfade on" if _bf_ask < 0 else "")
+                _ts_asked = int(self.cfg.get("temporal_stability", default=0) or 0)
+                _rr.note("temporal_stability", _ts_asked,
+                         0 if _not_real else (_ts_asked if self._stabilizer is not None else 0),
+                         "not used in preview/censor mode" if (_not_real and _ts_asked > 0) else
+                         ("stabilizer weights not found; ran without" if (_ts_asked > 0 and self._stabilizer is None) else ""))
                 _rr.note("watchdog_stall_seconds", None,
                          float(self.cfg.get("monitoring", "watchdog_stall_seconds", default=0) or 0) or None,
                          "from ChitraMaya-config.json when set; None = built-in default")
@@ -1749,6 +2214,8 @@ class Pipeline:
                          int(self.det_imgsz),
                          "ran at the TensorRT engine's compiled size (CM-148 'Use engine size')"
                          if (_panel_imgsz is not None and _panel_imgsz != int(self.det_imgsz)) else "")
+                _rr.note("det_batch", _ak.get("det_batch"), int(self.batch_size),
+                         getattr(self, "_det_batch_note", "") or "")   # CM-203
                 _rr.note("run_files", str(self.cfg.get("runReport", default="beside") or "beside"),
                          str(getattr(self._report, "mode", "beside")),
                          "the .run.json / .log / .timecodes.txt set: beside the video | Temp folder | off "
@@ -1772,6 +2239,7 @@ class Pipeline:
                 print(format_vram("after models", _snap0))
                 if self._report is not None:
                     self._report.vram("after_models", _snap0, frame=0)
+                self._vram_preflight(_snap0, w, h, store)                       # CM-221
         except Exception:
             pass
 
@@ -1895,7 +2363,14 @@ class Pipeline:
             except Exception:
                 pass
 
-        def _item_to_rgb(item: object) -> torch.Tensor:
+        # T20d (CM-234): one chroma guard per decode lane. The primary lane's
+        # frames get their frame numbers at flush time (consume_batch knows
+        # them); the re-decode lane is counted without numbers.
+        _chroma_guard = Nv12ChromaGuard("decoder")
+        _chroma_guard_lag = Nv12ChromaGuard("re-decode")
+        _chroma_first_hit = [False]
+
+        def _item_to_rgb(item: object, _guard: Nv12ChromaGuard = _chroma_guard) -> torch.Tensor:
             """One decoder item (NVDEC surface or CPU tensor) -> RGB HWC u8 on
             the pipeline device. Shared by consume_batch and, under CM-191,
             by the re-decode drain, so both decoders' frames take one path."""
@@ -1919,6 +2394,10 @@ class Pipeline:
                         metrics.t_upload += (time.perf_counter() - t0_up)
                     else:
                         nv12_dev = t_cpu
+
+                    # T20d: repair an unfinished chroma plane before the CSC, so
+                    # the detector and everything after it see a whole frame.
+                    nv12_dev = _guard.apply(nv12_dev, h)
 
                     t0_csc = time.perf_counter()
                     rgb = nv12_to_rgb_hwc_u8(nv12_dev, width=w, height=h)
@@ -1952,7 +2431,7 @@ class Pipeline:
             (BGR HWC u8 on the pipeline device, own memory)."""
             # flip() copies, so the blend's in-place writes never touch the
             # decoder's surface -- the same tensor the store used to hold.
-            return rgb_hwc_to_bgr_hwc_u8(_item_to_rgb(item))
+            return rgb_hwc_to_bgr_hwc_u8(_item_to_rgb(item, _chroma_guard_lag))
 
         _ledger = {"first_drain": False, "last_release": 0.0}
 
@@ -2040,8 +2519,10 @@ class Pipeline:
                       f"all-black result for {len(hits)} frame(s) "
                       f"({hits[0]}..{hits[-1]}) of a non-black region at "
                       f"{_dt.datetime.now().strftime('%H:%M:%S')}; those frames keep "
-                      f"their source pixels. If this repeats, note the time: it "
-                      f"points at a GPU/driver event, not at the settings.")
+                      f"their source pixels (the mosaic stays on them). The temporal "
+                      f"stabilizer checks its own output first (T20c), so this is the "
+                      f"restorer: note the time and the precision -- it points at a "
+                      f"GPU/driver or fp16 event, not at the detection settings.")
             return out
 
         _region_stats = RegionStats()
@@ -2050,8 +2531,10 @@ class Pipeline:
             """Paste-back for one closed clip: into the store (legacy / VR) or
             into the CM-191 patch plan."""
             try:
+                _stored = getattr(clip, "stored_shapes", None) or []
                 for _i, _shp in enumerate(getattr(clip, "crop_shapes", []) or []):
-                    _region_stats.note(clip.frame_nums[_i] if _i < len(clip.frame_nums) else None, _shp)
+                    _region_stats.note(clip.frame_nums[_i] if _i < len(clip.frame_nums) else None, _shp,
+                                       _stored[_i] if _i < len(_stored) else None)
             except Exception:
                 pass
             if _lag is not None:
@@ -2185,12 +2668,34 @@ class Pipeline:
             else:
                 detections = [Detection(boxes=None, scores=None, classes=None, masks=None) for _ in batch_rgb]
 
+            # T20d (CM-234): read the chroma guard's flags for this batch -- one
+            # host sync, after the detector has synced the stream anyway. The
+            # batch's frames are frame_num .. frame_num + len(batch) - 1.
+            _hits = _chroma_guard.flush()     # [(position in batch, luma rows, chroma rows, from_prev)]
+            if _hits:
+                _fns = [int(frame_num) + int(_pos) for (_pos, _ny, _nuv, _from_prev) in _hits]
+                metrics.chroma_repair_frames.extend(_fns)
+                _chroma_guard.frames_repaired.extend(_fns)
+                if not _chroma_first_hit[0]:
+                    _chroma_first_hit[0] = True
+                    print(f"[Decoder] WARNING (decode guard, T20d/e/f): frame {_fns[0]} arrived unfinished "
+                          f"from the hardware decoder ({_chroma_guard.describe_rows(_hits[0][1], _hits[0][2])} "
+                          f"at 0/255 -- the download stopped early); those rows were completed from the "
+                          f"previous frame. Counted; the run summary lists them.")
+            _chroma_guard_lag.flush()         # re-decode lane: counted, summarized at the end
+
             # -----------------------------
             # Consumer: track/restore/composite/encode
             # Drain encode ONCE per batch.
             # -----------------------------
-            if tracker is None or self.mode == "none":
+            _passthrough_only = (tracker is None or self.mode == "none")
+            if _passthrough_only:
                 # No tracker: encode directly, but sync once per batch (not per frame).
+                # T17b: these ARE delivered frames -- count them as passthrough so
+                # the UI progress, the 500-frame console checkpoint (with its GPU
+                # sample) and the run.json checkpoints, which all key off
+                # completed frames, keep moving in the Upscale / re-encode mode
+                # (field 09-20: the bar sat at 0 % for a 2h47m job).
                 if self.enc_sync_before_encode:
                     sync_device(self.device)
                 t0 = time.perf_counter()
@@ -2201,12 +2706,12 @@ class Pipeline:
                     encoder.encode_frame(bgr_u8_to_bgra_u8(bgr_u8))
                     frame_num += 1
                     metrics.processed_frames += 1
+                    metrics.early_passthrough_frames += 1
                     pbar.update(1)
                 metrics.t_encode += (time.perf_counter() - t0)
-                return
 
             safe_before_batch: int = frame_num
-            for i, bgr_u8 in enumerate(batch_bgr_u8):
+            for i, bgr_u8 in (enumerate(batch_bgr_u8) if not _passthrough_only else ()):
                 if self.max_frames is not None and frame_num >= self.max_frames:
                     break
 
@@ -2273,6 +2778,9 @@ class Pipeline:
                         _composite_closed_clip(clip, restored)         # store or CM-191 plan
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
+                        if int(getattr(clip, "n_seeded", 0) or 0) > 0:      # CM-213
+                            metrics.continuation_clips += 1
+                            metrics.overlap_frames += int(clip.n_seeded)
                         metrics.t_restore += (time.perf_counter() - t0)
 
                         # FOI: snapshot the target frame AFTER paste-back. If a
@@ -2300,9 +2808,10 @@ class Pipeline:
                 pbar.update(1)
 
             # Drain once per batch (sync once per drain happens inside the drain helper)
-            t0 = time.perf_counter()
-            _drain(int(safe_before_batch))
-            metrics.t_encode += (time.perf_counter() - t0)
+            if not _passthrough_only:
+                t0 = time.perf_counter()
+                _drain(int(safe_before_batch))
+                metrics.t_encode += (time.perf_counter() - t0)
 
             # T9b: honest console checkpoint. tqdm's it/s is the INSTANTANEOUS
             # rate between clip flushes; on a full title it read "29 it/s,
@@ -2334,20 +2843,49 @@ class Pipeline:
                     # checkpoint (console + report column 3) -- one driver
                     # call per 500 frames, and the run's own memory timeline.
                     _ck_vram = None
+                    _ck_torch = None
                     try:
                         if self.device.type == "cuda":
                             _cf, _ct = torch.cuda.mem_get_info(
                                 self.device.index if self.device.index is not None else 0)
                             _ck_vram = int((_ct - _cf) // (1024 * 1024))
                             _ck_line += f"  vram {_ck_vram} MB"
+                            # T23b (CM-238): the torch split rides along --
+                            # allocated/reserved. 'vram' at the wall with a
+                            # wide split is the cache holding what the
+                            # natives will ask for next; a narrow split at
+                            # the wall is the real working set.
+                            _ta = int(torch.cuda.memory_allocated(self.device) // (1024 * 1024))
+                            _trs = int(torch.cuda.memory_reserved(self.device) // (1024 * 1024))
+                            _ck_torch = (_ta, _trs)
+                            _ck_line += f"  torch {_ta}/{_trs}"
                     except Exception:
-                        _ck_vram = None
+                        _ck_vram = _ck_vram if _ck_vram is not None else None
+                    # CM-209: the watchdog's NVML medians since the last
+                    # checkpoint ride along -- PCIe tx/rx and NVENC util are
+                    # the two numbers that tell a paging run from a slow one.
+                    _gs = None
+                    try:
+                        _gsm = getattr(_watchdog, "gpu", None)
+                        if _gsm is not None and _gsm.active:
+                            _gs = _gsm.checkpoint_summary()
+                    except Exception:
+                        _gs = None
+                    if _gs and _gs.get("pcie_tx_gbs") is not None:
+                        _ck_line += (f"  pcie {_gs['pcie_tx_gbs']:.1f}/{_gs['pcie_rx_gbs']:.1f} GB/s")
+                        if _gs.get("enc_util") is not None:
+                            _ck_line += f"  nvenc {_gs['enc_util']:.0f}%"
+                        if _gs.get("paging"):
+                            _ck_line += "  PAGING"
                     try:
                         pbar.write(_ck_line)
                     except Exception:
                         print(_ck_line, flush=True)
                     if self._report is not None:
-                        self._report.checkpoint(_ck_done, _ck_el, vram_used_mb=_ck_vram)
+                        if _ck_torch is not None:
+                            _gs = dict(_gs) if _gs else {}
+                            _gs["torch_alloc_mb"], _gs["torch_reserved_mb"] = _ck_torch   # T23b
+                        self._report.checkpoint(_ck_done, _ck_el, vram_used_mb=_ck_vram, gpu=_gs)
             except Exception:
                 pass
 
@@ -2395,7 +2933,8 @@ class Pipeline:
                 # ~125s; short clips in ~5-10s -- ~1.3% of source duration
                 # with a 10s floor models both.
                 _fin_est = max(10.0, 0.013 * (float(total_frames) / max(fps, 1e-6)))
-                _mode = "detect-only" if (restorer is None and not self.analysis_use_synth_rois) else "restore"
+                _mode = ("upscale" if self.mode == "none" else
+                         "detect-only" if (restorer is None and not self.analysis_use_synth_rois) else "restore")
                 try:
                     progress_cb(
                         frame_num=_pf,
@@ -2450,8 +2989,20 @@ class Pipeline:
                   "clip can take several minutes with no visible progress (a stack dump from "
                   "the watchdog during that wait is a diagnosis, not a crash). Later runs, "
                   "and later clips of the same size, start immediately.")
+        def _wd_progress() -> int:
+            # frames delivered + crops through the secondary (CM-232): a slow
+            # custom scaler (seconds per crop, 09-22) freezes the frame count for
+            # a whole clip while working flat out; its crops are progress too
+            n = int(metrics.processed_frames)
+            try:
+                _st = getattr(self._secondary, "stats", None) if self._secondary is not None else None
+                if _st is not None:
+                    n += int(getattr(_st, "crops_seen", 0) or 0)
+            except Exception:
+                pass
+            return n
         _watchdog = StallWatchdog(
-            lambda: int(metrics.processed_frames),
+            _wd_progress,
             stall_seconds=_wd_stall,
             gpu_index=self.dec_gpu_id,
             label=str(Path(self.input_path).name),
@@ -2530,7 +3081,7 @@ class Pipeline:
                         if store.is_full() and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
-                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                new_max = _compute_emergency_store_max(w, h, self.rest_hold_frames, store.max_frames, self.device)
                                 if new_max > store.max_frames:
                                     old_max = store.max_frames
                                     store.max_frames = new_max
@@ -2591,7 +3142,7 @@ class Pipeline:
                         if store.is_full() and min_start is not None and len(store.frames_bgr_u8) > 0:
                             oldest = min(store.frames_bgr_u8.keys())
                             if sb <= oldest:
-                                new_max = _compute_emergency_store_max(w, h, self.rest_max_clip_length, store.max_frames, self.device)
+                                new_max = _compute_emergency_store_max(w, h, self.rest_hold_frames, store.max_frames, self.device)
                                 if new_max > store.max_frames:
                                     old_max = store.max_frames
                                     store.max_frames = new_max
@@ -2692,6 +3243,9 @@ class Pipeline:
                         _composite_closed_clip(clip, restored)
                         metrics.frames_restored.update(int(fn) for fn in clip.frame_nums)
                         metrics.clip_lengths.append(int(len(clip.frame_nums)))
+                        if int(getattr(clip, "n_seeded", 0) or 0) > 0:      # CM-213
+                            metrics.continuation_clips += 1
+                            metrics.overlap_frames += int(clip.n_seeded)
                         metrics.t_restore += (time.perf_counter() - _t_eof)
                         if (_foi_target is not None
                                 and int(_foi_target) in clip.frame_nums
@@ -2764,7 +3318,7 @@ class Pipeline:
                     print("[PTS] WARNING: Variable frame rate detected. Timecodes file written for accurate remux.")
                 # Set PTS metadata on the underlying Encoder (works whether
                 # encoder is a bare Encoder or wrapped in AsyncEncoder).
-                _real_encoder = encoder.underlying if isinstance(encoder, AsyncEncoder) else encoder
+                _real_encoder = _unwrap_encoder(encoder)
                 _real_encoder._pts_fps = pts_fps
                 _real_encoder._pts_timecodes_path = tc_path
                 _real_encoder._pts_is_vfr = is_vfr
@@ -2810,12 +3364,37 @@ class Pipeline:
                       f"timeline jump(s) were too large to fill -- audio "
                       f"sync shifts at those points (source timeline is "
                       f"discontinuous).")
+            # CM-235: tell the encoder what the filler did, so the finalize
+            # stamps the container at the right rate (source holes -> the
+            # fills ADD frames beyond the source's count -> the rate lifts;
+            # decoder drops -> the count is restored -> the rate stays).
+            if _filler is not None and _filler.total_filled > 0:
+                try:
+                    _enc0 = _unwrap_encoder(encoder)
+                    if hasattr(_enc0, "note_gap_fill"):
+                        _src_frames = int(decoder.num_frames or 0)
+                        _hs = float(getattr(_enc0, "_head_skip_seconds", 0.0) or 0.0)
+                        if _hs > 0 and fps > 0:
+                            _src_frames -= int(round(_hs * fps))
+                        _enc0.note_gap_fill(
+                            filled=int(_filler.total_filled),
+                            source_frames=int(_src_frames),
+                            discontinuous=bool(_filler.skipped_gaps))
+                except Exception as _gf_e:
+                    print(f"[Pipeline] gap-fill rate note failed ({_gf_e}); "
+                          f"the finalize keeps the source rate")
             try:
                 _promised = int(decoder.num_frames or 0)
                 _filled = int(_filler.total_filled) if _filler else 0
                 _short = _promised - int(metrics.processed_frames) - 0
+                # A run that errored (NVENC death, GPU loss) or was cancelled
+                # is SHORT BECAUSE IT STOPPED, not because the decoder lost
+                # frames -- the PARTIAL RESULT line already says so; the
+                # "AUDIO MAY BE OUT OF SYNC" warning here would be a false
+                # alarm (09-15 clean-machine run: CM-122 at 43 % printed it).
                 if (_promised > 0 and _short > 0 and _filled == 0
                         and self.max_frames is None
+                        and not _inflight_exc
                         and not (cancel_flag is not None and cancel_flag.is_set())):
                     _sec = _short / fps if fps > 0 else 0.0
                     _head_known = 0.0
@@ -2918,8 +3497,7 @@ class Pipeline:
             # survived so callers (server -> UI, CLI) can report "PARTIAL:
             # encoded M of N" honestly instead of implying total loss.
             try:
-                _real_enc = (encoder.underlying
-                             if isinstance(encoder, AsyncEncoder) else encoder)
+                _real_enc = _unwrap_encoder(encoder)
                 _frames_enc = int(getattr(_real_enc, "_frames_encoded", 0) or 0)
                 _needs_remux = bool(getattr(_real_enc, "_needs_remux", False))
                 _remux_ok = bool(getattr(_real_enc, "_remux_ok", False))
@@ -3006,18 +3584,69 @@ class Pipeline:
                       f"missing={metrics.redecode_missing}; "
                       f"peak pending patches {metrics.redecode_peak_patch_mb:.0f} MB "
                       f"in {'pinned RAM' if getattr(store, 'patch_home', 'host') == 'host' else 'VRAM'}")
+            # CM-219: what the whole-frame upscale cost.
+            _ups = self._output_upscaler.summary() if self._output_upscaler is not None else None
+            if _ups:
+                print(f"[OutputUpscale] {_ups['scaler']} {_ups['input']} -> {_ups['output']} on {_ups['frames']} "
+                      f"frames: {_ups['wall_s']:.1f}s wall ({_ups['ms_per_frame']:.1f} ms/frame, inside t_encode)")
+            # CM-209: the run's GPU counters in one line (NVML, 5 s polls).
+            try:
+                _gsm = getattr(_watchdog, "gpu", None)
+                _gsum = _gsm.run_summary() if _gsm is not None else None
+                if _gsum and _gsum.get("samples"):
+                    _vm = _gsum["vram_used_mb"]; _tx = _gsum["pcie_tx_gbs"]; _rx = _gsum["pcie_rx_gbs"]
+                    _en = _gsum["enc_util"]; _pg = float(_gsum.get("paging_seconds") or 0)
+                    _vt = int(_gsum.get("vram_total_mb") or 0)
+                    _pct = f" ({100.0 * _vm['median'] / _vt:.0f} %)" if (_vt and _vm.get("median") is not None) else ""
+                    print(f"[Pipeline] GPU over the run ({_gsum['samples']} samples): "
+                          f"VRAM median {_vm['median']:.0f} MB{_pct}, max {_vm['max']:.0f}; "
+                          f"PCIe tx/rx median {_tx['median']:.2f}/{_rx['median']:.2f} GB/s, "
+                          f"p90 {_tx['p90']:.2f}/{_rx['p90']:.2f}; "
+                          f"NVENC median {_en['median'] if _en['median'] is not None else '?'} %; "
+                          + (f"VRAM PAGING {_pg:.0f} s in {_gsum['paging_episodes']} episode(s) -- "
+                             f"see the [Watchdog] lines" if _pg > 0 else "no paging"))
+            except Exception:
+                pass
             # CM-186: black-output guard hits (should be zero)
             if metrics.guard_black_frames:
                 _gb = metrics.guard_black_frames
                 print(f"[Pipeline] WARNING: CM-186 guard refused {len(_gb)} all-black "
                       f"restorer result(s) (frames {min(_gb)}..{max(_gb)}); those "
                       f"frames kept their source pixels.")
+                metrics.warnings.append(f"{len(_gb)} frame(s) kept their MOSAIC: the restorer returned "
+                                        f"all-black for them (frames {min(_gb)}..{max(_gb)}; CM-186 guard)")
+            # T20d/e (CM-234): decoded frames that arrived unfinished (luma and/or chroma)
+            for _cg in (_chroma_guard, _chroma_guard_lag):
+                _cs = _cg.summary()
+                if _cs:
+                    print(f"[Decoder] decode guard ({_cg.label} lane): {_cs}.")
+                    metrics.warnings.append(f"{_cs} ({_cg.label} lane; the download stopped early -- "
+                                            f"Hardware Decode = Off avoids it, at CPU cost)")
+            # T20c: stabilizer windows that failed their own check
+            _stab = getattr(self, "_stabilizer", None)
+            if _stab is not None and (getattr(_stab, "bad_windows", 0) or getattr(_stab, "fp32_fallbacks", 0)):
+                _bw = int(getattr(_stab, "bad_windows", 0) or 0)
+                _fb = int(getattr(_stab, "fp32_fallbacks", 0) or 0)
+                print(f"[TemporalFix] summary: {_bw} window(s) came back black / non-finite and kept "
+                      f"their restored pixels unsmoothed"
+                      f"{'; the stabilizer switched to fp32 after the first fp16 failure' if _fb else ''}.")
+                if _bw:
+                    metrics.warnings.append(f"{_bw} restored frame(s) skipped temporal smoothing (stabilizer "
+                                            f"output was black / non-finite for their window)")
+                if _fb:
+                    metrics.warnings.append("the temporal stabilizer fell back from fp16 to fp32 during the run")
             print(
                 f"[Pipeline] Processing time (no mux) = {t_total_no_mux:.2f}s "
                 f"Overhead = {overhead:.2f}s (sum_parts={sum_parts:.2f}s)"
             )
             print(f"[Pipeline] Total time (with mux) = {t_total_with_mux:.2f}s (mux={metrics.t_mux:.2f}s)")
-            print(f"[Pipeline] DONE: Processed  &  Remuxed {metrics.processed_frames} frames")
+            if metrics.warnings:
+                print(f"[Pipeline] DONE WITH WARNINGS: Processed  &  Remuxed {metrics.processed_frames} frames -- "
+                      f"{len(metrics.warnings)} warning(s):")
+                for _w in metrics.warnings:
+                    print(f"[Pipeline]   ! {_w}")
+            else:
+                print(f"[Pipeline] DONE: Processed  &  Remuxed {metrics.processed_frames} frames")
             print(f"[Pipeline] early_passthrough_frames={metrics.early_passthrough_frames}")
 
             fw, ft, tb, avg_area, pct = metrics.det_stats.summary()
@@ -3036,8 +3665,17 @@ class Pipeline:
             #                          (warmup or genuine clean stretch). NOT a miss.
             #   3. restoration_miss  = detected but never made it to compositor.
             #                          Should be 0; non-zero is a bug.
-            #   4. visible_miss      = everything else. These are the frames where the
-            #                          user can SEE mosaic that should have been restored.
+            #   4. ttl_tail          = no detection, not restored, but a scene was
+            #                          still open: the (TTL + 1) frames after a
+            #                          scene's last detection while the tracker
+            #                          waits for the region to come back, then
+            #                          closes it. Nothing to see there (CM-231:
+            #                          on the close-up title every one of the
+            #                          4,221 'visible misses' was one of these).
+            #   5. visible_miss      = everything else: detected, not restored,
+            #                          not legit. These are the frames where the
+            #                          user can SEE mosaic that should have been
+            #                          restored. Should be 0.
             #
             # The actionable list for tuning is visible_miss_frames. Use mask-viz mode
             # (--mode pseudo) to confirm them visually.
@@ -3045,7 +3683,8 @@ class Pipeline:
             det_set = metrics.det_stats.frames_with_det_set
             rest_set = metrics.frames_restored
             legit_set = metrics.frames_legit_passthrough
-            miss_set = all_frames - rest_set - legit_set
+            ttl_tail_set = all_frames - rest_set - legit_set - det_set     # CM-231
+            miss_set = all_frames - rest_set - legit_set - ttl_tail_set
 
             fr = len(rest_set)
             legit = len(legit_set)
@@ -3055,6 +3694,7 @@ class Pipeline:
             gap_fill_set = rest_set - det_set            # restored without a direct det (TTL bridge)
             gap_fill_bonus = len(gap_fill_set)
             visible_miss = len(miss_set)
+            ttl_tail = len(ttl_tail_set)                                      # CM-231
 
             # Restorer workload — clips x clip-length drives restore cost far
             # better than box count. total_clip_frames = frames actually fed to
@@ -3087,13 +3727,23 @@ class Pipeline:
                 f"gap_fill_bonus={gap_fill_bonus} "
                 f"legit_passthrough={legit} "
                 f"visible_miss={visible_miss} "
-                f"restoration_miss={restoration_miss}"
+                f"restoration_miss={restoration_miss} "
+                f"ttl_tail={ttl_tail}"
             )
             print(
                 f"[ClipStats] clips={n_clips} total_clip_frames={total_clip_frames} "
                 f"len_min={clip_min} len_med={clip_med} len_max={clip_max} len_mean={clip_mean} "
                 f"capped={capped} ({capped_pct}% at MCL={_mcl})"
             )
+            # CM-213: what the overlap cost and where it applied. extra_pct is
+            # the lead-in frames over the frames the run would have restored
+            # without them -- the restorer-time price of the seams.
+            _ov_new = max(0, total_clip_frames - int(metrics.overlap_frames))
+            _ov_pct = round(100.0 * metrics.overlap_frames / _ov_new, 1) if _ov_new else 0.0
+            if self.rest_temporal_overlap > 0:
+                print(f"[Overlap] continuation_clips={metrics.continuation_clips} "
+                      f"lead_in_frames={metrics.overlap_frames} (+{_ov_pct}% restorer frames) "
+                      f"overlap={self.rest_temporal_overlap} crossfade_frames={2 * self.rest_blend_frames}")
 
             # CM-077b: did the secondary (RTX Super-Res) actually fire, and
             # where? The gate opens only for crops whose original region
@@ -3108,6 +3758,18 @@ class Pipeline:
                 _top = ", ".join(f"{d['frame']}({d['crop_px']}px)" for d in _region_stats.top_frames(5))
                 print(f"[RegionStats] crops={_region_stats.crops} largest_crop_px={_region_stats.largest_px} "
                       f"biggest-crop frames: {_top} -- top 20 in the run report (counts.regions)")
+            if self.crop_cap_px > 0:
+                # CM-227: what the cap did, where -- the frames to eyeball
+                _cf = _region_stats.capped_frames
+                if _cf:
+                    _cb = sorted(_cf.items(), key=lambda kv: (-kv[1][0], kv[0]))[:5]
+                    _cbs = ", ".join(f"{f}({nv}->{st}px)" for f, (nv, st) in _cb)
+                    print(f"[CropCap] {self.crop_cap_px} px: {_region_stats.capped_crops} of {_region_stats.crops} "
+                          f"crops stored downscaled on {len(_cf)} frames; biggest: {_cbs} -- "
+                          f"list in the run report (frames.capped, counts.regions.capped_biggest)")
+                else:
+                    print(f"[CropCap] {self.crop_cap_px} px: no crop exceeded it (largest "
+                          f"{_region_stats.largest_px} px) -- the cap changed nothing on this run")
             if _sec_stats is not None:
                 _sec_pct = round(
                     100.0 * _sec_stats.crops_upscaled / _sec_stats.crops_seen, 1
@@ -3147,6 +3809,33 @@ class Pipeline:
             # panel, the effective values, structured timing and events;
             # per-frame lists are run-length ranges (kilobytes, not
             # megabytes). Off with runReport = off.
+            # CM-205: residual scan -- the run's own detector over the finished
+            # output's key frames. Says what a viewer would still see, which
+            # the frame counters above cannot (a frame with one region restored
+            # and one missed counts as restored). Measurement only; never
+            # touches the output. Skipped for partial results and preview /
+            # censor modes; off with the panel's Residual Scan switch.
+            _residual = None
+            try:
+                if (self.mode == "real" and bool(getattr(self, "residual_scan", True))
+                        and detector is not None and not _inflight_exc
+                        and not (cancel_flag is not None and cancel_flag.is_set())
+                        and Path(str(out)).is_file()):
+                    from chitramaya.mosaic.residual_scan import scan_output, format_console
+                    _ff = (getattr(encoder, "ffmpeg_path", None)
+                           or getattr(locals().get("_real_encoder"), "ffmpeg_path", None) or "ffmpeg")
+                    _residual = scan_output(
+                        str(out), detector, ffmpeg=str(_ff), device=self.device,
+                        fps=float(fps), frame_w=int(w), frame_h=int(h),
+                        imgsz=int(self.det_imgsz), conf=float(self.det_conf),
+                        batch_size=int(self.batch_size), restored_frames=set(rest_set),
+                        cancel_flag=cancel_flag)
+                    for _ln in format_console(_residual):
+                        print(_ln)
+            except Exception as _res_e:
+                print(f"[Residual] scan skipped: {_res_e}")
+                _residual = None
+
             self.last_report_path = None
             if self._report is not None:
                 try:
@@ -3157,6 +3846,22 @@ class Pipeline:
                         _rr.event("black_output_guard", _gb[0],
                                   f"restorer returned all-black for {len(_gb)} clip frame(s); source pixels kept (CM-186)",
                                   count=len(_gb))
+                    if _chroma_guard.hits or _chroma_guard_lag.hits:
+                        _cf = sorted(metrics.chroma_repair_frames)
+                        _rr.event("decoder_frame_repair", (_cf[0] if _cf else None),
+                                  f"{int(_chroma_guard.hits + _chroma_guard_lag.hits)} decoded frame(s) arrived "
+                                  f"unfinished ({_chroma_guard.describe_rows(_chroma_guard.luma_rows + _chroma_guard_lag.luma_rows, _chroma_guard.chroma_rows + _chroma_guard_lag.chroma_rows)} "
+                                  f"at 0/255); completed from the previous frame (T20d/e/f, CM-234)",
+                                  count=int(_chroma_guard.hits + _chroma_guard_lag.hits))
+                    _stab2 = getattr(self, "_stabilizer", None)
+                    if _stab2 is not None and int(getattr(_stab2, "bad_windows", 0) or 0):
+                        _rr.event("temporal_fix_guard", None,
+                                  f"{int(_stab2.bad_windows)} stabilizer window(s) black / non-finite; restored "
+                                  f"frames kept unsmoothed"
+                                  f"{'; fell back to fp32' if int(getattr(_stab2, 'fp32_fallbacks', 0) or 0) else ''} (T20c)",
+                                  count=int(_stab2.bad_windows))
+                    if metrics.warnings:
+                        _rr.set_warnings(list(metrics.warnings))
                     if metrics.redecode_skipped or metrics.redecode_missing:
                         _rr.event("redecode_alignment", None,
                                   f"skipped={metrics.redecode_skipped} missing={metrics.redecode_missing} (CM-191)",
@@ -3166,12 +3871,40 @@ class Pipeline:
                         _rr.event("gap_fill", None,
                                   f"{_fl.total_filled} duplicate frame(s) across {len(_fl.gaps)} gap(s) (CM-120)",
                                   count=int(_fl.total_filled))
+                        # CM-235: the rate the finalize stamped after the fills
+                        try:
+                            _oru = getattr(_unwrap_encoder(encoder), "_output_rate_used", None)
+                            if _oru:
+                                _rr.note("output_rate", _oru["source"], _oru["output"],
+                                         (f"gap-fill: {_oru['encoded']} encoded / {_oru['source_frames']} "
+                                          f"source frames = {_oru['ratio']}; the container rate keeps "
+                                          f"the source's duration (CM-235)")
+                                         if _oru["output"] != _oru["source"] else
+                                         (f"gap-fill restored the source's frame count "
+                                          f"({_oru['encoded']} = {_oru['source_frames']}); rate unchanged (CM-235)"))
+                        except Exception:
+                            pass
                     if _fl is not None and getattr(_fl, "skipped_gaps", None):
                         _rr.event("timeline_jump_unfilled", None,
                                   f"{len(_fl.skipped_gaps)} jump(s) too large to fill", count=len(_fl.skipped_gaps))
                     _flaps = int(getattr(_watchdog, "flap_count", 0) or 0)
                     if _flaps:
                         _rr.event("pcie_flap", None, f"{_flaps} down-train/recover cycle(s)", count=_flaps)
+                    # CM-209: the run's GPU counters (NVML, 5 s polls) and paging time.
+                    try:
+                        _gsm = getattr(_watchdog, "gpu", None)
+                        _gsum = _gsm.run_summary() if _gsm is not None else None
+                    except Exception:
+                        _gsum = None
+                    if _gsum:
+                        # (counts.gpu_monitor is filled in below, once _counts exists --
+                        # T12 wrote it here, before the dict, and every NVIDIA run since
+                        # lost its run report to an UnboundLocalError; field 09-18.)
+                        if _gsum.get("paging_seconds"):
+                            _rr.event("vram_paging", None,
+                                      f"VRAM paging for {_gsum['paging_seconds']:.0f} s in "
+                                      f"{_gsum['paging_episodes']} episode(s) (CM-209)",
+                                      count=int(_gsum["paging_episodes"]))
                     _re_obj = locals().get("_real_encoder")
                     _head = float(getattr(_re_obj, "_head_skip_seconds", 0.0) or 0.0) if _re_obj is not None else 0.0
                     if _head > 0:
@@ -3190,7 +3923,8 @@ class Pipeline:
                         "resolution": [int(w), int(h)],
                         "source_container": str(getattr(decoder, "_container_format", "") or ""),
                         "partial": bool(_inflight_exc or (cancel_flag is not None and cancel_flag.is_set())),
-                        "mode": self.mode,
+                        "mode": ("upscale-only" if (self.mode == "none" and self._output_upscaler is not None)
+                                 else "re-encode" if self.mode == "none" else self.mode),   # CM-228
                     }
                     _timing = {
                         "wall_s": round(float(t_total_with_mux), 2),
@@ -3217,6 +3951,7 @@ class Pipeline:
                         "legit_passthrough": int(legit),
                         "visible_miss": int(visible_miss),
                         "restoration_miss": int(restoration_miss),
+                        "ttl_tail": int(ttl_tail),                                  # CM-231
                         "early_passthrough_count": int(metrics.early_passthrough_frames),
                         "total_boxes": int(getattr(metrics.det_stats, "total_boxes", 0) or 0),
                         "clips": {
@@ -3229,10 +3964,24 @@ class Pipeline:
                             "capped": int(capped),
                             "capped_pct": float(capped_pct),
                         },
+                        "overlap": {                                    # CM-213
+                            "overlap": int(self.rest_temporal_overlap),
+                            "crossfade_frames": int(2 * self.rest_blend_frames),
+                            "continuation_clips": int(metrics.continuation_clips),
+                            "lead_in_frames": int(metrics.overlap_frames),
+                            "extra_pct": float(_ov_pct),
+                        },
                         "regions": {
                             "crops": int(_region_stats.crops),
                             "largest_crop_px": int(_region_stats.largest_px),
                             "biggest_frames": _region_stats.top_frames(20),
+                            "crop_cap_px": int(self.crop_cap_px),                           # CM-227
+                            "capped_crops": int(_region_stats.capped_crops),
+                            "capped_frames": len(_region_stats.capped_frames),
+                            "capped_biggest": [
+                                {"frame": int(f), "native_px": int(nv), "stored_px": int(st)}
+                                for f, (nv, st) in sorted(_region_stats.capped_frames.items(),
+                                                          key=lambda kv: (-kv[1][0], kv[0]))[:20]],
                         },
                         "secondary": None if _sec_stats is None else {
                             "mode": str(self.secondary_restoration),
@@ -3246,13 +3995,31 @@ class Pipeline:
                             "biggest_frames": _sec_stats.top_frames(20),
                         },
                     }
+                    if _gsum:
+                        _counts["gpu_monitor"] = _gsum                                     # CM-209
+                    if getattr(self, "_vram_preflight_note", None):
+                        _counts["vram_preflight"] = dict(self._vram_preflight_note)         # CM-221
+                    if _ups:
+                        _counts["output_upscale"] = dict(_ups, output=f"{out_w}x{out_h}")   # CM-219
+                    if _residual is not None:
+                        _counts["residual_scan"] = {k: v for k, v in _residual.items()
+                                                    if k != "residual_frames"}
+                        if _residual.get("residual_count"):
+                            _rr.event("residual", (_residual.get("residual_frames") or [None])[0],
+                                      f"mosaic still detected on {_residual['residual_count']} of "
+                                      f"{_residual['sampled']} sampled key frames (CM-205)",
+                                      count=int(_residual["residual_count"]))
                     _frames = {
                         "visible_miss": sorted(miss_set),
                         "restoration_miss": sorted(restoration_miss_set),
+                        "ttl_tail": sorted(ttl_tail_set),                                   # CM-231
+                        "capped": sorted(_region_stats.capped_frames),                      # CM-227
                         "gap_fill": sorted(gap_fill_set),
                         "legit_passthrough": sorted(legit_set),
                         "secondary_upscaled": sorted(_sec_stats.applied_frames) if _sec_stats is not None else [],
                         "black_output_guard": sorted(metrics.guard_black_frames),
+                        "frame_repair": sorted(metrics.chroma_repair_frames),    # T20d/e (CM-234): decode guard hits
+                        "residual": sorted((_residual or {}).get("residual_frames") or []),
                     }
                     _debug = None
                     if metrics.det_stats.rois:
@@ -3274,6 +4041,19 @@ class Pipeline:
                 elapsed = metrics.wall_end - metrics.wall_start
                 print(f"[Pipeline] Wall clock: start={metrics.wall_start} end={metrics.wall_end} elapsed={elapsed}")
             print(f"[Pipeline] perf_counter elapsed = {t_total_with_mux:.2f}s")
+
+            # T23a (CM-237): the run's LAST step. The raw bitstream, the
+            # RECOVER script and the audio sidecar outlived the finalize on
+            # purpose; the output is read back once more, and only then do
+            # they go. A power cut anywhere before this line costs a re-mux
+            # (the RECOVER script), never a re-run.
+            try:
+                _real_enc = _unwrap_encoder(encoder)
+                if hasattr(_real_enc, "release_salvage"):
+                    _real_enc.release_salvage()
+            except Exception as _sv_e:
+                print(f"[Encoder] salvage release skipped ({type(_sv_e).__name__}: "
+                      f"{_sv_e}); the raw bitstream and RECOVER script stay.")
 
             # [CHANGE 4] Cleanup timecodes file (kept only if VFR; CM-202:
             # never kept when the run-files switch is off)
@@ -3338,6 +4118,7 @@ class MosaicResult:
     detections: int = 0
     restorations: int = 0
     diag_path: Optional[str] = None
+    warnings: list = field(default_factory=list)   # T20c: what "complete" must not hide
 
 
 @dataclass
@@ -3346,20 +4127,20 @@ class MosaicPipelineConfig:
 
     Mirrors exactly the keyword arguments built by
     ChitraMaya.models.MosaicConfig.to_pipeline_config(). Fields marked INERT are
-    accepted for signature compatibility but have no effect: the proven
-    pipeline implements neither temporal crossfade nor color matching (the
-    compositor does spatial mask feathering only). They are surfaced here so a
-    future implementation has a defined home, and so the server's mutation of
-    _discard_margin / _blend_frames remains harmless.
+    accepted for signature compatibility but have no effect (color matching
+    has no implementation). temporal_overlap / crossfade / blend_frames sat
+    here inert from the first commit -- jasna's knobs, scaffolded without the
+    implementation -- until CM-213 (1.80) built it into the tracker and
+    compositor.
     """
     detection_model: str = ""
     restoration_model: str = ""
     detection_score: float = 0.30
     detection_batch_size: int = 8
     max_clip_size: int = 60
-    temporal_overlap: int = 0        # INERT: no temporal-overlap implementation
-    crossfade: bool = False          # INERT: no crossfade implementation
-    blend_frames: int = 0            # INERT: no crossfade implementation
+    temporal_overlap: int = 8        # CM-213: continuation lead-in = 2 * this; 0 = hard cuts
+    crossfade: bool = True           # CM-213: linear crossfade at the seam
+    blend_frames: int = -1           # CM-213: -1 = auto (temporal_overlap // 3 with crossfade)
     mask_preview: bool = False
     mask_color: tuple = (255, 0, 255)
     mask_opacity: float = 0.70
@@ -3390,21 +4171,30 @@ class MosaicPipelineConfig:
     # CM-146 (Batch 70): Maxine DENOISE pass chained after the RTX upscale
     # ("none"|"low"|"medium"|"high"|"ultra"); ignored by esrgan-4x.
     secondary_denoise: str = "none"
+    secondary_quality: str = "high"     # CM-217: Maxine Super-Res quality (RTX modes)
+    output_upscale: str = "none"        # CM-219/CM-228: none | 2x | 4x | 1080p | 1440p | 2160p whole-frame upscale before encode
+    upscale_scaler: str = "esrgan"      # CM-228: esrgan (all GPUs) | rtx (Maxine VideoSuperRes, NVIDIA) | custom:<file> (CM-229)
+    custom_scaler_dir: str = ""         # CM-229: <app>/models/upscalers (the server fills it in)
+    upscale_only: bool = False          # CM-228: decode -> scale -> encode; no detector/restorer (mode "none")
     # CM-078: 0 = off, 1..3 = vs_temporalfix strength — temporal stabilization
     # of restored crops (7-frame window; real restoration mode only).
     temporal_stability: int = 0
     store_max_frames: int = 0
     # CM-084: FrameStore backend -- "auto" | "device" | "host".
     store_backend: str = "auto"
+    # T20d (CM-234): Hardware decode for the ffmpeg lane -- "auto" | "off".
+    hw_decode: str = "auto"
     # CM-202: the panel's run-files switch ("beside" | "temp" | "off");
     # "" = not set by the panel -> the flat runReport key decides.
     run_report: str = ""
     det_imgsz: int = 640
     det_iou: float = 0.70
     roi_dilate: int = 0
+    crop_cap_px: int = 0           # CM-227: Crop Cap; 0 = off (native crops)
     use_seg_masks: bool = True
     feather_radius: int = 0
     blendmask: str = "none"
+    residual_scan: bool = True     # CM-205
 
 
 # ---------------------------------------------------------------------------
@@ -3426,15 +4216,17 @@ _MPC_CONSUMED_FIELDS = frozenset({
     "codec", "preset", "qp", "async_encoder", "write_diagnostics", "run_report",
     "sbs_enabled", "sbs_layout",
     "sbs_det_split", "vr_projection", "secondary_restoration",
-    "secondary_denoise",
+    "secondary_denoise", "secondary_quality", "output_upscale",
+    "upscale_scaler", "upscale_only",   # CM-228
+    "custom_scaler_dir",                # CM-229
     "temporal_stability",
     "store_max_frames", "store_backend", "det_imgsz", "det_iou", "roi_dilate",
-    "use_seg_masks", "feather_radius", "blendmask",
+    "hw_decode",     # T20d (CM-234)
+    "crop_cap_px",   # CM-227
+    "use_seg_masks", "feather_radius", "blendmask", "residual_scan",
+    "temporal_overlap", "crossfade", "blend_frames",   # CM-213: live since 1.80
 })
 _MPC_INERT_FIELDS = frozenset({
-    "temporal_overlap",   # no temporal-overlap implementation
-    "crossfade",          # no crossfade implementation
-    "blend_frames",       # no crossfade implementation
     "color_match",        # no color-match implementation
 })
 
@@ -3475,10 +4267,6 @@ class MosaicPipeline:
         self.config = cfg
         self.gpu_id = int(gpu_id)
 
-        # Server mutates these in place for cached pipelines (inert knobs).
-        self._discard_margin: int = max(0, int(getattr(cfg, "temporal_overlap", 0)))
-        self._blend_frames: int = max(0, int(getattr(cfg, "blend_frames", 0)))
-
         # Build a warm host Pipeline from the config (no I/O happens until
         # run()). Borrow its proven _build_detector/_build_restorer so the
         # warm models are byte-identical to what the CLI builds.
@@ -3490,7 +4278,8 @@ class MosaicPipeline:
         # detector and let run() rebuild a restorer anyway.
         # CM-196 T10f: ledger the warm build -- these two are the largest
         # non-torch residents (TensorRT engines) and were invisible until now.
-        self._host._vram_stage("before models (CUDA context)")
+        from chitramaya.run_report import context_label as _ctx_label
+        self._host._vram_stage(_ctx_label())     # T20b: CUDA / HIP / XPU context by edition
         self._detector = self._host._build_detector()
         self._host._vram_stage("detector (warm build)")
         self._restorer = self._host._build_restorer()
@@ -3506,7 +4295,8 @@ class MosaicPipeline:
         data: dict = {
             "input": str(input_path),
             "output": str(output_path),
-            "mode": ("mosaic" if bool(getattr(c, "censor", False))
+            "mode": ("none" if bool(getattr(c, "upscale_only", False))          # CM-228
+                     else "mosaic" if bool(getattr(c, "censor", False))
                      else "pseudo" if bool(getattr(c, "mask_preview", False))
                      else "real"),
             "visualization": {
@@ -3529,9 +4319,15 @@ class MosaicPipeline:
             # case 2026-09-01: four denoise A/B runs on the 3060 Ti all ran
             # denoise=none with Ultra selected in the UI.
             "secondary_denoise": str(getattr(c, "secondary_denoise", "none") or "none"),
+            "secondary_quality": str(getattr(c, "secondary_quality", "high") or "high"),   # CM-217
+            "output_upscale": str(getattr(c, "output_upscale", "none") or "none"),         # CM-219
+            "upscale_scaler": str(getattr(c, "upscale_scaler", "esrgan") or "esrgan"),     # CM-228
+            "custom_scaler_dir": str(getattr(c, "custom_scaler_dir", "") or ""),          # CM-229
             "temporal_stability": int(getattr(c, "temporal_stability", 0) or 0),
             "roi_dilate": int(getattr(c, "roi_dilate", 0)),
+            "crop_cap_px": int(getattr(c, "crop_cap_px", 0) or 0),                    # CM-227
             "use_seg_masks": bool(getattr(c, "use_seg_masks", True)),
+            "residual_scan": bool(getattr(c, "residual_scan", True)),   # CM-205
             "detection": {
                 "model_path": c.detection_model,
                 "conf_threshold": float(c.detection_score),
@@ -3544,6 +4340,9 @@ class MosaicPipeline:
                 "rest_model_path": c.restoration_model,
                 "fp16": bool(getattr(c, "restoration_fp16", True)),
                 "max_clip_length": int(c.max_clip_size),
+                "temporal_overlap": int(getattr(c, "temporal_overlap", 0) or 0),   # CM-213
+                "crossfade": bool(getattr(c, "crossfade", True)),                   # CM-213
+                "blend_frames": int(getattr(c, "blend_frames", -1)),                # CM-213 (-1 = auto)
                 "backend": ("trt" if c.use_trt else "pytorch"),
                 "feather_radius": int(getattr(c, "feather_radius", 0)),
                 "blendmask": str(getattr(c, "blendmask", "none")),
@@ -3555,7 +4354,8 @@ class MosaicPipeline:
                 "async_encoder": bool(getattr(c, "async_encoder", False)),
                 "gpu_id": self.gpu_id,
             },
-            "decoder": {"gpu_id": self.gpu_id},
+            "decoder": {"gpu_id": self.gpu_id,
+                        "hw_accel": str(getattr(c, "hw_decode", "auto") or "auto")},   # T20d
         }
         # CM-093 X5c: monitoring section. The GUI path never populated one,
         # so run()'s read of monitoring.watchdog_stall_seconds ALWAYS fell
@@ -3706,13 +4506,12 @@ class MosaicPipeline:
     def apply_runtime_config(self, cfg: MosaicPipelineConfig) -> None:
         """Apply a non-model-reloading config delta to the warm pipeline.
 
-        The server calls this implicitly by reassigning .config then mutating
-        _discard_margin/_blend_frames/_detector. We also push the live
-        detection score down to the attribute the detector actually reads.
+        The server reassigns .config; every run rebuilds the host's nested
+        config from it (so CM-213 overlap/crossfade take effect per run
+        without a model reload). We also push the live detection score down
+        to the attribute the detector actually reads.
         """
         self.config = cfg
-        self._discard_margin = max(0, int(getattr(cfg, "temporal_overlap", 0)))
-        self._blend_frames = max(0, int(getattr(cfg, "blend_frames", 0)))
         self._set_detection_score(float(cfg.detection_score))
 
     def _set_detection_score(self, score: float) -> None:
@@ -3783,6 +4582,7 @@ class MosaicPipeline:
             detections=int(metrics.det_stats.frames_with_det),
             restorations=int(len(metrics.frames_restored)),
             diag_path=diag_path,
+            warnings=list(getattr(metrics, "warnings", []) or []),
         )
 
     def partial_result(self) -> Optional[dict]:

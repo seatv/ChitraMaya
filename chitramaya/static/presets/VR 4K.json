@@ -1,0 +1,9 @@
+{
+  "_preset": "VR 4K",
+  "_builtin": true,
+  "_note": "ChitraMaya built-in preset: side-by-side VR and other 4K+ sources. Detector at 800 (the field sweet spot for >= 4K), Max Clip 180 (needs the VRAM of an 8 GB card at 4K -- the preflight will say), SBS split on. Panel values only; folders and the rest of your settings are kept.",
+  "ctrlMosaicDetImgsz": "800",
+  "ctrlMosaicDetBatch": "8",
+  "ctrlMosaicMaxClip": "180",
+  "ctrlMosaicSbsSplit": true
+}

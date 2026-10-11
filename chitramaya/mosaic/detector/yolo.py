@@ -233,30 +233,36 @@ class MosaicDetectionModel:
 
         # Accept either HWC (H,W,3) or CHW (3,H,W).
         if f0.shape[-1] == 3:
-            # HWC
+            hwc = True
             h, w = int(f0.shape[0]), int(f0.shape[1])
-            batch = torch.stack(frames_u8, dim=0)  # [B,H,W,3]
-            batch = batch.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
         elif f0.shape[0] == 3:
-            # CHW
+            hwc = False
             h, w = int(f0.shape[1]), int(f0.shape[2])
-            batch = torch.stack(frames_u8, dim=0).contiguous()  # [B,3,H,W]
         else:
             raise RuntimeError(
                 f"Unsupported frame layout, expected HWC[...,3] or CHW[3,...], got shape={tuple(f0.shape)}"
             )
 
-        x = batch.to(dtype=self.dtype) / 255.0
         if self.debug:
-            layout = "HWC" if f0.shape[-1] == 3 else "CHW"
-            print(f"[DetYOLO] input_layout={layout} frame_shape={tuple(f0.shape)}")
-
-        # Move to model device if needed
-        if x.device != self.device:
-            x = x.to(self.device, non_blocking=True)
+            print(f"[DetYOLO] input_layout={'HWC' if hwc else 'CHW'} frame_shape={tuple(f0.shape)}")
 
         meta = _compute_letterbox_meta((h, w), (int(self.imgsz[0]), int(self.imgsz[1])), stride=self.stride)
-        x = _letterbox_bchw(x, meta)
+
+        # CM-224: letterbox ONE frame at a time, then stack the imgsz-sized
+        # results. The old order (stack -> float -> /255 -> letterbox) held
+        # two full-resolution float copies of the whole batch: at 4K, batch 8,
+        # fp32 that is 2 x 760 MiB of transient VRAM for a 640-px input, and
+        # it was the allocation every 4K OOM on an 8 GB card died on. Bilinear
+        # interpolation is per-sample, so the result is bit-identical.
+        parts = []
+        for f in frames_u8:
+            fc = f.permute(2, 0, 1) if hwc else f
+            xf = fc.unsqueeze(0).to(dtype=self.dtype) / 255.0
+            if xf.device != self.device:
+                xf = xf.to(self.device, non_blocking=True)
+            parts.append(_letterbox_bchw(xf, meta))
+        x = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        del parts
 
         if self.debug:
             t0 = time.perf_counter()

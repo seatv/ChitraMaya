@@ -22,11 +22,13 @@ from chitramaya.video.finalize import (
     AudioSidecar, sidecar_path_for, estimate_moov_bytes, moov_too_small,
     build_onepass_raw_cmd, build_onepass_container_cmd, probe_av_start,
     probe_audio_desc, audio_mux_failed, with_audio_reencode,
+    flush_to_disk, verify_output,
 )
+from chitramaya.video.source_format import input_args as _src_args   # CM-246
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -296,6 +298,83 @@ def _fps_to_rational(fps: float) -> str:
     return f"{frac.numerator}/{frac.denominator}"
 
 
+def gap_fill_output_rate(
+    fps: float, fps_str: str, frames_encoded: int, filled: int,
+    source_frames: int, discontinuous: bool,
+) -> Tuple[float, str, Fraction]:
+    """CM-235: the container rate the finalize must stamp AFTER gap-fill.
+
+    The gap filler (CM-120) re-encodes the previous frame wherever the
+    source PTS jump by more than one interval. Two very different sources
+    produce that: (a) the DECODER dropped frames the container counts (a
+    TS stream rip; NVDEC lost 150 of 127,498) -- the fills restore the
+    count and the source's average rate is still right; (b) the SOURCE
+    TIMELINE has holes (field 2026-09-25: a title stamped at exactly
+    30.000 fps with one frame missing every 990, which is how its muxer
+    keeps the average at 29.97). There the fills ADD frames beyond the
+    container's count, and stamping them at the average rate counts every
+    hole twice: 197 duplicates over 194,773 frames stretched the video by
+    6.6 s against the stream-copied audio, a drift that grows linearly to
+    the end.
+
+    One rule covers both: output rate = source average rate x
+    frames_encoded / source_frames. (a) gives a ratio of exactly 1;
+    (b) lifts the rate to the timeline's base cadence (194970/6499 =
+    30.000, exactly, in Fraction arithmetic). Only applied when the filler
+    filled something, no gap was left unfilled as a discontinuity, and the
+    ratio is within a 0.98..1.05 sanity band (a ratio outside it means the
+    counts do not describe the same thing; the caller warns and keeps the
+    source rate). Returns (fps, fps_str, ratio); an unchanged rate returns
+    the inputs and ratio 1 or the out-of-band ratio.
+    """
+    one = Fraction(1)
+    try:
+        if (int(filled) <= 0 or bool(discontinuous) or int(source_frames) <= 0
+                or int(frames_encoded) <= 0 or float(fps) <= 0):
+            return float(fps), str(fps_str), one
+        ratio = Fraction(int(frames_encoded), int(source_frames))
+        if ratio == 1:
+            return float(fps), str(fps_str), one
+        if not (Fraction(98, 100) <= ratio <= Fraction(105, 100)):
+            return float(fps), str(fps_str), ratio
+        out = (Fraction(str(fps_str)) * ratio).limit_denominator(100000)
+        out_str = (str(out.numerator) if out.denominator == 1
+                   else f"{out.numerator}/{out.denominator}")
+        return float(out), out_str, ratio
+    except Exception:
+        return float(fps), str(fps_str), one
+
+
+def _announce_gap_fill_rate(fps_str: str, out_fps_str: str, ratio: Fraction,
+                            filled: int, source_frames: int,
+                            frames_encoded: int, discontinuous: bool) -> None:
+    """The one console line for CM-235 (both encoder classes)."""
+    if int(filled) <= 0:
+        return
+    if bool(discontinuous):
+        print(f"[Encoder] gap-fill: {int(filled)} duplicate frame(s) were "
+              f"inserted but a timeline jump was left unfilled; the output "
+              f"rate stays {fps_str} (A/V sync shifts at that jump, as "
+              f"reported above).")
+        return
+    if ratio == 1:
+        print(f"[Encoder] gap-fill: {int(filled)} duplicate frame(s) restored "
+              f"frames the decoder lost; {int(frames_encoded)} frames match "
+              f"the source's {int(source_frames)}, output rate stays {fps_str}.")
+        return
+    if out_fps_str == fps_str:
+        print(f"[Encoder] WARNING: gap-fill inserted {int(filled)} frame(s) "
+              f"but {int(frames_encoded)} encoded vs {int(source_frames)} "
+              f"source frames (ratio {float(ratio):.4f}) is outside the "
+              f"0.98..1.05 band; rate left at {fps_str} -- check A/V sync.")
+        return
+    print(f"[Encoder] gap-fill: {int(filled)} duplicate frame(s) filled holes "
+          f"in the source timeline ({int(source_frames)} frames over "
+          f"{int(frames_encoded)} intervals); output rate {fps_str} -> "
+          f"{out_fps_str} so the video keeps the source's duration and the "
+          f"audio stays in sync (CM-235).")
+
+
 def _derive_ffprobe(ffmpeg_path: str) -> str:
     """Best-effort ffprobe path derived from the configured ffmpeg path.
 
@@ -308,6 +387,106 @@ def _derive_ffprobe(ffmpeg_path: str) -> str:
         probe = base.lower().replace("ffmpeg", "ffprobe")
         return os.path.join(d, probe) if d else probe
     return "ffprobe"
+
+
+# -- T23a (CM-237): settle + verify, then release the salvage ---------------
+# Shared by the NVENC and the ffmpeg encoders. Field 2026-09-27 (4060 box,
+# power cut a minute after a 4-hour remux returned 0): the index the muxer
+# wrote at the FRONT of the file was still in the OS write cache and the raw
+# bitstream was already gone, so a 4-hour run was repeated for want of a
+# 30-second re-mux. Three rules now: the output is fsync'ed the moment the
+# remux returns; it is read back (index, video stream, frame count) before
+# "Done" is printed; and the raw bitstream + RECOVER script + audio sidecar
+# stay on disk until the run's LAST step re-reads the output once more.
+def _settle_and_verify(enc, output_path: str, *, salvage: str) -> bool:
+    """fsync + read-back after a remux that returned 0. False = treat as a
+    failed remux (unreadable output; the caller's failure path keeps the
+    salvage and discards the partial file). A frame-count mismatch keeps
+    BOTH the output and the salvage and says so."""
+    try:
+        secs = flush_to_disk(output_path)
+        sz = os.path.getsize(output_path) / 1e6
+        print(f"[Encoder] output flushed to disk: {sz:.1f} MB in {secs:.1f}s (CM-237)")
+    except Exception as e:
+        print(f"[Encoder] WARNING: could not flush the output to disk ({e}); "
+              f"the read-back below still decides.")
+    try:
+        ffprobe = _derive_ffprobe(enc.ffmpeg_path)
+        fps = float(getattr(enc, "fps", 0.0) or 0.0)
+        n = int(getattr(enc, "_frames_encoded", 0) or 0)
+        verdict, detail = verify_output(
+            ffprobe, output_path, expect_frames=n,
+            expect_duration_s=(n / fps) if fps > 0 else 0.0)
+    except Exception as e:
+        verdict, detail = "unreadable", f"verify could not run ({e})"
+    if verdict == "ok":
+        print(f"[Encoder] output verified: {detail}; {salvage} and the audio "
+              f"sidecar stay until the end of the run (CM-237).")
+        enc._salvage_note = ""
+        return True
+    if verdict == "mismatch":
+        print(f"[Encoder] *** OUTPUT VERIFY WARNING: {Path(output_path).name} reads "
+              f"back as {detail}. The file is kept, and so are {salvage} and "
+              f"the audio sidecar -- if the file does not play to the end, "
+              f"run the RECOVER script (CM-237). ***")
+        enc._salvage_note = "verify mismatch"
+        return True
+    print(f"[Encoder] *** OUTPUT UNREADABLE after the remux: {detail}. Treating "
+          f"the finalize as failed (CM-237). ***")
+    try:
+        enc._discard_partial_output()
+    except Exception:
+        pass
+    return False
+
+
+def _release_salvage(enc, output_path: str, paths, what: str) -> None:
+    """The run's last step: one more read-back, then the raw bitstream (or
+    .venc), the RECOVER script and the audio sidecar are removed. Any doubt
+    keeps them and says where they are."""
+    if not getattr(enc, "_salvage_pending", False):
+        return
+    enc._salvage_pending = False
+    if getattr(enc, "_salvage_note", ""):
+        print(f"[Encoder] {what} kept ({enc._salvage_note}): "
+              + ", ".join(str(p) for p in paths))
+        return
+    try:
+        ffprobe = _derive_ffprobe(enc.ffmpeg_path)
+        n = int(getattr(enc, "_frames_encoded", 0) or 0)
+        fps = float(getattr(enc, "fps", 0.0) or 0.0)
+        verdict, detail = verify_output(
+            ffprobe, output_path, expect_frames=n,
+            expect_duration_s=(n / fps) if fps > 0 else 0.0)
+    except Exception as e:
+        verdict, detail = "unreadable", f"verify could not run ({e})"
+    if verdict != "ok":
+        print(f"[Encoder] *** OUTPUT VERIFY at end of run: {Path(output_path).name} "
+              f"reads back as {detail} -- {what}, the RECOVER script and the "
+              f"audio sidecar are KEPT: " + ", ".join(str(p) for p in paths)
+              + " (CM-237). ***")
+        return
+    removed = 0
+    for p in paths:
+        try:
+            pp = Path(p)
+            if pp.exists():
+                pp.unlink()
+                removed += 1
+        except Exception:
+            pass
+    try:
+        enc._remove_recovery_script()
+    except Exception:
+        pass
+    try:
+        sc = getattr(enc, "_audio_sidecar", None)
+        if sc is not None:
+            sc.cleanup()
+    except Exception:
+        pass
+    print(f"[Encoder] output verified again at the end of the run ({detail}); "
+          f"{what}, RECOVER script and audio sidecar removed (CM-237).")
 
 
 def _finalize_timeout_s(*paths) -> int:
@@ -643,6 +822,12 @@ class Encoder:
         # CM-187: audio sidecar attached by the pipeline right after
         # construction (extraction runs in the background during the run).
         self._audio_sidecar: Optional[AudioSidecar] = None
+        # T23a (CM-237): the raw bitstream, the RECOVER script and the audio
+        # sidecar outlive the finalize -- close() settles and verifies the
+        # output but keeps the salvage; the pipeline calls release_salvage()
+        # as the run's LAST step (after the residual scan and the report).
+        self._salvage_pending = False
+        self._salvage_note = ""
         self._last_ffmpeg_stderr = ""
 
         # CM-122 NVENC liveness canary (field event 2026-08-28): an NVENC
@@ -1068,6 +1253,39 @@ class Encoder:
             except Exception:
                 pass
 
+    def release_salvage(self) -> None:
+        """T23a (CM-237): the run's LAST step. Look at the output once more
+        and only then delete the raw bitstream, the RECOVER script and the
+        audio sidecar. Anything short of a clean read-back keeps them."""
+        _release_salvage(self, self.output_path,
+                         [self._raw_path], "raw bitstream")
+
+    # CM-235: set by the pipeline once the drain is complete (see
+    # gap_fill_output_rate); consumed by the finalize below.
+    def note_gap_fill(self, filled: int, source_frames: int,
+                      discontinuous: bool) -> None:
+        self._gap_fill_frames = int(filled)
+        self._gap_fill_source_frames = int(source_frames)
+        self._gap_fill_discontinuous = bool(discontinuous)
+
+    def _output_rate(self) -> Tuple[float, str]:
+        """(fps, fps_str) the finalize stamps: the source rate, lifted by
+        the gap-fill ratio when the filler added frames the source's
+        count does not carry (CM-235). Prints the one-line verdict."""
+        filled = int(getattr(self, "_gap_fill_frames", 0) or 0)
+        src = int(getattr(self, "_gap_fill_source_frames", 0) or 0)
+        disc = bool(getattr(self, "_gap_fill_discontinuous", False))
+        out_fps, out_str, ratio = gap_fill_output_rate(
+            self.fps, self.fps_str, int(self._frames_encoded), filled, src, disc)
+        _announce_gap_fill_rate(self.fps_str, out_str, ratio, filled, src,
+                                int(self._frames_encoded), disc)
+        if filled > 0:
+            self._output_rate_used = {"source": self.fps_str, "output": out_str,
+                                      "ratio": f"{ratio.numerator}/{ratio.denominator}",
+                                      "filled": filled, "source_frames": src,
+                                      "encoded": int(self._frames_encoded)}
+        return out_fps, out_str
+
     def close(self) -> None:
         """Flush, close file, remux with audio if needed."""
         if self._closed:
@@ -1079,16 +1297,19 @@ class Encoder:
 
         if self._needs_remux:
             self._remux_ok = self._remux()
+            if self._remux_ok:
+                # T23a (CM-237): fsync + read-back before anyone calls it
+                # done; a broken index is a remux failure, not a "Done".
+                self._remux_ok = _settle_and_verify(
+                    self, self.output_path,
+                    salvage=f"{Path(self._raw_path).name}, its RECOVER script")
 
-        # Cleanup raw bitstream + recovery script only if remux succeeded
+        # T23a: the raw bitstream + RECOVER script + audio sidecar STAY until
+        # release_salvage() -- the pipeline's last step, after the residual
+        # scan and the run report (until then the output is one power cut
+        # away from needing them).
         if self._needs_remux and self._remux_ok:
-            raw = Path(self._raw_path)
-            if raw.exists():
-                try:
-                    raw.unlink()
-                except Exception:
-                    pass
-            self._remove_recovery_script()
+            self._salvage_pending = True
         elif self._needs_remux and not self._remux_ok:
             print(f"[Encoder] Raw bitstream kept for debugging: {self._raw_path}")
             sc = self._audio_sidecar
@@ -1241,6 +1462,10 @@ class Encoder:
                   f"delay (decoder discarded the stream head; audio stays "
                   f"aligned).")
 
+        # CM-235: the rate the container is stamped at (lifted by the
+        # gap-fill ratio when the source timeline had holes).
+        out_fps, out_fps_str = self._output_rate()
+
         has_audio_source = bool(
             self.mux_audio and self.input_path and Path(self.input_path).exists()
         )
@@ -1269,6 +1494,7 @@ class Encoder:
                 import subprocess as _sp
                 _pr = _sp.run(
                     [_derive_ffprobe(self.ffmpeg_path), "-v", "error",
+                     *_src_args(str(self.input_path), _derive_ffprobe(self.ffmpeg_path)),
                      "-select_streams", "v:0", "-show_entries",
                      "stream=color_space,color_transfer,color_primaries,"
                      "color_range", "-of", "default=nw=1",
@@ -1319,8 +1545,8 @@ class Encoder:
                 if _t == "-i" or _t.startswith("-i"):
                     raise ValueError("mux_extra_args must not include -i")
         duration = 0.0
-        if self._frames_encoded > 0 and self.fps > 0:
-            duration = video_delay + (self._frames_encoded / self.fps)
+        if self._frames_encoded > 0 and out_fps > 0:
+            duration = video_delay + (self._frames_encoded / out_fps)
         dur_args: List[str] = ["-t", f"{duration:.3f}"] if duration > 0 else []
         ff = self.ffmpeg_path
 
@@ -1344,8 +1570,8 @@ class Encoder:
         def _finish(ok: bool) -> bool:
             if ok:
                 self._report_av_alignment(video_delay, audio_delay)
-                if sc is not None:
-                    sc.cleanup()
+                # T23a: the sidecar is part of the salvage now; it goes
+                # with the raw bitstream in release_salvage().
             else:
                 self._discard_partial_output()
             return ok
@@ -1359,14 +1585,14 @@ class Encoder:
                 # timestamps allowed), sample-accurate -- measured, see
                 # finalize.py.
                 cmd = build_onepass_raw_cmd(
-                    ff, fps_str=self.fps_str, input_fmt_args=input_fmt_args,
+                    ff, fps_str=out_fps_str, input_fmt_args=input_fmt_args,
                     raw_path=str(raw_path), sidecar=sidecar_in,
                     audio_itsoffset=(audio_delay - video_delay),
                     color_args=color_args, tag_args=tag_args,
                     timescale_args=timescale_args, extra_args=extra_args,
                     moov_bytes=moov_bytes, out_path=str(out_path),
-                    duration_s=(self._frames_encoded / self.fps
-                                if self.fps > 0 else 0.0))
+                    duration_s=(self._frames_encoded / out_fps
+                                if out_fps > 0 else 0.0))
                 print(f"[Encoder] finalize (CM-187): one pass -- raw bitstream "
                       f"{'+ audio sidecar ' if sidecar_in else ''}-> "
                       f"{out_path.name}"
@@ -1385,7 +1611,7 @@ class Encoder:
                 step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
                          "-nostdin", "-fflags", "+genpts",
                          "-analyzeduration", "10M", "-probesize", "50M",
-                         "-r", self.fps_str,
+                         "-r", out_fps_str,
                          *input_fmt_args, "-i", str(raw_path),
                          "-map", "0:v:0", "-c:v", "copy"]
                 step1 += color_args + tag_args + timescale_args + [str(temp_video)]
@@ -1423,7 +1649,7 @@ class Encoder:
                 step1 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
                          "-nostdin", "-fflags", "+genpts",
                          "-analyzeduration", "10M", "-probesize", "50M",
-                         "-r", self.fps_str,
+                         "-r", out_fps_str,
                          *input_fmt_args, "-i", str(raw_path),
                          "-map", "0:v:0", "-c:v", "copy"]
                 step1 += color_args + tag_args + timescale_args + [str(temp_video)]
@@ -1434,7 +1660,7 @@ class Encoder:
                     return False
                 if has_audio_source:
                     step2 = [ff, "-hide_banner", "-y", "-loglevel", "warning",
-                             "-nostdin", "-i", self.input_path,
+                             "-nostdin", *_src_args(str(self.input_path)), "-i", self.input_path,
                              "-itsoffset", f"{video_delay:.6f}", "-i", str(temp_video),
                              "-map", "1:v:0", "-c:v", "copy"] + tag_args
                     step2 += ["-map", "0:a?", "-c:a", "copy"]
@@ -1457,12 +1683,12 @@ class Encoder:
             cmd = [ff, "-hide_banner", "-y", "-loglevel", "warning", "-nostdin",
                    "-fflags", "+genpts",
                    "-analyzeduration", "10M", "-probesize", "50M",
-                   "-r", self.fps_str,
+                   "-r", out_fps_str,
                    *input_fmt_args, "-i", str(raw_path)]
             if has_audio_source:
                 if audio_delay > 0:
                     cmd += ["-itsoffset", f"{audio_delay:.6f}"]
-                cmd += ["-i", self.input_path]
+                cmd += [*_src_args(str(self.input_path)), "-i", self.input_path]
             cmd += ["-map", "0:v:0", "-c:v", "copy"] + color_args + tag_args
             if has_audio_source:
                 cmd += ["-map", "1:a?", "-c:a", "copy"]
@@ -1681,6 +1907,8 @@ class FfmpegEncoder:
         self._venc_path = self._stem + ".venc.mp4"
         self._stderr_path = self._stem + ".venc.stderr.log"
         self._audio_sidecar: Optional[AudioSidecar] = None   # CM-187
+        self._salvage_pending = False                          # T23a (CM-237)
+        self._salvage_note = ""
         self._last_ffmpeg_stderr = ""
 
         # Pick the encoder: QSV -> AMF -> software (Batch 34 ladder). Each
@@ -1689,24 +1917,28 @@ class FfmpegEncoder:
         qsv_name = self._QSV[self.codec]
         amf_name = self._AMF[self.codec]
         sw_name = self._SW[self.codec]
-        if self._probe_encoder(qsv_name):
+        # T20b: on the ROCm edition AMF is the native encoder -- probe it FIRST.
+        # The QSV-first ladder cost every AMD run a failing QSV init probe
+        # (and a "trying av1_qsv" line that read as a wrong-edition build on
+        # the 09-16 gate run). On Intel / NVIDIA-without-NVENC the order stays.
+        _amf_first = False
+        try:
+            import torch as _torch
+            _amf_first = bool(getattr(getattr(_torch, "version", None), "hip", None))
+        except Exception:
+            pass
+        if _amf_first and self._probe_encoder(amf_name):
+            self._enc_name = amf_name
+            self._enc_args = self._amf_args()
+            hw = "AMD AMF hardware"
+        elif self._probe_encoder(qsv_name):
             self._enc_name = qsv_name
             self._enc_args = ["-global_quality", str(self.qp),
                               "-preset", self._P2SPEED[self.preset]]
             hw = "Intel QSV hardware"
-        elif self._probe_encoder(amf_name):
+        elif (not _amf_first) and self._probe_encoder(amf_name):
             self._enc_name = amf_name
-            # CQP to match the UI's constant-QP semantics. AV1's qindex
-            # scale is 0-255; map the HEVC-style slider by the same rough
-            # 4x equivalence the NVENC path uses (QP18 -> qindex 72).
-            _q = self.qp
-            if self.codec == "av1":
-                _q = min(255, self.qp * 4)
-                print(f"[Encoder] AV1 rate control: QP{self.qp} (HEVC scale)"
-                      f" -> qindex {_q} (AV1 scale)")
-            self._enc_args = ["-rc", "cqp",
-                              "-qp_i", str(_q), "-qp_p", str(_q),
-                              "-quality", self._P2AMF[self.preset]]
+            self._enc_args = self._amf_args()
             hw = "AMD AMF hardware"
         elif self._probe_encoder(sw_name):
             self._enc_name = sw_name
@@ -1883,7 +2115,39 @@ class FfmpegEncoder:
             except Exception:
                 pass
 
+    def _discard_partial_output(self) -> None:
+        """CM-124/T23a: a failed or unreadable final mux must not leave a
+        file that looks like the result; the .venc + script are the salvage."""
+        try:
+            p = Path(self.output_path)
+            if p.exists():
+                sz = p.stat().st_size
+                p.unlink()
+                print(f"[Encoder] Removed unplayable partial output "
+                      f"({sz / 1e6:.1f} MB): {self.output_path}")
+        except Exception as e:
+            print(f"[Encoder] Could not remove partial output: {e}")
+
+    def release_salvage(self) -> None:
+        """T23a (CM-237): the run's LAST step -- one more read-back of the
+        output, then the .venc, its stderr log, the RECOVER script and the
+        audio sidecar are removed. Any doubt keeps them."""
+        _release_salvage(self, self.output_path,
+                         [self._venc_path, self._stderr_path], ".venc video")
+
     # -- probe --------------------------------------------------------------
+
+    def _amf_args(self) -> list:
+        """AMF rate control: CQP to match the UI's constant-QP semantics. AV1's
+        qindex scale is 0-255; map the HEVC-style slider by the same rough 4x
+        equivalence the NVENC path uses (QP18 -> qindex 72)."""
+        _q = self.qp
+        if self.codec == "av1":
+            _q = min(255, self.qp * 4)
+            print(f"[Encoder] AV1 rate control: QP{self.qp} (HEVC scale)"
+                  f" -> qindex {_q} (AV1 scale)")
+        return ["-rc", "cqp", "-qp_i", str(_q), "-qp_p", str(_q),
+                "-quality", self._P2AMF[self.preset]]
 
     def _probe_encoder(self, enc_name: str) -> bool:
         """3-frame null encode: proves the encoder initializes on THIS
@@ -1978,6 +2242,32 @@ class FfmpegEncoder:
 
     # -- finalize -----------------------------------------------------------
 
+    # CM-235: set by the pipeline once the drain is complete (see
+    # gap_fill_output_rate); consumed by the finalize below.
+    def note_gap_fill(self, filled: int, source_frames: int,
+                      discontinuous: bool) -> None:
+        self._gap_fill_frames = int(filled)
+        self._gap_fill_source_frames = int(source_frames)
+        self._gap_fill_discontinuous = bool(discontinuous)
+
+    def _output_rate(self) -> Tuple[float, str]:
+        """(fps, fps_str) the finalize stamps: the source rate, lifted by
+        the gap-fill ratio when the filler added frames the source's
+        count does not carry (CM-235). Prints the one-line verdict."""
+        filled = int(getattr(self, "_gap_fill_frames", 0) or 0)
+        src = int(getattr(self, "_gap_fill_source_frames", 0) or 0)
+        disc = bool(getattr(self, "_gap_fill_discontinuous", False))
+        out_fps, out_str, ratio = gap_fill_output_rate(
+            self.fps, self.fps_str, int(self._frames_encoded), filled, src, disc)
+        _announce_gap_fill_rate(self.fps_str, out_str, ratio, filled, src,
+                                int(self._frames_encoded), disc)
+        if filled > 0:
+            self._output_rate_used = {"source": self.fps_str, "output": out_str,
+                                      "ratio": f"{ratio.numerator}/{ratio.denominator}",
+                                      "filled": filled, "source_frames": src,
+                                      "encoded": int(self._frames_encoded)}
+        return out_fps, out_str
+
     def close(self) -> None:
         if self._closed:
             return
@@ -2015,8 +2305,13 @@ class FfmpegEncoder:
         if _head > 0:
             video_delay += _head
             print(f"[Encoder] Head-skip compensation: +{_head:.3f}s video delay.")
-        duration = video_delay + (self._frames_encoded / self.fps
-                                  if self.fps > 0 else 0)
+        # CM-235: the .venc already carries timestamps at the source rate;
+        # a gap-fill rate lift is applied as an input timestamp scale on
+        # the stream copy (-itsscale), no re-encode.
+        out_fps, _out_fps_str = self._output_rate()
+        video_itsscale = (self.fps / out_fps) if (out_fps > 0 and self.fps > 0) else 1.0
+        duration = video_delay + (self._frames_encoded / out_fps
+                                  if out_fps > 0 else 0)
 
         # CM-187: one pass -- the fragmented .venc + the audio sidecar
         # (extracted at run start) -> final mp4 with the index reserved up
@@ -2038,7 +2333,8 @@ class FfmpegEncoder:
                 video_itsoffset=video_delay, sidecar=audio_in,
                 audio_itsoffset=audio_delay, tag_args=tag_args,
                 timescale_args=ts_args, extra_args=[], duration_s=duration,
-                moov_bytes=moov_bytes, out_path=self.output_path)
+                moov_bytes=moov_bytes, out_path=self.output_path,
+                video_itsscale=video_itsscale)
             print(f"[Encoder] finalize (CM-187): one pass -- .venc "
                   f"{'+ audio sidecar ' if audio_in else ''}-> "
                   f"{Path(self.output_path).name}"
@@ -2056,6 +2352,8 @@ class FfmpegEncoder:
             cmd += ["-i", self.input_path]
             if video_delay:
                 cmd += ["-itsoffset", f"{video_delay:.6f}"]
+            if abs(video_itsscale - 1.0) > 1e-9:
+                cmd += ["-itsscale", f"{video_itsscale:.9f}"]
             cmd += ["-i", str(venc),
                     "-map", "1:v:0", "-c:v", "copy", "-tag:v", tag,
                     "-map", "0:a?", "-c:a", "copy"]
@@ -2099,6 +2397,11 @@ class FfmpegEncoder:
                                   watch_path=self.output_path)
 
         if ok:
+            # T23a (CM-237): fsync + read-back before "Done"; the .venc, the
+            # RECOVER script and the sidecar stay until release_salvage().
+            ok = _settle_and_verify(self, self.output_path,
+                                    salvage=f"{venc.name}, its RECOVER script")
+        if ok:
             try:
                 ffprobe = _derive_ffprobe(self.ffmpeg_path)
                 v0, a0, skip = probe_av_start(ffprobe, self.output_path)
@@ -2113,14 +2416,7 @@ class FfmpegEncoder:
                       + (f" [{desc}]" if desc else "") + ".")
             except Exception:
                 pass
-            try:
-                venc.unlink()
-                Path(self._stderr_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-            if sc is not None:
-                sc.cleanup()
-            self._remove_recovery_script()
+            self._salvage_pending = True
             print(f"[Encoder] Done: {self.output_path}")
         else:
             try:

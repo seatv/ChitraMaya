@@ -66,7 +66,15 @@ async function selectVideo() {
 
 async function loadVideo(path) {
   const result = await apiPost('/api/load-video', { path });
-  if (result.error) return null;
+  if (result.error) {
+    // CM-245: the server refuses a load while a run holds the operation
+    // lock (swapping the source under a starting run used to mis-name its
+    // output). Say so; the loaded video and label stay as they were.
+    if (result.busy) {
+      try { alert(result.error); } catch (e) { /* headless */ }
+    }
+    return null;
+  }
 
   state.videoPath = path;
   state.videoInfo = result.info;

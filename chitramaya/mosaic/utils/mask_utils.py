@@ -151,6 +151,27 @@ def get_nonzero_box_torch(mask: torch.Tensor) -> Optional[Box]:
     return int(rows[0]), int(cols[0]), int(rows[-1]), int(cols[-1])
 
 
+# CM-214: auto feather as a share of the FRAME height (60 px at 2160,
+# 30 px at 1080), so the blend band is the same size on screen whatever the
+# region's size -- a small region no longer gets a 2-px seam. Idea from
+# jasna's blend mask (kruk2, AGPL-3.0: dilation and falloff each 2.8 % of
+# the frame height); applied here to our outward feather, where the same
+# number is the solid margin AND the ramp width.
+FRAME_FEATHER_RATIO = 0.028
+
+
+def auto_feather_px(frame_h: Optional[int], crop_hw: Tuple[int, int], *,
+                    min_feather_px: int = 2, region_ratio: float = 0.05) -> int:
+    """CM-214: the feather the compositor uses when the panel says 0 (auto).
+    With the frame height known: FRAME_FEATHER_RATIO of it. Without (unit
+    tools, old callers): the pre-1.80 rule, 5 % of the region's short side."""
+    if frame_h is not None and int(frame_h) > 0:
+        px = int(round(int(frame_h) * FRAME_FEATHER_RATIO))
+    else:
+        px = int(round(min(int(crop_hw[0]), int(crop_hw[1])) * float(region_ratio)))
+    return max(int(min_feather_px), px)
+
+
 def create_support_blend_mask(
     crop_mask: torch.Tensor,
     feather_px: Optional[int] = None,
@@ -158,19 +179,34 @@ def create_support_blend_mask(
     min_feather_px: int = 2,
     max_feather_ratio: float = 0.05,
     passes: int = 1,
+    frame_h: Optional[int] = None,
 ) -> torch.Tensor:
-    """Create an inward-only soft alpha from the actual mask support.
+    """Shape-aware paste-back alpha with an OUTWARD feather (CM-086).
 
-    This is intended for the mainline gRestorer compositor.
+    Used by the "facefusion" blend mask (compositor + VR projection).
 
     Behavior:
-      - derives support from the resized crop mask itself
-      - feathers *inside* the support boundary (never outside)
-      - renormalizes so the strongest interior remains 1.0
+      - support = the resized crop mask (the detector's segmentation outline)
+      - alpha is exactly 1.0 on every support pixel AND on a margin of
+        feather_px around it, then ramps to 0 over the next feather_px
+      - the ramp therefore lies in the restorer's reconstruction of clean
+        pixels around the mosaic, never on the mosaic itself
+      - feather_px None = auto: FRAME_FEATHER_RATIO of frame_h when the
+        caller passes the frame height (CM-214, the compositor does), else
+        max_feather_ratio of the region's short side (the pre-1.80 rule)
 
-    Unlike the legacy create_blend_mask(), this does not build a synthetic inner
-    rectangle first. That makes the alpha follow the real ROI support and allows
-    the compositor to blend only the effective mask bounds.
+    History: until 09-16 this feathered INWARD (blur, then alpha *= support),
+    which left alpha == 0 on every mosaic pixel outside the segmentation
+    outline -- a rim of untouched mosaic blocks around each region, moving
+    frame to frame -- and cut hard along the outline's straight edges
+    (CM-086, seen on the 09-11 AMD runs and the 09-16 4K cut). Segmentation
+    masks are tight; mosaic blocks run past them. Growing the support first
+    and blurring outward fixes both symptoms.
+
+    Implementation: box dilation (summed-area box mean > 0) by
+    feather_px * passes, then `passes` box means of the same width. Reflect
+    padding keeps alpha at 1.0 where the support touches the crop edge.
+    Same CM-172 box filter, so no per-shape MIOpen compile on ROCm.
     """
     mask = crop_mask.squeeze()
     if mask.ndim != 2:
@@ -183,29 +219,35 @@ def create_support_blend_mask(
         return torch.zeros_like(support)
 
     if feather_px is None:
-        feather_px = int(round(min(h, w) * float(max_feather_ratio)))
-        feather_px = max(int(min_feather_px), feather_px)
+        feather_px = auto_feather_px(frame_h, (h, w), min_feather_px=int(min_feather_px),
+                                     region_ratio=float(max_feather_ratio))
 
     feather_px = int(max(0, feather_px))
+    # Reflect padding needs pad < dim: an explicit Feather larger than a small
+    # crop (Feather 64 on a 40-px region) is clamped, not an error.
+    feather_px = min(feather_px, max(0, (min(h, w) - 1) // 2))
     if feather_px <= 0:
         return support
 
+    n_pass = max(1, int(passes))
     k = 2 * feather_px + 1
-    alpha = support
-    for _ in range(max(1, int(passes))):
-        # CM-172: summed-area box mean instead of F.avg_pool2d (same numbers,
-        # no per-shape MIOpen compile on ROCm). Zero padding matches
-        # avg_pool2d's count_include_pad=True default.
-        alpha = box_filter_2d(alpha, k, pad_mode="zeros")
 
-    # Inward-only feather: do not let alpha extend outside the actual support.
-    alpha = alpha * support
+    # 1. Solid core: the support grown by feather_px per pass (a box mean is
+    #    > 0 exactly where the box window touches the support).
+    core = support
+    for _ in range(n_pass):
+        core = (box_filter_2d(core, k, pad_mode="reflect") > 0).to(dtype=torch.float32)
 
-    # Re-normalize so valid interior remains strong even on small crops.
-    amax = alpha.max()
-    if float(amax) > 0.0:
-        alpha = alpha / amax
+    # 2. Outward ramp: blur the core. Every support pixel sits at least
+    #    feather_px * n_pass inside the core, so its window is all ones and
+    #    alpha stays exactly 1.0 there; outside the core alpha falls to 0 over
+    #    feather_px * n_pass.
+    alpha = core
+    for _ in range(n_pass):
+        alpha = box_filter_2d(alpha, k, pad_mode="reflect")
 
+    # Guard against float dust: the support itself is always fully pasted.
+    alpha = torch.maximum(alpha, support)
     return alpha.clamp(0.0, 1.0)
 
 

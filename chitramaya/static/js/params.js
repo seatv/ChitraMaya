@@ -145,12 +145,21 @@ function applyConfig(cfg) {
   if (cfg.tempDir !== undefined) tempPath.value = cfg.tempDir;
 
   // All controls
+  const _edApply = document.documentElement.dataset.edition || '';
   for (const id of CONFIG_CONTROLS) {
     if (cfg[id] === undefined) continue;
     const el = document.getElementById(id);
     if (!el) continue;
     if (el.type === 'checkbox') el.checked = !!cfg[id];
     else el.value = String(cfg[id]);
+    // T20b (CM-184 closed): a settings file from an NVIDIA box asks for RTX Super-Res;
+    // off-CUDA that option is not offered, and an unmatched value would read back as
+    // '' = Off. Maxine's stand-in on every edition is the bundled Real-ESRGAN 4x.
+    if (id === 'ctrlMosaicSecondary' && _edApply && _edApply !== 'cuda'
+        && String(cfg[id]).startsWith('rtx') && el.value !== String(cfg[id])) {
+      el.value = 'esrgan-4x';
+      console.log(`[Secondary] settings asked for ${cfg[id]} (NVIDIA Maxine); this edition runs Real-ESRGAN 4x instead`);
+    }
   }
   // CM-182: (re)apply the UI language the config carries (English when unset).
   try {
@@ -186,6 +195,16 @@ function applyConfig(cfg) {
     } else {
       delete window._pendingMosaicModels;
     }
+    // CM-229: same race for the custom scaler options (populateCustomScalers
+    // consumes the stash once the options exist)
+    const pend = {};
+    for (const id of ['ctrlMosaicSecondary', 'ctrlUpscaleScaler']) {
+      const want = cfg[id];
+      const sel = document.getElementById(id);
+      if (want !== undefined && String(want).startsWith('custom:') && sel && sel.value !== String(want)) pend[id] = want;
+    }
+    if (Object.keys(pend).length) window._pendingCustomScalers = pend;
+    else delete window._pendingCustomScalers;
   }
 
   // Update all dial value displays

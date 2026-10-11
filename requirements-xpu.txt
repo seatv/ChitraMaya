@@ -45,6 +45,10 @@ torchvision==0.28.0+xpu
 # directly. If not, detection runs via raw torch (model.to("xpu")) --
 # phase-0 test scripts cover both.
 ultralytics>=8.4
+# CM-229: custom super-resolution models (models/upscalers) -- the loader that
+# identifies ESRGAN / RealPLKSR / SPAN / ATD / HAT / ... state dicts (MIT).
+# Pure Python on top of torch; pulls einops + safetensors.
+spandrel>=0.4.1
 
 # ── ONNX Runtime (CPU) ────────────────────────────────────────────────
 onnxruntime>=1.26

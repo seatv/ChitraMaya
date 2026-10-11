@@ -303,13 +303,202 @@ def pad_mask_hw(m: torch.Tensor, target_hw: Tuple[int, int]) -> Tuple[torch.Tens
 
 
 # -------------------------
+# CM-227: bounded crop storage
+# -------------------------
+
+# An open scene keeps every frame's crop until the clip closes (the clip
+# scale needs the scene's largest box). Stored at native resolution that is
+# (max_clip + 2 * overlap) x crop^2 x 4 bytes of VRAM per open scene: nothing
+# at 1080p (crops <= 400 px -> 86 MB), the whole card at 4K (a 3,500-px crop
+# is 49 MB a frame; 80 frames of one filled an 8 GB 5060 Ti -- 09-21). With a
+# cap, anything whose long side exceeds it is downscaled at capture; boxes
+# and crop shapes stay in native coordinates and Clip.from_scene resizes
+# from whatever is stored.
+#
+# The resample is the SAME non-antialiased bilinear Clip.from_scene uses
+# (image_utils.resize, lada's INTER_LINEAR), not an area average. The
+# restoration model was trained on crops that reached it through that one
+# aliased downscale; an area average low-passes the 1-2 px skin-line
+# network away before the model sees it and the output loses that texture
+# (the close-up title, 09-22: 'the polygonal contours disappear'). Sampling
+# keeps the contrast the model expects.
+#
+# T26 (10-02): that reasoning was right about THIS step and missed the next
+# one. Clip.from_scene then resized the stored 512 to the clip's 256 with
+# the same bilinear -- and bilinear at exactly 2x IS a 2x2 box average, so
+# the capped path handed the restorer about half the fine detail the native
+# path does (measured on a 4K skin texture: 0.6-0.7 of the native
+# high-frequency energy at cap 512, 0.45 at 1024; Gman saw it as "less
+# detail with the cap" on the ProblemChild A/B). A first cut used NEAREST
+# for the second step: detail back, but torch/cv2 nearest is floor-based
+# and sampled 3.75 px (cap 512) / 5.6 px (1024) up-left of the native
+# sample -- the restored patch landed displaced on the frame ("the window
+# grill moved", frame 744).
+#
+# T26 final: the two steps are ALIGNED so that the capped chain samples the
+# frame where the one-step native chain does. The native clip pixel i
+# samples native x = (i + 0.5) * L / 256 - 0.5. The storage grid is shifted
+# by c = (cap / 256) / 2 stored pixels -- stored pixel j sits at
+# (j + c) / s - 0.5 -- so that for the largest crop of a scene (the one the
+# clip is scaled to) every r-th stored pixel (r = cap / 256) sits exactly on
+# a native clip sample, and the clip builder then takes a 2-tap sample at
+# (i + 0.5) * S / out - c, which is stored pixel i * r exactly: a point
+# sample of a point sample, bit-for-bit the native chain along that axis
+# (cap 768) or within float rounding (512, 1024). Along an axis whose ratio
+# is not an integer (the short side, or a smaller crop in the scene) the
+# 2-tap is a blend of two stored neighbours at an unbiased position -- no
+# systematic shift, a little less than the full native detail. Measured:
+# 0.94-0.97 of native high-frequency energy, and the smallest pixel
+# difference to the native clip of any variant (fewer than RC4's).
+#
+# The cap is a panel option (Restoration -> Crop Cap), OFF by default:
+# 0 = store native (Beta2 parity). The pipeline's VRAM preflight names the
+# value that would fit when the native estimate does not.
+SCENE_CROP_CAP_PX = 0
+
+
+def crop_storage_scale(h: int, w: int, cap: int = SCENE_CROP_CAP_PX) -> float:
+    """1.0 when the crop is stored as is, else the downscale factor (< 1)."""
+    long_side = max(int(h), int(w))
+    if cap <= 0 or long_side <= int(cap):
+        return 1.0
+    return float(cap) / float(long_side)
+
+
+# The clip size the storage grid is aligned to (lada's clip is 256 px).
+# If TrackerConfig.clip_size ever differs the chain is still unbiased, only
+# the "lands exactly on a native sample" property is lost.
+CAP_GRID_CLIP_SIZE = 256
+
+
+def cap_grid_shift(cap: int, clip_size: int = CAP_GRID_CLIP_SIZE) -> float:
+    """c: the storage grid's offset in stored pixels (see the note above)."""
+    if cap <= 0:
+        return 0.5
+    return (float(cap) / float(clip_size)) / 2.0
+
+
+def _axis_taps(pos: torch.Tensor, n: int):
+    """Clamped 2-tap (floor, floor+1, weight) for float sample positions."""
+    p = pos.clamp(0.0, float(n - 1))
+    i0 = p.floor().to(torch.long).clamp_(max=n - 1)
+    i1 = (i0 + 1).clamp_(max=n - 1)
+    return i0, i1, (p - i0.to(p.dtype))
+
+
+def sample_hwc_u8(img_u8: torch.Tensor, pos_y: torch.Tensor, pos_x: torch.Tensor) -> torch.Tensor:
+    """Separable 2-tap bilinear sample of an (H, W, C) uint8 image at float
+    positions (pixel-centre coordinates, clamped at the border) -> (len(pos_y),
+    len(pos_x), C) uint8. The native path's bilinear at explicit positions;
+    works on CPU and CUDA alike (pure indexing, no interpolate kernel)."""
+    h, w = int(img_u8.shape[0]), int(img_u8.shape[1])
+    y0, y1, wy = _axis_taps(pos_y.to(img_u8.device, torch.float32), h)
+    x0, x1, wx = _axis_taps(pos_x.to(img_u8.device, torch.float32), w)
+    f = img_u8.to(torch.float32)
+    r0 = f[y0]                      # (oh, W, C)
+    r1 = f[y1]
+    wx_ = wx.view(1, -1, 1)
+    top = r0[:, x0] * (1.0 - wx_) + r0[:, x1] * wx_
+    bot = r1[:, x0] * (1.0 - wx_) + r1[:, x1] * wx_
+    wy_ = wy.view(-1, 1, 1)
+    out = top * (1.0 - wy_) + bot * wy_
+    return out.round_().clamp_(0, 255).to(torch.uint8).contiguous()
+
+
+def sample_hw_mask_u8(mask_u8: torch.Tensor, pos_y: torch.Tensor, pos_x: torch.Tensor) -> torch.Tensor:
+    """Nearest sample of an (H, W) uint8 mask at the same positions."""
+    h, w = int(mask_u8.shape[0]), int(mask_u8.shape[1])
+    iy = pos_y.to(mask_u8.device, torch.float32).round().to(torch.long).clamp_(0, h - 1)
+    ix = pos_x.to(mask_u8.device, torch.float32).round().to(torch.long).clamp_(0, w - 1)
+    return mask_u8.to(torch.uint8)[iy][:, ix].contiguous()
+
+
+def cap_crop_storage(crop_img: torch.Tensor, crop_mask: Optional[torch.Tensor],
+                     cap: int = SCENE_CROP_CAP_PX
+                     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Downscale an (H, W, 3) uint8 crop and its (H, W) uint8 mask for
+    storage when the long side exceeds ``cap``. Image: a 2-tap bilinear
+    point sample WITHOUT antialiasing on the ALIGNED grid (stored pixel j
+    at native (j + c) / s - 0.5, c = cap_grid_shift(cap); see the note
+    above). Mask: nearest at the same positions. Both keep their dtype and
+    device. Unchanged tensors are returned as is (no copy)."""
+    h, w = int(crop_img.shape[0]), int(crop_img.shape[1])
+    s = crop_storage_scale(h, w, cap)
+    if s >= 1.0:
+        return crop_img, crop_mask
+    nh = max(1, int(round(h * s)))
+    nw = max(1, int(round(w * s)))
+    c = cap_grid_shift(cap)
+    pos_y = (torch.arange(nh, dtype=torch.float32) + c) / s - 0.5
+    pos_x = (torch.arange(nw, dtype=torch.float32) + c) / s - 0.5
+    img_small = sample_hwc_u8(crop_img, pos_y, pos_x)
+    mask_small = crop_mask
+    if crop_mask is not None:
+        m = crop_mask
+        if m.ndim == 3 and m.shape[-1] == 1:
+            m = m[:, :, 0]
+        mask_small = sample_hw_mask_u8(m, pos_y, pos_x)
+    return img_small, mask_small
+
+
+def resample_capped_to_clip(stored_u8: torch.Tensor, out_hw: Tuple[int, int], cap: int,
+                            *, is_mask: bool = False) -> torch.Tensor:
+    """Clip.from_scene's resize for a CAPPED stored crop (or its mask): sample
+    the stored grid at (i + 0.5) * S / out - c -- the native clip sample's
+    position expressed in stored pixels -- with a 2-tap (image) or nearest
+    (mask). For the scene's largest crop that position is stored pixel
+    i * (cap / 256) exactly: the native chain's own sample."""
+    oh, ow = int(out_hw[0]), int(out_hw[1])
+    sh, sw = int(stored_u8.shape[0]), int(stored_u8.shape[1])
+    c = cap_grid_shift(cap)
+    pos_y = (torch.arange(oh, dtype=torch.float32) + 0.5) * (sh / float(oh)) - c
+    pos_x = (torch.arange(ow, dtype=torch.float32) + 0.5) * (sw / float(ow)) - c
+    if is_mask:
+        m = stored_u8
+        if m.ndim == 3 and m.shape[-1] == 1:
+            m = m[:, :, 0]
+        return sample_hw_mask_u8(m, pos_y, pos_x)
+    return sample_hwc_u8(stored_u8, pos_y, pos_x)
+
+
+def mask_to_native(mask_small: Optional[torch.Tensor], native_hw: Tuple[int, int],
+                   cap: int = 0) -> Optional[torch.Tensor]:
+    """The stored (possibly capped) mask back at the crop box's native size
+    (nearest), for the tracker's same-frame union in native coordinates.
+    ``cap`` > 0: invert the aligned storage grid (T26) -- native pixel y reads
+    stored row round((y + 0.5) * s - c) -- so the union sits where the mask
+    was captured; 0 keeps the plain nearest upscale."""
+    if mask_small is None:
+        return None
+    nh, nw = int(native_hw[0]), int(native_hw[1])
+    if tuple(mask_small.shape[-2:]) == (nh, nw):
+        return mask_small
+    if cap > 0:
+        sh, sw = int(mask_small.shape[0]), int(mask_small.shape[1])
+        c = cap_grid_shift(cap)
+        pos_y = (torch.arange(nh, dtype=torch.float32) + 0.5) * (sh / float(nh)) - c
+        pos_x = (torch.arange(nw, dtype=torch.float32) + 0.5) * (sw / float(nw)) - c
+        return sample_hw_mask_u8(mask_small, pos_y, pos_x)
+    m = mask_small.to(torch.uint8).unsqueeze(0).unsqueeze(0)
+    return F.interpolate(m, size=(nh, nw), mode="nearest").squeeze(0).squeeze(0).contiguous()
+
+
+# -------------------------
 # Scene + Clip
 # -------------------------
 
 
 @dataclass
 class Scene:
-    """Tracks one mosaic region across consecutive frames."""
+    """Tracks one mosaic region across consecutive frames.
+
+    CM-227: ``crops`` / ``masks`` are STORED at most ``crop_cap_px`` on the
+    long side (see ``cap_crop_storage``); ``crop_boxes`` stay native. Read a
+    mask in native coordinates through ``last_mask_native()``."""
+
+    # class attribute on purpose (not a dataclass field): the storage cap,
+    # overridable per instance (tests) without touching the field order
+    crop_cap_px = SCENE_CROP_CAP_PX
 
     id: int
     frame_start: int
@@ -333,6 +522,26 @@ class Scene:
         # a scene completes when (current_frame - last_detected_frame) > ttl.
         # -1 sentinel means "no detection yet" (Scene was just instantiated).
         self.last_detected_frame: int = -1
+
+        # CM-213: a continuation scene starts life with the parent's last
+        # 2 * overlap frames already in it; seed_weights holds the paste
+        # weight of each seeded frame (see scene_tracker.continuation_weights).
+        # Frames added afterwards weigh 1.0. Empty for an ordinary scene.
+        self.seed_weights: List[float] = []
+        self.parent_scene_id: int = -1
+
+    @property
+    def is_continuation(self) -> bool:
+        return bool(self.seed_weights)
+
+    def paste_weights(self) -> Optional[List[float]]:
+        """Per-frame paste weights for the clip, or None when every frame
+        weighs 1.0 (an ordinary scene -- the compositor's fast path)."""
+        if not self.seed_weights:
+            return None
+        w = list(self.seed_weights)[: len(self.frame_nums)]
+        w.extend([1.0] * (len(self.frame_nums) - len(w)))
+        return w
 
     @property
     def frame_end(self) -> int:
@@ -371,10 +580,20 @@ class Scene:
         self.frame_nums.append(int(frame_num))
         self.roi_boxes.append(roi_box)
         self.crop_boxes.append(crop_box)
+        crop_img, crop_mask = cap_crop_storage(crop_img, crop_mask, self.crop_cap_px)   # CM-227
         self.crops.append(crop_img)
         self.masks.append(crop_mask)
         if is_detection:
             self.last_detected_frame = int(frame_num)
+
+    def last_mask_native(self) -> Optional[torch.Tensor]:
+        """CM-227: the last frame's mask at its crop box's native size (the
+        stored one may be capped)."""
+        if not self.masks or self.masks[-1] is None:
+            return None
+        b = self.crop_boxes[-1]
+        return mask_to_native(self.masks[-1], (int(b[2]) - int(b[0]) + 1, int(b[3]) - int(b[1]) + 1),
+                              cap=int(self.crop_cap_px))
 
     # --- Compatibility aliases (older pipeline revisions) ---
     def append(
@@ -407,6 +626,9 @@ class Scene:
             raise AssertionError("Cannot merge into empty scene")
         self.roi_boxes[-1] = _union_box(self.roi_boxes[-1], roi_box)
         self.crop_boxes[-1] = crop_box
+        # CM-227: cap the incoming pair first, so a same-box merge below sees
+        # equal (stored) shapes and unions; a changed box replaces, as before.
+        crop_img, crop_mask = cap_crop_storage(crop_img, crop_mask, self.crop_cap_px)
         self.crops[-1] = crop_img
         # NOTE (important): during same-frame merges, the *crop box usually changes*
         # (we recompute it from the union ROI). That means any previously stored

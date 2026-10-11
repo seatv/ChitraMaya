@@ -131,12 +131,41 @@ def vram_snapshot(device=None) -> Optional[Dict[str, int]]:
         return None
 
 
+def _other_legend() -> str:
+    """T20b: what 'other' (VRAM torch cannot see) is made of, per edition --
+    the NVIDIA wording ('engines/RTX SS/NVDEC/NVENC') read as a wrong build
+    on the AMD box (09-16 gate run)."""
+    try:
+        import torch
+        if getattr(getattr(torch, "version", None), "hip", None):
+            return "MIOpen kernels/AMF/driver"
+        if "+xpu" in str(getattr(torch, "__version__", "")):
+            return "oneDNN kernels/QSV/driver"
+    except Exception:
+        pass
+    return "engines/RTX SS/NVDEC/NVENC/driver"
+
+
+def context_label() -> str:
+    """T20b: the first ledger line's label -- 'CUDA context' on NVIDIA,
+    'HIP context' on AMD, 'XPU context' on Intel."""
+    try:
+        import torch
+        if getattr(getattr(torch, "version", None), "hip", None):
+            return "before models (HIP context)"
+        if "+xpu" in str(getattr(torch, "__version__", "")):
+            return "before models (XPU context)"
+    except Exception:
+        pass
+    return "before models (CUDA context)"
+
+
 def format_vram(label: str, snap: Optional[Dict[str, int]]) -> str:
     if not snap:
         return f"[VRAM] {label}: n/a"
     return (f"[VRAM] {label}: used {snap['used']} / {snap['total']} MB "
             f"(free {snap['free']}; torch allocated {snap['torch_allocated']}, "
-            f"reserved {snap['torch_reserved']}; other {snap['other']} = engines/RTX SS/NVDEC/NVENC/driver)")
+            f"reserved {snap['torch_reserved']}; other {snap['other']} = {_other_legend()})")
 
 
 class RunReport:
@@ -156,7 +185,9 @@ class RunReport:
         self._t0 = time.perf_counter()
         self.effective: Dict[str, Dict[str, Any]] = {}
         self.events: Dict[str, Dict[str, Any]] = {}
+        self.warnings: List[str] = []     # T20c: run.warnings -- what "complete" must not hide
         self.checkpoints: List[List[float]] = []
+        self.gpu_checkpoints: List[Dict[str, Any]] = []   # CM-209
         self.vram_samples: List[Dict[str, Any]] = []     # CM-196 ledger
         self._vram_peak_used: int = 0
         self.report_path: Optional[str] = None
@@ -188,6 +219,11 @@ class RunReport:
         asked == ran, so the report answers 'what ran' in one place."""
         self.effective[str(field)] = {"asked": asked, "ran": ran, "reason": str(reason or "")}
 
+    def set_warnings(self, warnings: List[str]) -> None:
+        """T20c: the run's user-facing warnings (guard hits, stabilizer windows
+        skipped). Written as run.warnings and run.status = 'complete-with-warnings'."""
+        self.warnings = [str(w)[:300] for w in (warnings or [])]
+
     def event(self, kind: str, frame: Optional[int] = None, message: str = "", count: int = 1) -> None:
         e = self.events.setdefault(str(kind), {"count": 0, "first": None})
         e["count"] += int(count)
@@ -197,10 +233,13 @@ class RunReport:
                           "time": _dt.datetime.now().strftime("%H:%M:%S")}
 
     def checkpoint(self, frame: int, elapsed_s: float, max_points: int = 2000,
-                   vram_used_mb: Optional[int] = None) -> None:
+                   vram_used_mb: Optional[int] = None,
+                   gpu: Optional[Dict[str, Any]] = None) -> None:
         """[frame, elapsed_s] -- or [frame, elapsed_s, vram_used_mb] when the
         CM-196 ledger has a driver reading (the third column lines up with a
-        monitor CSV without guessing the run window)."""
+        monitor CSV without guessing the run window). CM-209: ``gpu`` (the
+        watchdog's NVML medians since the previous checkpoint) goes to the
+        parallel ``gpu_checkpoints`` list, one dict per row, same frame."""
         if len(self.checkpoints) < max_points:
             row: List[float] = [int(frame), round(float(elapsed_s), 1)]
             if vram_used_mb is not None:
@@ -208,6 +247,10 @@ class RunReport:
                 if int(vram_used_mb) > self._vram_peak_used:
                     self._vram_peak_used = int(vram_used_mb)
             self.checkpoints.append(row)
+            if gpu:
+                g = dict(gpu)
+                g["frame"] = int(frame)
+                self.gpu_checkpoints.append(g)
 
     def vram(self, label: str, snap: Optional[Dict[str, int]], frame: Optional[int] = None,
              delta_mb: Optional[int] = None) -> None:
@@ -237,9 +280,15 @@ class RunReport:
         run.setdefault("wall_seconds", round(time.perf_counter() - self._t0, 1))
         run.setdefault("input", self.input_path)
         run.setdefault("output", self.output_path)
+        if self.warnings:
+            run["warnings"] = list(self.warnings)
+            if not run.get("partial"):
+                run["status"] = "complete-with-warnings"
         timing = dict(timing)
         if self.checkpoints:
             timing["checkpoints"] = self.checkpoints
+        if self.gpu_checkpoints:
+            timing["gpu_checkpoints"] = self.gpu_checkpoints   # CM-209
         rep: Dict[str, Any] = {
             "chitramaya": {"version": self.version, "edition": self.edition, "report_format": 1},
             "machine": _machine_info(device),

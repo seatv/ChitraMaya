@@ -53,6 +53,8 @@ SECONDARY_MODES = ("none", "rtx-2x", "rtx-4x", "esrgan-4x")
 # used, and jasna chains a SECOND VideoSuperRes effect in DENOISE mode
 # (their default: medium) after the upscale, before paste-back.
 SECONDARY_DENOISE_MODES = ("none", "low", "medium", "high", "ultra")
+# CM-217: Maxine VideoSuperRes.QualityLevel for the upscale itself.
+SECONDARY_QUALITY_MODES = ("low", "medium", "high", "ultra")
 
 _QUALITY = "high"          # matches the field-validated probe configuration
 _INPUT_SIZE = 256          # must equal restoration clip_size; enforced by caller
@@ -192,7 +194,8 @@ class RtxSecondaryRestorer:
 
     def __init__(self, *, device: torch.device, scale: int = 2,
                  input_size: int = _INPUT_SIZE,
-                 denoise: str = "none") -> None:
+                 denoise: str = "none",
+                 quality: str = _QUALITY) -> None:
         if scale not in (2, 4):
             raise ValueError(f"scale must be 2 or 4, got {scale}")
         if int(input_size) != _INPUT_SIZE:
@@ -214,9 +217,15 @@ class RtxSecondaryRestorer:
             "high": VideoSuperRes.QualityLevel.HIGH,
             "ultra": VideoSuperRes.QualityLevel.ULTRA,
         }
+        # CM-217: the Super-Res QualityLevel is the panel's Scaler Quality
+        # (low / medium / high / ultra); HIGH was hardcoded until 1.80.
+        self.quality = str(quality or _QUALITY).strip().lower()
+        if self.quality not in qmap:
+            raise ValueError(f"unknown secondary quality {self.quality!r} "
+                             f"(expected one of {SECONDARY_QUALITY_MODES})")
         self._stream_ptr = torch.cuda.current_stream(self.device).cuda_stream if \
             self.device.type == "cuda" else 0
-        self._sr = VideoSuperRes(device=(self.device.index or 0), quality=qmap[_QUALITY])
+        self._sr = VideoSuperRes(device=(self.device.index or 0), quality=qmap[self.quality])
         self._sr.output_width = self.out_size
         self._sr.output_height = self.out_size
         self._sr.load()
@@ -347,6 +356,7 @@ class InterpSecondaryRestorer:
 __all__ = [
     "SECONDARY_MODES",
     "SECONDARY_DENOISE_MODES",
+    "SECONDARY_QUALITY_MODES",
     "RtxSecondaryRestorer",
     "InterpSecondaryRestorer",
     "SecondaryStats",

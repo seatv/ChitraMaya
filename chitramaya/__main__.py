@@ -113,16 +113,50 @@ def _install_cli_console(tag: str = "cli") -> None:
         pass
 
 
+def _say(line: str) -> None:
+    """Print an [Alloc] line now (terminal) and keep it for the server to
+    re-print once the console log tee is installed (T24)."""
+    try:
+        import chitramaya as _pkg
+        _pkg.ALLOC_BANNER.append(line)
+    except Exception:
+        pass
+    print(line)
+
+
 def _apply_cuda_alloc_conf() -> None:
-    """Batch 78 (CM-149): "cudaExpandableSegments": true in
-    ChitraMaya-config.json sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments
-    before torch makes its first CUDA allocation.
+    """Batch 78 (CM-149), default flipped in T15: PYTORCH_CUDA_ALLOC_CONF=
+    expandable_segments is set before torch makes its first CUDA allocation
+    on every NVIDIA build; "cudaExpandableSegments": false in
+    ChitraMaya-config.json turns it off.
 
     Field basis: ProblemChild 4K60 on a 6GB card OOM'd at frame 197,368
     from allocator fragmentation; with expandable_segments it reached
-    281,512 (+43%). Users should not have to remember a per-machine env
-    var -- user knobs live in the config file (env-var doctrine). An env
-    var the user DID set explicitly is respected and never clobbered.
+    281,512 (+43%). 09-19/21: three 4K OOMs on an 8 GB 5060 Ti each showed
+    ~1.1 GiB 'reserved but unallocated' with a 760 MiB request refused --
+    fragmentation again, on a machine where the key was off. Nobody should
+    have to know the key exists to get past it, so it is the default now.
+    Users should not have to remember a per-machine env var -- user knobs
+    live in the config file (env-var doctrine). An env var the user DID set
+    explicitly is respected and never clobbered. ROCm / XPU builds: no-op
+    (the allocator option is CUDA's).
+
+    T23c / T24 (CM-238): the allocator's ``garbage_collection_threshold`` was
+    added here in T23 and REMOVED in T24. Field 10-01 (FifthBatch-4060,
+    tools/gc_threshold_probe.py on torch 2.11.0+cu128): with the threshold
+    parsed by the allocator (0.5), a memory fraction set, 60 % of the card in
+    torch's cache and a fresh cudaMalloc needed, the allocator handed back
+    nothing (cudaFree calls 0) -- by the env var and by the runtime API alike.
+    The knob cannot be shown to work on the torch the app ships, so it is not
+    offered; the wall is handled by torch's own release-and-retry (seen in
+    the field as a silent reserved drop at 8187/8187 MB) and the torch
+    allocated/reserved split on the checkpoint line is what CM-238 keeps.
+    A ``cudaGcThreshold`` key left in ChitraMaya-config.json is ignored and
+    said so once.
+
+    The lines this function prints are also kept in ``chitramaya.ALLOC_BANNER`` so the
+    UI server can re-print them after the console tee is installed (T24:
+    they used to reach the terminal only, i.e. nobody on the windowed exe).
 
     Must run before any subcommand touches torch/CUDA -- call first in
     main(). Config anchoring mirrors the server: exe dir when frozen,
@@ -131,24 +165,50 @@ def _apply_cuda_alloc_conf() -> None:
     import os
     from pathlib import Path
     try:
+        try:
+            from chitramaya.gpu_gate import _build_edition
+            if _build_edition() != "cuda":
+                return
+        except Exception:
+            pass
+        want = True
         base = (Path(sys.executable).parent
                 if getattr(sys, "frozen", False) else Path.cwd())
         cfg_file = base / "ChitraMaya-config.json"
-        if not cfg_file.exists():
+        flat = None
+        if cfg_file.exists():
+            flat = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(flat, dict) and flat.get("cudaExpandableSegments") is False:
+                want = False
+            if isinstance(flat, dict) and flat.get("cudaGcThreshold") is not None:
+                _say("[Alloc] \"cudaGcThreshold\" in ChitraMaya-config.json is ignored since T24: "
+                     "torch's garbage_collection_threshold handed nothing back on the torch "
+                     "this build ships (field 10-01, tools/gc_threshold_probe.py); the key "
+                     "can be removed.")
+        if os.name == "nt":
+            # T17b (field 09-20): torch's caching allocator only implements
+            # expandable segments where the CUDA driver API is linked (Linux);
+            # on Windows the option is ignored with "expandable_segments not
+            # supported on this platform". Say so once instead of setting it.
+            _say("[Alloc] CUDA expandable_segments is not available in torch on Windows (the allocator "
+                 "ignores it); VRAM headroom on this platform comes from the bounded scene buffers "
+                 "(CM-227), the per-frame detector letterbox (CM-224) and the pre-run VRAM check "
+                 "(CM-236); the checkpoint line's torch allocated/reserved split shows the cache.")
             return
-        flat = json.loads(cfg_file.read_text(encoding="utf-8"))
-        if not isinstance(flat, dict) or not flat.get("cudaExpandableSegments"):
+        if not want:
+            _say("[Alloc] CUDA expandable_segments OFF (cudaExpandableSegments: false in "
+                 "ChitraMaya-config.json); the default since T15 is on.")
             return
         cur = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         if "expandable_segments" in cur:
-            print("[Alloc] PYTORCH_CUDA_ALLOC_CONF already configures "
-                  "expandable_segments; leaving the environment as-is.")
+            _say("[Alloc] PYTORCH_CUDA_ALLOC_CONF already configures "
+                 "expandable_segments; leaving the environment as-is.")
             return
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
             (cur + "," if cur else "") + "expandable_segments:True")
-        print("[Alloc] CUDA expandable_segments ENABLED "
-              "(cudaExpandableSegments in ChitraMaya-config.json) -- "
-              "reduces allocator fragmentation on long runs.")
+        _say("[Alloc] CUDA expandable_segments ENABLED (default; "
+             "\"cudaExpandableSegments\": false in ChitraMaya-config.json turns it off) -- "
+             "no allocator fragmentation on long runs.")
     except Exception:
         # A malformed config must never block launch; self-check reports
         # JSON validity separately.

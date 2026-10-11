@@ -359,11 +359,15 @@ def composite_clip_into_store_projected(
     from chitramaya.mosaic.utils import mask_utils
 
     n = min(len(restored_frames_u8), len(clip.frame_nums))
+    _wt = getattr(clip, "weight_at", None)
     for i in range(n):
         frame_num = int(clip.frame_nums[i])
         frame = store_bgr_u8.get(frame_num)
         if frame is None:
             continue
+        weight = float(_wt(i)) if _wt is not None else 1.0
+        if weight <= 0.0:
+            continue   # CM-213: a seeded frame the parent clip owns
 
         clip_img = restored_frames_u8[i]
         if clip_img is None:
@@ -384,11 +388,14 @@ def composite_clip_into_store_projected(
         if str(blendmask).lower() == "facefusion":
             _feather = int(feather_radius) if int(feather_radius) > 0 else None
             alpha = mask_utils.create_support_blend_mask(
-                clip_mask.float(), feather_px=_feather)
+                clip_mask.float(), feather_px=_feather,
+                frame_h=int(frame.shape[0]))   # CM-214
         else:
             alpha = mask_utils.create_blend_mask(clip_mask.float())
         if alpha.ndim == 3:
             alpha = alpha.squeeze(-1)
+        if weight < 1.0:
+            alpha = alpha * weight   # CM-213 crossfade over the parent's paste
 
         vrproj.blend_projected(
             frame_bgr_u8=frame,

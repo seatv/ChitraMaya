@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+
+from chitramaya.video.source_format import input_args as _src_args   # CM-246
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -77,12 +79,31 @@ class Decoder:
         output_format: str = "RGBP",          # "RGBP" or "RGB"
         ffmpeg_input_args: str = "",          # injected BEFORE -i (CPU fallback)
         threaded_buffer_size: Optional[int] = None,   # CM-191: explicit NVDEC prefetch depth
+        hw_accel: str = "auto",               # T20d: panel 'Hardware decode' -- auto | off (ffmpeg lane)
+        scan_stream: bool = True,             # T23f (CM-240): False = no whole-file scan at open
     ) -> None:
         self.input_path = str(Path(input_path))
+        # T23f (CM-240): PyNvVideoCodec's need_scanned_stream_metadata reads
+        # the WHOLE file at open to count frames exactly. The primary decoder
+        # needs that count (progress, the PARTIAL verdict, gap-fill); the
+        # CM-191 lag decoder does not -- it follows the primary's PTS -- and
+        # on a 10 GB 4K title its scan ran concurrently with the primary's
+        # first read and the audio sidecar extraction: three full reads of
+        # the source before the first frame moved (2.5 min on a local SSD,
+        # far worse on the USB drive that stalled batch 1).
+        self.scan_stream: bool = bool(scan_stream)
         self.gpu_id = int(gpu_id)
         self.batch_size = int(batch_size)
         self.output_format = str(output_format or "RGBP").upper()
         self.ffmpeg_input_args = str(ffmpeg_input_args or "")
+        # T20d: the panel's Hardware decode setting for the ffmpeg lane
+        # (auto = probe qsv -> d3d11va -> CPU; off = CPU decode). The
+        # CM_HW_DECODE environment variable, when set, still overrides it
+        # (the A/B switch that found the d3d11va chroma fault). What ran is
+        # in self.hw_decode / self.hw_decode_reason for the run report.
+        self.hw_accel: str = str(hw_accel or "auto").strip().lower() or "auto"
+        self.hw_decode: str = "nvdec"
+        self.hw_decode_reason: str = ""
         # CM-191: the lagging re-decode instance asks for a small prefetch
         # queue (it is read one frame at a time); None keeps the default.
         self._threaded_buffer_override: Optional[int] = (
@@ -162,7 +183,7 @@ class Decoder:
                     gpu_id=self.gpu_id,
                     output_color_type=out_color,
                     use_device_memory=True,
-                    need_scanned_stream_metadata=True,
+                    need_scanned_stream_metadata=bool(self.scan_stream),
                 )
                 self.backend = "nvdec"
             except Exception as e:
@@ -180,6 +201,8 @@ class Decoder:
         if self.backend == "nvdec":
             meta = None
             try:
+                if not self.scan_stream:
+                    raise RuntimeError("no scan requested")
                 meta = self._decoder.get_scanned_stream_metadata()
             except Exception:
                 meta = self._decoder.get_stream_metadata()
@@ -235,7 +258,8 @@ class Decoder:
 
         fps_s = f"{self.metadata.fps:.2f}" if self.metadata.fps else "?"
         nf_s = str(self.metadata.num_frames) if self.metadata.num_frames else "?"
-        print(f"[Decoder] Initialized ({self.backend}): {self.metadata.width}x{self.metadata.height}, {nf_s} frames, {fps_s} fps")
+        print(f"[Decoder] Initialized ({self.backend}): {self.metadata.width}x{self.metadata.height}, {nf_s} frames, {fps_s} fps"
+              + ("" if self.scan_stream or self.backend != "nvdec" else " (no stream scan; container count)"))
         if self.backend == "nvdec":
             print(f"[Decoder] Output: {self.output_format} on GPU {self.gpu_id} (ThreadedDecoder, buffer={self._threaded_buffer_size()})")
         else:
@@ -624,6 +648,7 @@ class Decoder:
         # -- the rewrite pass was pure cost (CM-187).
         cmd = [
             "ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostdin",
+            *_src_args(str(src)),           # CM-246
             "-i", str(src),
             "-map", "0:v:0", "-an", "-sn", "-dn",
             "-c", "copy", "-f", "mp4",
@@ -702,6 +727,7 @@ class Decoder:
     def _ffprobe(self, path: Optional[str] = None) -> VideoMetadata:
         cmd = [
             "ffprobe", "-v", "error",
+            *_src_args(str(path or self.input_path)),   # CM-246: forced demuxer when auto-detection is fooled
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,avg_frame_rate,codec_name,bit_rate,nb_frames,start_time",
             "-show_entries", "format=duration,format_name",
@@ -834,6 +860,7 @@ class Decoder:
             *hw_tokens,
             "-fflags", "+genpts",
             *extra_tokens,
+            *_src_args(self.input_path),    # CM-246
             "-i", self.input_path,
             "-an", "-sn", "-dn",
             "-fps_mode", "passthrough",  # CM-131: -vsync removed in ffmpeg 9; fps_mode exists since 5.1
@@ -863,19 +890,30 @@ class Decoder:
         runs at -v warning and treats any setup-failure/fallback message in
         stderr as a probe failure.
 
-        CM_HW_DECODE env: auto (default) | qsv | d3d11va (force one
-        candidate) | off/0/cpu/none (skip probing, plain CPU decode --
-        also the A/B switch for benchmarking).
+        CM_HW_DECODE env: auto (default) | qsv | d3d11va | d3d12va (force
+        one candidate; d3d12va is the T20f A/B path, never chosen by auto)
+        | off/0/cpu/none (skip probing, plain CPU decode -- also the A/B
+        switch for benchmarking).
 
         Results are cached per input path for the process lifetime.
         """
-        env = os.getenv("CM_HW_DECODE", "auto").strip().lower()
+        env = os.getenv("CM_HW_DECODE", "").strip().lower()
         if env in {"0", "off", "cpu", "none", "false"}:
             print("[Decoder] hw decode: disabled (CM_HW_DECODE)")
+            self.hw_decode, self.hw_decode_reason = "none", "CM_HW_DECODE environment override"
             return []
+        # T20d: the panel setting decides when the environment does not.
+        if not env and self.hw_accel in {"off", "0", "cpu", "none", "false"}:
+            print("[Decoder] hw decode: off (Hardware decode = Off in the panel); CPU decode")
+            self.hw_decode, self.hw_decode_reason = "none", "Hardware decode = Off (panel)"
+            return []
+        if not env:
+            env = "auto"
 
         cached = Decoder._HWACCEL_CACHE.get(self.input_path)
         if cached is not None:
+            self.hw_decode = (cached[1] if len(cached) > 1 else "none")
+            self.hw_decode_reason = "probe result cached for this file" if cached else "no usable hardware decoder (cached)"
             return list(cached)
 
         # X2b: qsv needs an explicit system-memory output format. ffmpeg 8
@@ -888,7 +926,13 @@ class Decoder:
             ("qsv", ["-hwaccel", "qsv", "-hwaccel_output_format", "nv12"]),
             ("d3d11va", ["-hwaccel", "d3d11va"]),
         ]
-        if env in {"qsv", "d3d11va"}:
+        # T20f: ffmpeg's D3D12 decode path (ffmpeg 7+) has its own download
+        # code; selectable for an A/B against the d3d11va download that hands
+        # over unfinished frames on AMD (CM-234). Not in the auto order until
+        # a field run says it is clean.
+        if env == "d3d12va":
+            candidates = [("d3d12va", ["-hwaccel", "d3d12va"])]
+        elif env in {"qsv", "d3d11va"}:
             candidates = [c for c in candidates if c[0] == env]
 
         _FALLBACK_MARKERS = ("failed setup", "falling back", "fall back",
@@ -903,6 +947,7 @@ class Decoder:
             probe_cmd = [
                 "ffmpeg", "-hide_banner", "-v", "warning",
                 *tokens,
+                *_src_args(self.input_path),    # CM-246
                 "-i", self.input_path,
                 "-an", "-sn", "-dn",
                 "-fps_mode", "passthrough",  # CM-131: -vsync removed in ffmpeg 9; fps_mode exists since 5.1
@@ -921,6 +966,9 @@ class Decoder:
                 soft_fallback = any(m in err for m in _FALLBACK_MARKERS)
                 if r.returncode == 0 and not soft_fallback:
                     chosen = list(tokens)
+                    self.hw_decode = name
+                    self.hw_decode_reason = ("GPU fixed-function decode; frames downloaded to "
+                                             "system memory; the chroma guard watches the download (T20d)")
                     print(f"[Decoder] hw decode: {name} "
                           f"(GPU fixed-function decode; frames downloaded "
                           f"to system memory)")
@@ -934,6 +982,7 @@ class Decoder:
 
         if not chosen:
             print("[Decoder] hw decode: none usable; CPU decode")
+            self.hw_decode, self.hw_decode_reason = "none", "no usable hardware decoder for this file; CPU decode"
         Decoder._HWACCEL_CACHE[self.input_path] = list(chosen)
         return chosen
 

@@ -22,7 +22,14 @@
 //                                                       looked up by English
 //
 // Every lookup falls back to English per key: a missing or stale
-// translation never blanks a control. Language is the ctrlUiLanguage
+// translation never blanks a control. CM-235 (1.80.00 field): a string
+// is only (re)applied while the element still shows the English original
+// or the value this file last set -- text the app rewrote at runtime (the
+// loaded video's path in the header, "Get Models" / "Compile Models",
+// "Test Frame 354", the elapsed/ETA counters, a populated model list) is
+// left alone, since applyConfig() re-applies the language on every
+// settings load / saved-configuration click / Reset Defaults and used to
+// clobber all of it back to the extracted English. Language is the ctrlUiLanguage
 // select in the gear menu, persisted with Save Settings (ChitraMaya-
 // config.json, key ctrlUiLanguage). ASCII-only source; the strings live in
 // the JSON files.
@@ -34,6 +41,25 @@
   let CUR = null;           // key -> translation (current language)
   let curLang = 'en';
   const originals = new Map();  // element -> {attr/text: english} so switching back restores
+  const lastSet = new Map();    // element -> {slot: value we last wrote} (CM-235 runtime guard)
+
+  // CM-235: true when the element's current value in `slot` is neither the
+  // English original we remembered nor the value we last wrote, i.e. the
+  // app changed it at runtime and the translator must not touch it.
+  function runtimeChanged(el, slot, current) {
+    const m = originals.get(el);
+    if (!m || !(slot in m)) return false;          // first application
+    const cur = norm(current);
+    if (cur === norm(m[slot])) return false;
+    const l = lastSet.get(el);
+    if (l && slot in l && cur === norm(l[slot])) return false;
+    return true;
+  }
+  function noteSet(el, slot, value) {
+    let l = lastSet.get(el);
+    if (!l) { l = {}; lastSet.set(el, l); }
+    l[slot] = value;
+  }
   let jsMap = new Map();        // english message -> translation
   let patched = false;
 
@@ -112,7 +138,10 @@
       if (!sel) return;
       const optVal = parts.slice(oi + 1).join('.');
       for (const o of sel.options) {
-        if (o.value === optVal) { remember(o, 'text', norm(o.textContent)); o.textContent = value; return; }
+        if (o.value === optVal) {
+          if (runtimeChanged(o, 'text', o.textContent)) return;
+          remember(o, 'text', norm(o.textContent)); o.textContent = value; noteSet(o, 'text', value); return;
+        }
       }
       return;
     }
@@ -121,25 +150,41 @@
       if (parts.length === 2) {
         const el = document.getElementById(parts[0]);
         if (!el) return;
-        if (attr === 'value') { remember(el, 'attr:value', el.value); el.value = value; return; }
-        remember(el, 'attr:' + attr, el.getAttribute(attr)); el.setAttribute(attr, value); return;
+        if (attr === 'value') {
+          if (runtimeChanged(el, 'attr:value', el.value)) return;
+          remember(el, 'attr:value', el.value); el.value = value; noteSet(el, 'attr:value', value); return;
+        }
+        setAttrGuarded(el, attr, value); return;
       }
       // <ctx>.<slug>.<attr>: locate by English text inside the scope
       const el = findByAttr(scopeOf(parts[0]), attr, english);
       if (!el) return;
-      remember(el, 'attr:' + attr, el.getAttribute(attr)); el.setAttribute(attr, value); return;
+      setAttrGuarded(el, attr, value); return;
     }
     if (last === 'text' && parts.length === 2) {
       const el = document.getElementById(parts[0]);
       if (!el) return;
-      if (english.indexOf('<') >= 0) { remember(el, 'html', norm(el.innerHTML)); el.innerHTML = value; return; }
-      remember(el, 'text', ownText(el)); setOwnText(el, value); return;
+      setTextGuarded(el, english, value); return;
     }
     // <ctx>.<slug>: own text (or inline html) inside the scope
     const el = findByText(scopeOf(parts[0]), english);
     if (!el) return;
-    if (english.indexOf('<') >= 0) { remember(el, 'html', norm(el.innerHTML)); el.innerHTML = value; }
-    else { remember(el, 'text', ownText(el)); setOwnText(el, value); }
+    setTextGuarded(el, english, value);
+  }
+
+  function setAttrGuarded(el, attr, value) {
+    const slot = 'attr:' + attr;
+    if (runtimeChanged(el, slot, el.getAttribute(attr))) return;
+    remember(el, slot, el.getAttribute(attr)); el.setAttribute(attr, value); noteSet(el, slot, value);
+  }
+
+  function setTextGuarded(el, english, value) {
+    if (english.indexOf('<') >= 0) {
+      if (runtimeChanged(el, 'html', el.innerHTML)) return;
+      remember(el, 'html', norm(el.innerHTML)); el.innerHTML = value; noteSet(el, 'html', norm(value)); return;
+    }
+    if (runtimeChanged(el, 'text', ownText(el))) return;
+    remember(el, 'text', ownText(el)); setOwnText(el, value); noteSet(el, 'text', value);
   }
 
   function applyAll() {
@@ -167,6 +212,17 @@
     if (typeof s !== 'string') return s;
     const hit = jsMap.get(norm(s));
     return hit == null ? s : hit;
+  }
+
+  // CM-235: the current-language string for an extracted key (e.g.
+  // 'currentFileName.text'), English when untranslated, `fallback` when
+  // the key is unknown -- for the few places the app writes an extracted
+  // string back itself (the header when the video is unloaded).
+  function t(key, fallback) {
+    const dict = CUR || {};
+    let v = dict[key];
+    if (v == null || !norm(v)) v = EN ? EN[key] : null;
+    return (v == null || !norm(v)) ? fallback : String(v);
   }
 
   function patchMessageFns() {
@@ -206,7 +262,7 @@
     }
   }
 
-  window.I18N = { setLanguage, tr, get language() { return curLang; }, LANGS };
+  window.I18N = { setLanguage, tr, t, get language() { return curLang; }, LANGS };
 
   document.addEventListener('DOMContentLoaded', () => {
     const sel = document.getElementById('ctrlUiLanguage');

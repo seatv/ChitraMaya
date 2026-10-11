@@ -46,7 +46,11 @@ def _apply_secondary(
     if secondary is None:
         return clip_img_u8, 1
     _st = getattr(secondary, "stats", None)
-    if not secondary.should_apply(orig_shape_hw):
+    # CM-208: judge the gate on the region without its Region Margin (the
+    # pipeline sets gate_margin_px = 2 * roi_dilate per run; 0 when off).
+    _gm = int(getattr(secondary, "gate_margin_px", 0) or 0)
+    gate_shape_hw = (max(1, int(orig_shape_hw[0]) - _gm), max(1, int(orig_shape_hw[1]) - _gm))
+    if not secondary.should_apply(gate_shape_hw):
         if _st is not None:
             _st.note(frame_num, orig_shape_hw, "small")
         return clip_img_u8, 1
@@ -87,6 +91,7 @@ def _blend_into_frame_lada(
     border_ratio: float = 0.05,
     blendmask: str = "none",
     feather_radius: int = 0,
+    weight: float = 1.0,
 ) -> None:
     """
     Direct port of LADA frame_restorer.py blend:
@@ -101,9 +106,18 @@ def _blend_into_frame_lada(
                        feather_radius does not apply here.
       - "facefusion" : alpha follows the mosaic's actual mask support
                        (create_support_blend_mask) for a softer, shape-aware
-                       edge. feather_radius (px) sets the inward feather;
-                       0 = auto (derived from crop size).
+                       edge. feather_radius (px) sets the OUTWARD feather (CM-086);
+                       0 = auto (CM-214: 2.8 % of the frame height).
+
+    weight (CM-213): scales the alpha for one frame of a continuation clip.
+    The parent clip's result already sits in the frame, so pasting with
+    alpha * weight yields (1 - weight) * parent + weight * this clip on the
+    interior -- the crossfade across an overlap seam. 1.0 = the plain blend;
+    <= 0 is a no-op (the caller skips such frames before getting here).
     """
+    weight = float(weight)
+    if weight <= 0.0:
+        return
     t, l, b, r = map(int, orig_clip_box)
     frame_roi = frame_bgr_u8[t : b + 1, l : r + 1]
 
@@ -112,10 +126,13 @@ def _blend_into_frame_lada(
         _feather = int(feather_radius) if int(feather_radius) > 0 else None
         blend_mask = mask_utils.create_support_blend_mask(
             clip_mask_u8.float(), feather_px=_feather,
+            frame_h=int(frame_bgr_u8.shape[0]),   # CM-214: auto feather scales with the frame
         )
     else:
         # Legacy LADA rectangular blend mask.
         blend_mask = mask_utils.create_blend_mask(clip_mask_u8.float())
+    if weight < 1.0:
+        blend_mask = blend_mask * weight
 
     if frame_bgr_u8.device.type not in ("cuda", "xpu"):  # CM-093: xpu takes the GPU path
         # CPU/numpy path (matches LADA CPU semantics: astype(uint8) truncation)
@@ -174,11 +191,15 @@ def composite_clip_into_store(
     Masks stay in clip space (they carry no detail worth upscaling).
     """
     n = min(len(restored_frames_u8), len(clip.frame_nums))
+    _wt = getattr(clip, "weight_at", None)
     for i in range(n):
         frame_num = int(clip.frame_nums[i])
         frame = store_bgr_u8.get(frame_num)
         if frame is None:
             continue
+        weight = float(_wt(i)) if _wt is not None else 1.0
+        if weight <= 0.0:
+            continue   # CM-213: a seeded frame the parent clip owns
         prepared = prepare_patch(clip, i, restored_frames_u8[i], secondary)
         if prepared is None:
             continue   # CM-186 guard dropped this frame's restoration
@@ -193,6 +214,7 @@ def composite_clip_into_store(
             border_ratio=border_ratio,
             blendmask=blendmask,
             feather_radius=feather_radius,
+            weight=weight,
         )
 
 
@@ -242,8 +264,10 @@ def blend_patch(
     border_ratio: float = 0.05,
     blendmask: str = "none",
     feather_radius: int = 0,
+    weight: float = 1.0,
 ) -> None:
-    """CM-191: the blend half of the compositor, unchanged arithmetic."""
+    """CM-191: the blend half of the compositor, unchanged arithmetic
+    (CM-213: times the frame's paste weight)."""
     _blend_into_frame_lada(
         frame_bgr_u8=frame_bgr_u8,
         clip_img_u8=clip_img_u8,
@@ -253,6 +277,7 @@ def blend_patch(
         border_ratio=border_ratio,
         blendmask=blendmask,
         feather_radius=feather_radius,
+        weight=weight,
     )
 
 

@@ -119,12 +119,35 @@ class TemporalStabilizer:
             from chitramaya.device import enable_channels_last_convs
             enable_channels_last_convs(model)
         # CM-093: device-aware fp16 (CUDA Volta+; XPU validated in phase 0).
+        # T20c (CM-186, the real cause): on ROCm the fp16 stabilizer returns
+        # NaN / garbage for part of every 7-frame window (9060 XT, 09-23: 207
+        # of 524 frames all-black, the rest "wavy") -- fp32 there. ROCm
+        # reports as device.type == "cuda", hence the explicit HIP test.
         from chitramaya.device import fp16_supported
-        self._fp16 = fp16_supported(self.device)
+        self._is_hip = bool(getattr(getattr(torch, "version", None), "hip", None))
+        self._fp16 = fp16_supported(self.device) and not self._is_hip
         if self._fp16:
             model.half()
         self._model = model
         self._dtype = torch.float16 if self._fp16 else torch.float32
+        # T20c: per-window output check (see stabilize_clip). A bad window
+        # hands back the UNSTABILIZED restored frame -- the restoration is
+        # kept, only the smoothing is skipped for that frame -- and the
+        # first bad fp16 window switches the model to fp32 for the run.
+        self.bad_windows: int = 0
+        self.fp32_fallbacks: int = 0
+        self._warned: bool = False
+
+    def precision(self) -> str:
+        return "fp16" if self._fp16 else "fp32"
+
+    def _to_fp32(self) -> None:
+        if not self._fp16:
+            return
+        self._model.float()
+        self._fp16 = False
+        self._dtype = torch.float32
+        self.fp32_fallbacks += 1
 
     @torch.inference_mode()
     def stabilize_clip(self, frames: Sequence[torch.Tensor]) -> List[torch.Tensor]:
@@ -145,12 +168,57 @@ class TemporalStabilizer:
         stack = stack[..., [2, 1, 0]].permute(0, 3, 1, 2).contiguous()
         stack = stack.to(self._dtype).div_(255.0)          # [N,3,H,W] RGB
 
+        def _run(stk: torch.Tensor, which: Sequence[int]) -> List[torch.Tensor]:
+            outs: List[torch.Tensor] = []
+            for i in which:
+                idxs = [min(max(i + k, 0), n - 1) for k in range(-_RADIUS, _RADIUS + 1)]
+                outs.append(self._model(stk[idxs].unsqueeze(0))[0])   # [3,H,W] RGB float
+            return outs
+
+        def _bad(outs: List[torch.Tensor], stk: torch.Tensor, which: Sequence[int]) -> List[int]:
+            """T20c: indices whose window came back non-finite, or black for a
+            non-black input. One host sync per clip, not per frame."""
+            if not outs:
+                return []
+            o = torch.stack(outs).float()                         # [m,3,H,W]
+            finite = torch.isfinite(o).flatten(1).all(dim=1)
+            black = o.abs().flatten(1).amax(dim=1) <= 1e-3
+            src_dark = stk[list(which)].float().flatten(1).amax(dim=1) <= 1e-3
+            flags = (~finite | (black & ~src_dark)).tolist()
+            return [w for w, f in zip(which, flags) if f]
+
+        all_idx = list(range(n))
+        outs = _run(stack, all_idx)
+        bad = _bad(outs, stack, all_idx)
+        if bad and self._fp16:
+            # T20c (CM-186, the real cause): fp16 on ROCm returned NaN / garbage
+            # for part of every window. Switch to fp32 once for the run and redo
+            # the failed windows; the restored frames themselves are untouched.
+            self._to_fp32()
+            stack = stack.to(torch.float32)
+            if not self._warned:
+                self._warned = True
+                print(f"[TemporalFix] WARNING: {len(bad)} stabilized window(s) came back black / "
+                      f"non-finite in fp16; the stabilizer runs in fp32 for the rest of this run "
+                      f"(restored frames are unaffected).")
+            redo = _run(stack, bad)
+            for w, o in zip(bad, redo):
+                outs[w] = o
+            bad = _bad([outs[w] for w in bad], stack, bad)
+        if bad:
+            self.bad_windows += len(bad)
+            if not self._warned:
+                self._warned = True
+                print(f"[TemporalFix] WARNING: {len(bad)} stabilized window(s) came back black / "
+                      f"non-finite; those frames keep their restored pixels without smoothing "
+                      f"(count in the run summary).")
+        bad_set = set(bad)
         out_frames: List[torch.Tensor] = []
-        for i in range(n):
-            idxs = [min(max(i + k, 0), n - 1) for k in range(-_RADIUS, _RADIUS + 1)]
-            inp = stack[idxs].unsqueeze(0)                 # [1,7,3,H,W]
-            out = self._model(inp)[0]                      # [3,H,W] RGB
-            out = out.clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
+        for i in all_idx:
+            if i in bad_set:
+                out_frames.append(frames[i])                   # the restored frame, unsmoothed
+                continue
+            out = outs[i].clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
             out_frames.append(out.permute(1, 2, 0)[..., [2, 1, 0]].contiguous())
         return out_frames
 

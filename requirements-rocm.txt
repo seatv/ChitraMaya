@@ -59,6 +59,10 @@ https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1
 # (torch.version.hip + device name + matmul probe) is the first thing
 # to collect.
 ultralytics>=8.4
+# CM-229: custom super-resolution models (models/upscalers) -- the loader that
+# identifies ESRGAN / RealPLKSR / SPAN / ATD / HAT / ... state dicts (MIT).
+# Pure Python on top of torch; pulls einops + safetensors.
+spandrel>=0.4.1
 # lap: ultralytics tracker dependency it otherwise AutoUpdate-installs
 # AT RUNTIME (field event r3: it pip-installed itself in the MIDDLE of
 # a PyInstaller build when the spec first imported ultralytics). Pin it

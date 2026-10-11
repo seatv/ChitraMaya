@@ -3,7 +3,7 @@
 
 Compares, for many random region shapes:
   legacy create_blend_mask        (F.conv2d, uniform kernel, reflect pad)
-  legacy create_support_blend_mask (F.avg_pool2d, zero pad)
+  create_support_blend_mask        (CM-086 outward feather; reference = max_pool2d + avg_pool2d, reflect pad)
 against the shipped implementations in chitramaya.mosaic.utils.mask_utils,
 which now build the same box means from cumulative sums (no conv2d, no
 avg_pool2d -> no per-shape MIOpen compile on ROCm).
@@ -80,9 +80,13 @@ def legacy_create_blend_mask(crop_mask: torch.Tensor) -> torch.Tensor:
     return blend
 
 
-def legacy_create_support_blend_mask(crop_mask: torch.Tensor, feather_px=None, *,
-                                     min_feather_px: int = 2, max_feather_ratio: float = 0.05,
-                                     passes: int = 1) -> torch.Tensor:
+def reference_create_support_blend_mask(crop_mask: torch.Tensor, feather_px=None, *,
+                                        min_feather_px: int = 2, max_feather_ratio: float = 0.05,
+                                        passes: int = 1) -> torch.Tensor:
+    """Independent reference for the CM-086 OUTWARD feather: torch pooling ops
+    (max_pool2d dilation, avg_pool2d ramp, reflect padding) instead of the
+    summed-area box filter the shipped function uses. Same semantics:
+    alpha == 1 on the support and its feather margin, ramp to 0 outside."""
     mask = crop_mask.squeeze()
     support = (mask > 0).to(dtype=torch.float32)
     h, w = int(support.shape[0]), int(support.shape[1])
@@ -92,17 +96,20 @@ def legacy_create_support_blend_mask(crop_mask: torch.Tensor, feather_px=None, *
         feather_px = int(round(min(h, w) * float(max_feather_ratio)))
         feather_px = max(int(min_feather_px), feather_px)
     feather_px = int(max(0, feather_px))
+    feather_px = min(feather_px, max(0, (min(h, w) - 1) // 2))
     if feather_px <= 0:
         return support
     k = 2 * feather_px + 1
-    alpha = support.unsqueeze(0).unsqueeze(0)
-    for _ in range(max(1, int(passes))):
-        alpha = F.avg_pool2d(alpha, kernel_size=k, stride=1, padding=feather_px)
-    alpha = alpha.squeeze(0).squeeze(0)
-    alpha = alpha * support
-    amax = alpha.max()
-    if float(amax) > 0.0:
-        alpha = alpha / amax
+    n_pass = max(1, int(passes))
+    x = support.unsqueeze(0).unsqueeze(0)
+    for _ in range(n_pass):
+        xp = F.pad(x, (feather_px,) * 4, mode="reflect")
+        x = F.max_pool2d(xp, kernel_size=k, stride=1)          # box dilation
+    for _ in range(n_pass):
+        xp = F.pad(x, (feather_px,) * 4, mode="reflect")
+        x = F.avg_pool2d(xp, kernel_size=k, stride=1)          # outward ramp
+    alpha = x.squeeze(0).squeeze(0)
+    alpha = torch.maximum(alpha, support)
     return alpha.clamp(0.0, 1.0)
 
 
@@ -145,9 +152,14 @@ def _composite_u8(alpha: torch.Tensor, clip: torch.Tensor, frame: torch.Tensor) 
 def main() -> int:
     ap = argparse.ArgumentParser(description="CM-172 blend-mask equivalence + timing check")
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--shapes", type=int, default=200, help="number of random (h, w) shapes")
+    # Defaults trimmed 09-16: the REFERENCE implementations (F.conv2d with a
+    # 71x71 kernel, pooling) run on the CPU by design and cost seconds per
+    # large shape -- 200 shapes to 1400 px took many minutes with no output
+    # and looked hung. 60 shapes to 1000 px is a ~1-2 minute check; pass
+    # --shapes 200 --max-side 1400 for the long form.
+    ap.add_argument("--shapes", type=int, default=60, help="number of random (h, w) shapes (default 60)")
     ap.add_argument("--min-side", type=int, default=24)
-    ap.add_argument("--max-side", type=int, default=1400)
+    ap.add_argument("--max-side", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--tol", type=float, default=1e-4, help="max allowed |alpha diff|")
     ap.add_argument("--max-u8-frac", type=float, default=0.001, help="max allowed fraction of composite pixels differing per shape")
@@ -156,7 +168,10 @@ def main() -> int:
 
     device = torch.device(args.device)
     gen = torch.Generator().manual_seed(args.seed)
-    print(f"[cm172] device={device} torch={torch.__version__} shapes={args.shapes}")
+    print(f"[cm172] device={device} torch={torch.__version__} shapes={args.shapes} max-side={args.max_side}")
+    print("[cm172] the reference math (conv2d / pooling) runs on the CPU and is slow by design -- "
+          "expect a minute or two; progress every 10 shapes.")
+    _t_start = time.perf_counter()
 
     worst_alpha = {"legacy": 0.0, "support": 0.0}
     worst_u8 = {"legacy": 0.0, "support": 0.0}
@@ -167,6 +182,9 @@ def main() -> int:
     failures = 0
 
     for i in range(args.shapes):
+        if i and i % 10 == 0:
+            print(f"[cm172] {i}/{args.shapes} shapes, {time.perf_counter() - _t_start:.0f}s elapsed, "
+                  f"worst |alpha diff| legacy={worst_alpha['legacy']:.2e} support={worst_alpha['support']:.2e}", flush=True)
         h = int(torch.randint(args.min_side, args.max_side + 1, (1,), generator=gen))
         w = int(torch.randint(args.min_side, args.max_side + 1, (1,), generator=gen))
         mask_u8 = _random_region_mask(h, w, gen, device)
@@ -176,7 +194,7 @@ def main() -> int:
 
         for name, f_old, f_new in (
             ("legacy", lambda: legacy_create_blend_mask(mask_f), lambda: mask_utils.create_blend_mask(mask_f)),
-            ("support", lambda: legacy_create_support_blend_mask(mask_f), lambda: mask_utils.create_support_blend_mask(mask_f)),
+            ("support", lambda: reference_create_support_blend_mask(mask_f), lambda: mask_utils.create_support_blend_mask(mask_f)),
         ):
             a_old, dt_old = _timed(f_old, device)
             a_new, dt_new = _timed(f_new, device)
@@ -202,9 +220,6 @@ def main() -> int:
                 failures += 1
                 print(f"[cm172] FAIL {name}: h={h} w={w} max|dalpha|={d:.3e} "
                       f"u8 pixels differing={nd} ({100.0 * frac:.3f}%) max level diff={lvl}")
-
-        if (i + 1) % 50 == 0:
-            print(f"[cm172] {i + 1}/{args.shapes} shapes checked")
 
     print("")
     print("[cm172] ---- equivalence ----")

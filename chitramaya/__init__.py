@@ -19,4 +19,11 @@ Ported from Rope's schemes with:
 # already listed in packaging/windows/released-versions.txt (append to that
 # file right after each publish). v1.20 and v1.30 both shipped showing a
 # stale number because this line relied on memory; no longer.
-__version__ = "1.70.99-Beta"
+__version__ = "1.80.00-RC9"
+
+# T24: the [Alloc] lines main() prints before torch is imported (and before
+# the console log tee exists). The UI server re-prints them into the .log.
+# Lives here, not in __main__, because `python -m chitramaya` runs that file
+# as `__main__` and a second import of chitramaya.__main__ would be a fresh
+# module with an empty list.
+ALLOC_BANNER: list = []

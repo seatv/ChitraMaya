@@ -41,6 +41,10 @@ PyNvVideoCodec>=2.1
 
 # ── YOLO mosaic detector ──────────────────────────────────────────────
 ultralytics>=8.4
+# CM-229: custom super-resolution models (models/upscalers) -- the loader that
+# identifies ESRGAN / RealPLKSR / SPAN / ATD / HAT / ... state dicts (MIT).
+# Pure Python on top of torch; pulls einops + safetensors.
+spandrel>=0.4.1
 
 # ── ONNX Runtime (for InferenceBackend = ort_cuda / ort_trt) ──────────
 # Required even if you stay on the TensorRT path — used inside
