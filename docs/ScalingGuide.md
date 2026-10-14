@@ -95,6 +95,8 @@ animal from the Secondary. These are real runs, not estimates:
 | RTX 3060 Ti 8 GB | 1080p title restored **and** upscaled to 2160p | RTX Super-Res (Quality ultra, Denoise ultra) | **6h30m for 2h03m** (0.32×); the upscale was 81 % of the wall; 85 ms per frame |
 | RTX 5060 Ti | 1080p title, Upscale mode to 2160p | RTX Super-Res (ultra + ultra) | **10h02m for 2h41m** (0.27×); 61 ms per frame |
 | RTX 3060 Ti 8 GB | 1080p title, Upscale mode to 2160p | Real-ESRGAN | **~29 h for 2h03m** (2.1 fps) |
+| RTX 3060 Ti 8 GB | 1080p30 title (66 min) restored **and** upscaled to 2160p | RTX Super-Res (ultra + ultra) | **3h42m** (0.30×); 86.6 ms per frame; VRAM at the 8 GB ceiling from mid-title (no paging) |
+| RTX 3060 Ti 8 GB | the same title, same settings | custom 4× SPAN **with its TensorRT engines** | **5h04m** (0.22×); 131 ms per frame (275 in PyTorch = 2.1×); VRAM 72 % |
 | RX 9060 XT 16 GB | 720p title restored and upscaled to 2160p | custom 4× SPAN | **10h00m for 2h25m** (0.24×); 98 ms per frame; the upscale was 71 % of the wall |
 | RX 9060 XT 16 GB | 17 s 1080p cut restored and upscaled to 2160p | custom 4× SPAN | 143 s (3.9 fps); 183 ms per frame for the upscale alone |
 | Arc 140V (laptop iGPU) | 17 s 1080p cut restored and upscaled to 2160p | custom 4× SPAN | **505 s (1.1 fps)**; the scaler took 76 ms per frame, the 4K frames' trip to the encoder the rest |
@@ -106,9 +108,13 @@ Read it as three tiers:
   hours per hour of 1080p60 video on a 3060 Ti–5060 Ti class card — and
   note the Known issue below: those runs paid for a second denoise pass they
   did not need. At the defaults (Quality high, Denoise none) expect less.
-- **Real-ESRGAN and custom models on NVIDIA: clips.** A compact 4× network
-  over a 4K frame is ~475 ms on a 3060 Ti; a 2-hour title is a 29-hour job.
-  Use them on a segment where you want their look, not on a title.
+- **Real-ESRGAN and custom models on NVIDIA: clips — or, with engines, a
+  long night.** A compact 4× network over a 4K frame is ~475 ms on a 3060 Ti
+  in PyTorch; a 2-hour title is a 29-hour job. A custom model compiled to
+  TensorRT engines (§3) runs 2.1× faster: a SPAN model at 131 ms per 4K
+  frame brought a 66-minute title to five hours on the same card, with
+  2 GB of VRAM to spare where RTX Super-Res sat at the ceiling. Still half
+  the speed of RTX Super-Res; use it where you prefer its look.
 - **AMD and Intel: clips, or overnight.** There is no Maxine, so every
   whole-frame scaler is a PyTorch network over every frame — 100–180 ms per
   frame on an RX 9060 XT, and on the Arc 140V the 4K *output* itself runs at
@@ -163,6 +169,23 @@ wrong folder each get their own hint).
   re-fuses their reparameterised layers on every frame, which made them run
   slower than they are; ChitraMaya fuses them once at load (bit-identical
   output, checked), which is why a SPAN model is the fastest custom option.
+- **NVIDIA: compile the model once (CM-247).** From the install folder:
+
+  ```
+  ChitraMaya-cli.exe -compile-sr 4xNomos8k_span_otf_strong.pth --secondary --bench
+  ```
+
+  writes TensorRT engines beside the weights in `models\upscalers\` — the
+  whole-frame engine and, with `--secondary`, the 256-px engine the Secondary
+  uses on crops; `--bench` prints the speed-up and the parity against
+  PyTorch. From then on the app uses them automatically (`[Scalers] ...
+  engine ACTIVE` in the console; `backend: "tensorrt"` in the run report).
+  Measured 2.1× on the whole-frame upscale; the Secondary engine on crops is
+  faster than Maxine's. Engines are built for the GPU they were compiled
+  on — one built on another card is skipped with a console line and the
+  model runs in PyTorch. A few minutes per model; needs a few GB of free
+  VRAM while it builds. AMD and Intel: no engines; the model runs in
+  PyTorch (the fused SPAN path is already the fast one there).
 
 **Where to find models:** [OpenModelDB](https://openmodeldb.info) is the
 community index; Philip Hofmann's
@@ -181,7 +204,34 @@ eyes over any of our numbers.
 
 ---
 
-## 4. Recipes
+## 4. Max Clip Length — measured
+
+Max Clip Length is the restorer's temporal window: a track is cut into clips
+of at most that many frames, each restored in one pass with the frames
+before and after it in view, and the cuts are joined with Overlap +
+Crossfade. Six runs of a 10-minute 4K60 cut on an RTX 3060 12 GB (identical
+detections in every run; RTX Super-Res and Real-ESRGAN Secondaries):
+
+| Max Clip | wall | clips | join re-work | VRAM peak | residual scan |
+|---|---|---|---|---|---|
+| 90 | 48:49 | 1,020 | 23 % | 7.9 GB | 26 frames |
+| 180 | 46:28 | 668 | 12.5 % | 9.8 GB | 25 (same frames) |
+| 240 | 45:55 | 598 | 10 % | 11.1 GB | 26 (same frames) |
+| 300 | 54:09 | 563 | 9 % | 12.2 GB = ceiling, paging | 26 (same frames) |
+
+The restore cost per frame was flat (29.6 / 29.8 / 30.0 ms at 90 / 180 /
+240); the only thing a short clip costs is the join re-work, and the only
+thing a long one buys is fewer joins — until it hits the card's memory,
+when everything slows, detection included (300: +18 % wall). The scaler
+made no difference to any of this (Real-ESRGAN: 55:23 / 50:30 at 90 / 180).
+
+**Rule: Max Clip Length ≈ 3 × frame rate** — 180 at 60 fps, 90 at 30 — the
+1.80.00 default. Going shorter buys VRAM (about 2 GB between 180 and 90 at
+4K) for a few percent of time and more joins; going longer buys nothing you
+can see. On an 8 GB card at 4K60, 90 fits and 180 does not without Crop
+Cap; take Max Clip 90 **before** Crop Cap 512, because it costs no texture.
+
+## 5. Recipes
 
 **A 1080p title, best quality in reasonable time (NVIDIA):** defaults
 (Secondary RTX Super-Res 4×, Temporal Stability 1, Output Upscale off).

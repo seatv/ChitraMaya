@@ -19,7 +19,7 @@ Ported from Rope's schemes with:
 # already listed in packaging/windows/released-versions.txt (append to that
 # file right after each publish). v1.20 and v1.30 both shipped showing a
 # stale number because this line relied on memory; no longer.
-__version__ = "1.80.00-RC9"
+__version__ = "1.80.00"
 
 # T24: the [Alloc] lines main() prints before torch is imported (and before
 # the console log tee exists). The UI server re-prints them into the .log.

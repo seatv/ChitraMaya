@@ -34,6 +34,7 @@ ChitraMaya.exe is the windowed UI and has no console to print to):
   ChitraMaya-cli.exe -restore     [opts]   Run the mosaic-restoration CLI
   ChitraMaya-cli.exe -compile-rest [opts]  Build/rebuild BasicVSR++ TensorRT sub-engines
   ChitraMaya-cli.exe -compile-det  [opts]  Build/rebuild the YOLO detection engine (CM-201 profile)
+  ChitraMaya-cli.exe -compile-sr <model>   Build TensorRT engines for a custom scaler in models\\upscalers (CM-247)
   ChitraMaya-cli.exe -self-check           Verify this install (imports, GPU, ffmpeg)
   ChitraMaya-cli.exe -verify-blend-mask    Diagnostic: blend-mask equivalence + timing (CM-172)
   ChitraMaya-cli.exe -probe-decode         Diagnostic: decode-path layer timings (CM-171)
@@ -51,6 +52,7 @@ For the full CLI option list, run:
   ChitraMaya-cli.exe -restore      --help
   ChitraMaya-cli.exe -compile-rest --help
   ChitraMaya-cli.exe -compile-det  --help
+  ChitraMaya-cli.exe -compile-sr   --help
 
 Every CLI run writes its own console log next to the exe
 (ChitraMaya-console-<stamp>-cli.log; the newest 20 launches are kept).
@@ -365,6 +367,13 @@ def main() -> int:
         sys.argv = ["ChitraMaya -compile-det"] + args[1:]
         from tools.compile_yolo import main as compile_det_main
         return _run_sub("-compile-det", compile_det_main)
+
+    # CM-247: custom super-resolution engines (T25) from an INSTALLED build --
+    # the user has no source tree or venv, only ChitraMaya-cli.exe.
+    if args and args[0] in ("-compile-sr", "--compile-sr"):
+        sys.argv = ["ChitraMaya -compile-sr"] + args[1:]
+        from tools.compile_custom_sr import main as compile_sr_main
+        return _run_sub("-compile-sr", compile_sr_main)
 
     # T9 diagnostics (AMD hold): the same tools/ scripts, runnable from an
     # INSTALLED build -- the AMD and Intel boxes have no source tree or venv.

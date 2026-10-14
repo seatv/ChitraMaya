@@ -911,6 +911,23 @@ if (stcBtn) {
   });
 }
 
+// ── Help: the User Guide (CM-248) ─────────────────────────
+// Served by the app at /userguide (UserGuide.html next to the exe), opened in
+// the system browser through the pywebview bridge; window.open in a browser.
+const helpBtn = document.getElementById('helpBtn');
+if (helpBtn) {
+  helpBtn.addEventListener('click', () => {
+    const url = window.location.origin + '/userguide';
+    if (typeof window.pywebview !== 'undefined'
+        && window.pywebview && window.pywebview.api
+        && typeof window.pywebview.api.open_url === 'function') {
+      window.pywebview.api.open_url(url);
+    } else {
+      window.open(url, '_blank');
+    }
+  });
+}
+
 // ── Console Drawer (Batch 23) ─────────────────────────────
 // Mirrors everything the process prints (batch rosters, skip reasons,
 // recovery banners, watchdog alarms) from /api/console into a collapsible

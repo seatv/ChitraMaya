@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChitraMaya Scaling Guide</title>
+<style>
+:root { --fg:#1f2328; --bg:#ffffff; --muted:#59636e; --line:#d1d9e0; --code:#f6f8fa; --link:#0969da; --note:#ddf4ff; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --code:#161b22; --link:#4493f8; --note:#0c2d6b; }
+}
+html { -webkit-text-size-adjust: 100%; }
+body { margin:0; padding:0 16px 48px; background:var(--bg); color:var(--fg);
+       font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 2em; margin: 1.2em 0 .4em; border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+h2 { font-size: 1.5em; margin: 1.8em 0 .5em; border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+h3 { font-size: 1.2em; margin: 1.4em 0 .4em; }
+p, li { max-width: 72ch; }
+a { color: var(--link); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: .92em; }
+code { background: var(--code); padding: .1em .35em; border-radius: 4px; }
+pre { background: var(--code); padding: 12px 14px; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; max-width: 100%; }
+th, td { border: 1px solid var(--line); padding: 6px 12px; text-align: left; vertical-align: top; }
+th { background: var(--code); }
+blockquote { margin: 1em 0; padding: .6em 1em; border-left: 4px solid var(--link); background: var(--note); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
+img { max-width: 100%; height: auto; }
+.toc { background: var(--code); padding: 10px 18px; border-radius: 6px; margin: 1em 0; }
+.toc ul { margin: 0; padding-left: 1.2em; }
+.stamp { color: var(--muted); font-size: .85em; margin-top: 3em; border-top: 1px solid var(--line); padding-top: .6em; }
+</style>
+</head>
+<body>
+<main>
+<h1 id="scaling-guide-the-secondary-scaler-and-output-upscale">Scaling Guide — the Secondary scaler and Output Upscale</h1>
+<p>ChitraMaya scales pixels in two very different places, and it pays to keep
+them apart in your head:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Secondary</strong> (Restoration panel)</th>
+<th><strong>Output Upscale</strong> (Encoder panel)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>What it scales</td>
+<td>each restored <em>region</em> (a 256-px crop), before paste-back</td>
+<td>the <em>whole frame</em>, after restoration, before encode</td>
+</tr>
+<tr>
+<td>Why</td>
+<td>large regions were stretched at paste-back and went soft</td>
+<td>you want a bigger output (720p → 2160p, 1080p → 1440p / 2160p)</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>a few percent of a run</td>
+<td><strong>hours per hour of video</strong> on most cards</td>
+</tr>
+<tr>
+<td>Default</td>
+<td><strong>on</strong> (RTX Super-Res 4× on NVIDIA, Real-ESRGAN 4× elsewhere)</td>
+<td><strong>off</strong></td>
+</tr>
+<tr>
+<td>Use it for</td>
+<td>every run</td>
+<td>clips and segments; titles overnight, and only on NVIDIA's RTX path in reasonable time</td>
+</tr>
+</tbody>
+</table>
+<p>Both take the same three kinds of scaler: <strong>RTX Super-Res</strong> (NVIDIA Maxine;
+needs an RTX card and a recent driver), <strong>Real-ESRGAN 4×</strong> (bundled, every
+edition), and <strong>custom models</strong> — any super-resolution <code>.pth</code> /
+<code>.safetensors</code> you drop into <code>models\upscalers\</code>.</p>
+<hr />
+<h2 id="1-the-secondary-why-it-is-on-by-default">1. The Secondary — why it is on by default</h2>
+<p>The restorer works on a fixed 256 × 256 crop of each region. When the
+region on the frame is larger than that — close-ups, VR, anything at 4K — the
+restored crop used to be <em>stretched</em> back up at paste-back, and the result
+went soft exactly where you look closest. With a secondary scaler the
+restored crop is upscaled 4× first (to 1024 px), so the final resize
+<em>shrinks</em> instead of stretching. Regions at or below 256 px skip the stage
+automatically (the run report's <code>counts.secondary</code> says how many crops went
+through and how many were too small to need it).</p>
+<p><strong>Cost</strong> is small because only regions are scaled: on an RTX 4060 the 17 s
+1080p test cut restores in 32.5 s with RTX Super-Res 4× and 32.5 s with
+Real-ESRGAN 4× — the same. On AMD and Intel the secondary runs in PyTorch
+and is a larger share of a slower run, but still single-digit percent.</p>
+<p><strong>Which scaler?</strong> They produce two different <em>looks</em>, and neither is more
+correct — pick by eye with <strong>Test Frame</strong>, which shows every region as
+Mosaic → Restored:</p>
+<ul>
+<li><strong>RTX Super-Res</strong> (NVIDIA): the smoother result — about half the fine
+  texture of the other path on the same clip, with the same residual mosaic
+  and flicker. Its <strong>Scaler Quality</strong> (low / medium / high / ultra; high is
+  the pre-1.80 value) and <strong>Scaler Denoise</strong> (a second Maxine pass) are the
+  two controls beneath it. Denoise changed nothing visible in our
+  measurements at ~60 % more restore time; leave it at <em>none</em>.</li>
+<li><strong>Real-ESRGAN 4×</strong> (<code>realesr-general-x4v3</code>, every edition): keeps the
+  restorer's texture. The default on AMD and Intel, and a fair choice on
+  NVIDIA if you prefer texture to smoothness.</li>
+<li><strong>A custom model</strong> — see §3. The one we recommend trying is
+  <code>4xNomos8k_span_otf_strong</code> (a SPAN model trained by Philip Hofmann): to
+  our eyes a touch better than either built-in on skin, and on AMD and
+  Intel it is <em>faster</em> than Real-ESRGAN (9 % less restore time on an RX
+  9060 XT, 18 % on an Arc 140V) once its layers are fused at load, which
+  ChitraMaya does. On NVIDIA it costs about the same as the built-ins.</li>
+</ul>
+<p>If RTX Super-Res is selected on a machine where the Maxine runtime is not
+available, the run falls back to Real-ESRGAN and the console and run report
+(<code>effective.secondary</code>) say so.</p>
+<p><strong>Region Margin</strong> (Detection panel) grows the detector's box before it
+reaches the restorer and the paste-back mask with it; <strong>Feather</strong> and
+<strong>Blend Mask</strong> (Restoration panel) shape the edge where the scaled crop
+meets the frame — the Face Swap blend feathers <em>outward</em> into clean skin,
+so every mosaic pixel is fully replaced.</p>
+<hr />
+<h2 id="2-output-upscale-a-clip-feature-or-an-overnight-one">2. Output Upscale — a clip feature, or an overnight one</h2>
+<p><strong>Output Upscale</strong> (Encoder panel) takes a factor — <strong>2×</strong>, <strong>4×</strong> — or a
+target — <strong>1080p</strong>, <strong>1440p</strong>, <strong>2160p</strong> — and scales every finished frame
+before it is encoded. It works inside a normal restoration run, and on its
+own in <strong>Upscale</strong> mode (Alternate Execution Modes): decode → scale →
+encode, no detector, no restorer, no tracker — for SFW content you simply
+want bigger, or a restored output you want to bring to 4K in a second pass.
+<strong>Save Segment</strong> writes a marked segment as its own file, so you can judge a
+scaler on a minute before committing a title. The <strong>Upscale Scaler</strong>
+dropdown picks the model; the progress modal, the console checkpoints and
+the run report (<code>counts.output_upscale</code> — scaler, factor, ms per frame) all
+know the mode.</p>
+<p>A 4× model is run once and the result resized to the target when the target
+is not a multiple of the model's factor (a 4× model to 2160p from 1080p runs
+at 4× and shrinks by half); a 2× model to 2160p from 720p runs twice. The
+run report's <code>effective.output_upscale</code> shows what happened.</p>
+<h3 id="what-it-costs-measured">What it costs — measured</h3>
+<p>Whole-frame scaling touches every pixel of every frame, so it is a different
+animal from the Secondary. These are real runs, not estimates:</p>
+<table>
+<thead>
+<tr>
+<th>card</th>
+<th>job</th>
+<th>scaler</th>
+<th>speed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>1080p title restored <strong>and</strong> upscaled to 2160p</td>
+<td>RTX Super-Res (Quality ultra, Denoise ultra)</td>
+<td><strong>6h30m for 2h03m</strong> (0.32×); the upscale was 81 % of the wall; 85 ms per frame</td>
+</tr>
+<tr>
+<td>RTX 5060 Ti</td>
+<td>1080p title, Upscale mode to 2160p</td>
+<td>RTX Super-Res (ultra + ultra)</td>
+<td><strong>10h02m for 2h41m</strong> (0.27×); 61 ms per frame</td>
+</tr>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>1080p title, Upscale mode to 2160p</td>
+<td>Real-ESRGAN</td>
+<td><strong>~29 h for 2h03m</strong> (2.1 fps)</td>
+</tr>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>1080p30 title (66 min) restored <strong>and</strong> upscaled to 2160p</td>
+<td>RTX Super-Res (ultra + ultra)</td>
+<td><strong>3h42m</strong> (0.30×); 86.6 ms per frame; VRAM at the 8 GB ceiling from mid-title (no paging)</td>
+</tr>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>the same title, same settings</td>
+<td>custom 4× SPAN <strong>with its TensorRT engines</strong></td>
+<td><strong>5h04m</strong> (0.22×); 131 ms per frame (275 in PyTorch = 2.1×); VRAM 72 %</td>
+</tr>
+<tr>
+<td>RX 9060 XT 16 GB</td>
+<td>720p title restored and upscaled to 2160p</td>
+<td>custom 4× SPAN</td>
+<td><strong>10h00m for 2h25m</strong> (0.24×); 98 ms per frame; the upscale was 71 % of the wall</td>
+</tr>
+<tr>
+<td>RX 9060 XT 16 GB</td>
+<td>17 s 1080p cut restored and upscaled to 2160p</td>
+<td>custom 4× SPAN</td>
+<td>143 s (3.9 fps); 183 ms per frame for the upscale alone</td>
+</tr>
+<tr>
+<td>Arc 140V (laptop iGPU)</td>
+<td>17 s 1080p cut restored and upscaled to 2160p</td>
+<td>custom 4× SPAN</td>
+<td><strong>505 s (1.1 fps)</strong>; the scaler took 76 ms per frame, the 4K frames' trip to the encoder the rest</td>
+</tr>
+</tbody>
+</table>
+<p>Read it as three tiers:</p>
+<ul>
+<li><strong>NVIDIA with RTX Super-Res: the title-scale path.</strong> 60–85 ms per 4K frame
+  at the <em>ultra + ultra</em> settings those runs used, i.e. roughly three to four
+  hours per hour of 1080p60 video on a 3060 Ti–5060 Ti class card — and
+  note the Known issue below: those runs paid for a second denoise pass they
+  did not need. At the defaults (Quality high, Denoise none) expect less.</li>
+<li><strong>Real-ESRGAN and custom models on NVIDIA: clips — or, with engines, a
+  long night.</strong> A compact 4× network over a 4K frame is ~475 ms on a 3060 Ti
+  in PyTorch; a 2-hour title is a 29-hour job. A custom model compiled to
+  TensorRT engines (§3) runs 2.1× faster: a SPAN model at 131 ms per 4K
+  frame brought a 66-minute title to five hours on the same card, with
+  2 GB of VRAM to spare where RTX Super-Res sat at the ceiling. Still half
+  the speed of RTX Super-Res; use it where you prefer its look.</li>
+<li><strong>AMD and Intel: clips, or overnight.</strong> There is no Maxine, so every
+  whole-frame scaler is a PyTorch network over every frame — 100–180 ms per
+  frame on an RX 9060 XT, and on the Arc 140V the 4K <em>output</em> itself runs at
+  about 1 fps because the frames' trip to the encoder is the wall. A 720p
+  title to 2160p on the 9060 XT is a ten-hour job; keep titles at their
+  native resolution on the Arc.</li>
+</ul>
+<p>The console's <code>[Pipeline] frame N/M avg X fps ... ETA</code> line prints the true
+average every 500 frames; a minute into a run you know the whole run's
+length. <strong>Save Segment</strong> first, then decide.</p>
+<h3 id="the-two-things-to-know-before-a-title">The two things to know before a title</h3>
+<ol>
+<li><strong>Upscale Scaler = RTX Super-Res takes its Quality and Denoise from the
+   Secondary's controls</strong> (a known issue in 1.80.00; own controls are
+   planned). With the Secondary at ultra + ultra, every 4K frame gets a
+   second denoise pass. Set the Secondary's Quality / Denoise to what you
+   want the <em>upscale</em> to run at — the defaults, high / none, are the cheap
+   and sensible pair — or accept the cost knowingly.</li>
+<li><strong>Resolution and memory.</strong> A 2160p output is four times the pixels of
+   1080p at every stage after the scaler — the encoder's surfaces, the
+   frames in flight. On 8 GB cards, and on 16 GB laptops, the VRAM / RAM
+   preflight in the console is worth reading before a long run.</li>
+</ol>
+<hr />
+<h2 id="3-custom-models-modelsupscalers">3. Custom models — <code>models\upscalers\</code></h2>
+<p>Drop any super-resolution model file into <code>models\upscalers\</code> (or use
+<strong>Manage Models → Custom scalers → Add</strong>) and press <strong>Rescan</strong>: it appears
+in both scaler dropdowns as <code>&lt;file&gt; (&lt;architecture&gt; Nx)</code>. ChitraMaya
+identifies the architecture from the file itself — Real-ESRGAN / ESRGAN /
+RRDB, SPAN, PLKSR and RealPLKSR, DAT, HAT, OmniSR, SwinIR, ATD (community
+layout), Compact and some thirty more — through the <strong>spandrel</strong> library.
+Files it cannot identify are listed with a reason (official-repository ATD
+checkpoints, for instance, use a revised layout the identifier does not
+know yet; a training checkpoint, a diffusion model, or a YOLO file in the
+wrong folder each get their own hint).</p>
+<p><strong>What runs, and how:</strong></p>
+<ul>
+<li>Custom models run in <strong>PyTorch</strong> on every edition (fp16 where the GPU
+  supports it), tiled when the frame is large, with the model's required
+  padding handled for it.</li>
+<li>As a <strong>Secondary</strong>, a custom model's output is <strong>colour-matched</strong> to the
+  restorer's crop before paste-back (mean and contrast per channel, gain
+  clamped), so a model's tint never leaks into the frame. Its factor is
+  honoured: a 2× model upscales the crop 2×.</li>
+<li>As the <strong>Upscale Scaler</strong>, the model's factor and your target decide the
+  pass count, as in §2.</li>
+<li><strong>SPAN models</strong> get one special treatment: the reference implementation
+  re-fuses their reparameterised layers on every frame, which made them run
+  slower than they are; ChitraMaya fuses them once at load (bit-identical
+  output, checked), which is why a SPAN model is the fastest custom option.</li>
+<li><strong>NVIDIA: compile the model once (CM-247).</strong> From the install folder:</li>
+</ul>
+<p><code>ChitraMaya-cli.exe -compile-sr 4xNomos8k_span_otf_strong.pth --secondary --bench</code></p>
+<p>writes TensorRT engines beside the weights in <code>models\upscalers\</code> — the
+  whole-frame engine and, with <code>--secondary</code>, the 256-px engine the Secondary
+  uses on crops; <code>--bench</code> prints the speed-up and the parity against
+  PyTorch. From then on the app uses them automatically (<code>[Scalers] ...
+  engine ACTIVE</code> in the console; <code>backend: "tensorrt"</code> in the run report).
+  Measured 2.1× on the whole-frame upscale; the Secondary engine on crops is
+  faster than Maxine's. Engines are built for the GPU they were compiled
+  on — one built on another card is skipped with a console line and the
+  model runs in PyTorch. A few minutes per model; needs a few GB of free
+  VRAM while it builds. AMD and Intel: no engines; the model runs in
+  PyTorch (the fused SPAN path is already the fast one there).</p>
+<p><strong>Where to find models:</strong> <a href="https://openmodeldb.info">OpenModelDB</a> is the
+community index; Philip Hofmann's
+<a href="https://github.com/Phhofm/models">models repository</a> carries many of the
+best-regarded ones with training notes. <strong>Check each model's licence</strong> — they
+differ, and they are not ChitraMaya's to grant.</p>
+<p><strong>What to expect:</strong> as a <em>Secondary</em>, none of the community models we
+measured beat the two built-ins clearly; <code>4xNomos8k_span_otf_strong</code> is the
+one that came closest — to our eyes slightly better on skin, and faster on
+AMD and Intel. As a <em>whole-frame</em> scaler the picture is more open, because
+the built-in Real-ESRGAN is a compact network chosen for speed, and a
+stronger model may well look better on a clip you care about — at a cost
+the table above lets you estimate. Measure with <strong>Save Segment</strong>; trust your
+eyes over any of our numbers.</p>
+<hr />
+<h2 id="4-max-clip-length-measured">4. Max Clip Length — measured</h2>
+<p>Max Clip Length is the restorer's temporal window: a track is cut into clips
+of at most that many frames, each restored in one pass with the frames
+before and after it in view, and the cuts are joined with Overlap +
+Crossfade. Six runs of a 10-minute 4K60 cut on an RTX 3060 12 GB (identical
+detections in every run; RTX Super-Res and Real-ESRGAN Secondaries):</p>
+<table>
+<thead>
+<tr>
+<th>Max Clip</th>
+<th>wall</th>
+<th>clips</th>
+<th>join re-work</th>
+<th>VRAM peak</th>
+<th>residual scan</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>90</td>
+<td>48:49</td>
+<td>1,020</td>
+<td>23 %</td>
+<td>7.9 GB</td>
+<td>26 frames</td>
+</tr>
+<tr>
+<td>180</td>
+<td>46:28</td>
+<td>668</td>
+<td>12.5 %</td>
+<td>9.8 GB</td>
+<td>25 (same frames)</td>
+</tr>
+<tr>
+<td>240</td>
+<td>45:55</td>
+<td>598</td>
+<td>10 %</td>
+<td>11.1 GB</td>
+<td>26 (same frames)</td>
+</tr>
+<tr>
+<td>300</td>
+<td>54:09</td>
+<td>563</td>
+<td>9 %</td>
+<td>12.2 GB = ceiling, paging</td>
+<td>26 (same frames)</td>
+</tr>
+</tbody>
+</table>
+<p>The restore cost per frame was flat (29.6 / 29.8 / 30.0 ms at 90 / 180 /
+240); the only thing a short clip costs is the join re-work, and the only
+thing a long one buys is fewer joins — until it hits the card's memory,
+when everything slows, detection included (300: +18 % wall). The scaler
+made no difference to any of this (Real-ESRGAN: 55:23 / 50:30 at 90 / 180).</p>
+<p><strong>Rule: Max Clip Length ≈ 3 × frame rate</strong> — 180 at 60 fps, 90 at 30 — the
+1.80.00 default. Going shorter buys VRAM (about 2 GB between 180 and 90 at
+4K) for a few percent of time and more joins; going longer buys nothing you
+can see. On an 8 GB card at 4K60, 90 fits and 180 does not without Crop
+Cap; take Max Clip 90 <strong>before</strong> Crop Cap 512, because it costs no texture.</p>
+<h2 id="5-recipes">5. Recipes</h2>
+<p><strong>A 1080p title, best quality in reasonable time (NVIDIA):</strong> defaults
+(Secondary RTX Super-Res 4×, Temporal Stability 1, Output Upscale off).
+Try Temporal Stability 3 on a segment if shimmer bothers you.</p>
+<p><strong>The same title on AMD or Intel:</strong> defaults (Secondary Real-ESRGAN 4×), or
+<code>4xNomos8k_span_otf_strong</code> as the Secondary for a slightly better and
+faster run. Output Upscale off.</p>
+<p><strong>A 720p or 1080p title you want at 2160p (NVIDIA):</strong> Output Upscale
+<strong>2160p</strong> with Upscale Scaler <strong>RTX Super-Res</strong>, Secondary Quality <strong>high</strong>,
+Denoise <strong>none</strong>. Overnight on a 3060 Ti-class card; check the ETA line
+after the first 500 frames.</p>
+<p><strong>A clip or segment you want at 2160p with a particular look (any
+edition):</strong> mark the segment, Output Upscale 2160p with Real-ESRGAN or a
+custom model, <strong>Save Segment</strong>. Minutes, not hours.</p>
+<p><strong>SFW content you just want bigger:</strong> Alternate Execution Modes → <strong>Upscale</strong>,
+pick the target and scaler, Restore &amp; Save. No models to download.</p>
+<p><strong>A 4K VR title on an 8 GB card:</strong> the built-in <strong>VR 4K</strong> configuration
+(Image Size 800, Max Clip 180, Split SBS), Secondary on, Output Upscale off,
+and <strong>Crop Cap</strong> if the preflight asks for it.</p>
+<p class="stamp">Generated from docs/ScalingGuide.md on 2026-10-14 for ChitraMaya 1.80.00. The Markdown is the source; edit that.</p>
+</main>
+</body>
+</html>

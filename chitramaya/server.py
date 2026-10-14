@@ -1712,6 +1712,37 @@ def index():
                            training_ui=_training_ui_enabled())
 
 
+# ── User Guide (CM-248) ──
+# The guide ships as UserGuide.html next to the exe (the packager copies it
+# from docs/) and the header's Help button opens it in the system browser
+# through this route, so the same page works installed, from source, and
+# offline. ScalingGuide.html sits beside it and is linked from the guide.
+
+_GUIDE_FILES = {"UserGuide.html", "ScalingGuide.html"}
+
+
+def _guide_path(name: str) -> Optional[Path]:
+    if name not in _GUIDE_FILES:
+        return None
+    base = _app_base_dir()
+    for cand in (base / name, base / "docs" / name,
+                 Path(getattr(sys, "_MEIPASS", base)) / "docs" / name):
+        if cand.is_file():
+            return cand
+    return None
+
+
+@app.route("/userguide")
+@app.route("/userguide/<name>")
+def user_guide(name: str = "UserGuide.html"):
+    p = _guide_path(name)
+    if p is None:
+        return Response("The User Guide is not installed next to the app (UserGuide.html). "
+                        "It is published at https://get.chitramaya.org/userguide.html",
+                        status=404, mimetype="text/plain")
+    return Response(p.read_bytes(), mimetype="text/html; charset=utf-8")
+
+
 # ── Video ──
 
 @app.route("/api/load-video", methods=["POST"])

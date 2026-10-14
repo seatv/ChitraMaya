@@ -307,6 +307,38 @@ def main() -> int:
             "src_video, output_path" in _mf_src and "self.video_path, output_path" not in _mf_src, True)
         checks["load-video refuses while the operation lock is held (CM-245)"] = (
             "_op_lock.locked()" in _insp.getsource(_srv.api_load_video), True)
+        # CM-247: custom-SR engines compile from the installed build (no venv, no source tree)
+        from chitramaya import __main__ as _cm_main
+        checks["-compile-sr subcommand dispatches to tools.compile_custom_sr (CM-247)"] = (
+            '"-compile-sr"' in _insp.getsource(_cm_main) and "compile_custom_sr" in _insp.getsource(_cm_main), True)
+        checks["-compile-sr is in the CLI usage text (CM-247)"] = ("-compile-sr" in _cm_main.USAGE, True)
+        from tools import compile_custom_sr as _ccs
+        checks["-compile-sr looks for models next to the exe when frozen (CM-247)"] = (
+            'getattr(sys, "frozen", False)' in _insp.getsource(_ccs.main), True)
+        # CM-248: the User Guide ships next to the exe and the Help button opens it via /userguide
+        import json as _json
+        _root = _P(__file__).resolve().parents[1]
+        checks["User Guide: docs/UserGuide.md and the generated .html exist (CM-248)"] = (
+            (_root / "docs" / "UserGuide.md").is_file() and (_root / "docs" / "UserGuide.html").is_file(), True)
+        checks["User Guide: HTML is not older than the Markdown (CM-248)"] = (
+            (_root / "docs" / "UserGuide.html").stat().st_mtime >= (_root / "docs" / "UserGuide.md").stat().st_mtime, True)
+        with _srv.app.test_client() as _tc:
+            _r = _tc.get("/userguide")
+            checks["GET /userguide serves the guide (CM-248)"] = (
+                (_r.status_code, b"ChitraMaya User Guide" in _r.data), (200, True))
+            _r2 = _tc.get("/userguide/ScalingGuide.html")
+            checks["GET /userguide/ScalingGuide.html serves the Scaling Guide (CM-248)"] = (_r2.status_code, 200)
+            _r3 = _tc.get("/userguide/../server.py")
+            checks["/userguide refuses anything but the two guides (CM-248)"] = (_r3.status_code in (404, 400), True)
+        _ui_html = (_root / "chitramaya" / "templates" / "ui.html").read_text(encoding="utf-8")
+        checks["Help button in the header (CM-248)"] = ('id="helpBtn"' in _ui_html, True)
+        _langs_ok = all("helpBtn.text" in _json.loads((_root / "chitramaya" / "static" / "i18n" / f"{_l}.json").read_text(encoding="utf-8"))
+                        for _l in ("en", "zh-CN", "zh-TW", "th"))
+        checks["Help button translated in en / zh-CN / zh-TW / th (CM-248)"] = (_langs_ok, True)
+        _pk = (_root / "packaging" / "windows")
+        checks["all three packagers copy UserGuide.html next to the exe (CM-248)"] = (
+            all("UserGuide.html" in (_pk / n).read_text(encoding="utf-8") for n in
+                ("chitramaya-packager.ps1", "chitramaya-rocm-packager.ps1", "chitramaya-xpu-packager.ps1")), True)
         # CM-246: a picture header glued in front of a transport stream (the 10-09 STZY-016
         # field case: ffprobe said png_pipe, the audio probe found nothing, two runs finalized
         # video-only). The demuxer is forced from the extension and every source call gets it.

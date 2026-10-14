@@ -70,6 +70,8 @@
   "gotoTimeBtn.title": "Go to time",
   "manageModelsBtn.text": "Manage Models",
   "manageModelsBtn.title": "Download, compile and manage detection / restoration models and custom scalers",
+  "helpBtn.text": "Help",
+  "helpBtn.title": "Open the User Guide (installed next to the app; also at get.chitramaya.org)",
   "newBtn.text": "New",
   "newBtn.title": "New project — reset all",
   "outputBtn.text": "📁 Output",

@@ -142,6 +142,8 @@
   "gotoTimeBtn.title": "转到时间",
   "manageModelsBtn.text": "管理模型",
   "manageModelsBtn.title": "下载、编译并管理检测/恢复模型和自定义缩放器",
+  "helpBtn.text": "帮助",
+  "helpBtn.title": "打开用户指南（随程序安装；也可在 get.chitramaya.org 查看）",
   "newBtn.text": "新建",
   "newBtn.title": "新建项目——重置全部",
   "outputBtn.text": "📁 输出",

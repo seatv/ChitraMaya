@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChitraMaya User Guide</title>
+<style>
+:root { --fg:#1f2328; --bg:#ffffff; --muted:#59636e; --line:#d1d9e0; --code:#f6f8fa; --link:#0969da; --note:#ddf4ff; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e6edf3; --bg:#0d1117; --muted:#9198a1; --line:#30363d; --code:#161b22; --link:#4493f8; --note:#0c2d6b; }
+}
+html { -webkit-text-size-adjust: 100%; }
+body { margin:0; padding:0 16px 48px; background:var(--bg); color:var(--fg);
+       font: 16px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 2em; margin: 1.2em 0 .4em; border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+h2 { font-size: 1.5em; margin: 1.8em 0 .5em; border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+h3 { font-size: 1.2em; margin: 1.4em 0 .4em; }
+p, li { max-width: 72ch; }
+a { color: var(--link); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: .92em; }
+code { background: var(--code); padding: .1em .35em; border-radius: 4px; }
+pre { background: var(--code); padding: 12px 14px; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; max-width: 100%; }
+th, td { border: 1px solid var(--line); padding: 6px 12px; text-align: left; vertical-align: top; }
+th { background: var(--code); }
+blockquote { margin: 1em 0; padding: .6em 1em; border-left: 4px solid var(--link); background: var(--note); }
+hr { border: 0; border-top: 1px solid var(--line); margin: 2em 0; }
+img { max-width: 100%; height: auto; }
+.toc { background: var(--code); padding: 10px 18px; border-radius: 6px; margin: 1em 0; }
+.toc ul { margin: 0; padding-left: 1.2em; }
+.stamp { color: var(--muted); font-size: .85em; margin-top: 3em; border-top: 1px solid var(--line); padding-top: .6em; }
+</style>
+</head>
+<body>
+<main>
+<h1 id="chitramaya-user-guide">ChitraMaya User Guide</h1>
+<p><em>Version 1.80.00 — for people who want a video fixed, not for people who want to build the program. Developers: see the README.</em></p>
+<p>ChitraMaya finds mosaic-censored regions in a video, restores them with a temporal model, and writes a new video file. It runs on Windows with an NVIDIA GeForce RTX, AMD Radeon or Intel Arc GPU. This guide covers installing it, getting the models, the everyday workflow, the settings that actually matter, what the output files are, what the console is telling you, what to expect from your graphics card, and what to do when something goes wrong.</p>
+<p>This copy of the guide is installed next to <code>ChitraMaya.exe</code> as <code>UserGuide.html</code> (the <strong>Help</strong> button in the app opens it) and published at <a href="https://get.chitramaya.org/userguide.html">https://get.chitramaya.org/userguide.html</a>.</p>
+<hr />
+<h2 id="1-what-it-does-and-what-it-does-not">1. What it does, and what it does not</h2>
+<p><strong>It does:</strong> detect mosaic regions frame by frame with a detection model, track them across frames, restore each tracked region with a video restoration model (BasicVSR++, trained by the lada project), upscale the restored region with a second model so close-ups do not go soft, smooth frame-to-frame shimmer, paste the result back into the untouched original frame, and encode the whole thing on the GPU. It can also preview a single frame in seconds, run a whole folder overnight, upscale whole frames to 4K, add mosaic (the reverse operation, for making shareable clips), and compare original against restored inside a VR projection.</p>
+<p><strong>It does not:</strong> invent what was never in the picture — a mosaic that destroyed the content leaves a restoration that is plausible rather than true; find every mosaic — a thin sliver at the edge of the frame, a region whose neighbour is still mosaic, or a mosaic applied in an unusual projection can be missed, and the run report tells you where it suspects leftovers; or work on content the models were not trained on (text, logos, faces are not what the restoration model knows).</p>
+<p><strong>Terms.</strong> By using ChitraMaya you agree to use it only for purposes lawful where you are. You are responsible for what you make with it. The authors accept no liability for its use. The automatic mosaic detection in <strong>Add Mosaic</strong> is experimental and must not be relied on to censor anything you intend to share — see section 8.</p>
+<hr />
+<h2 id="2-installing">2. Installing</h2>
+<h3 id="which-edition">Which edition</h3>
+<p>There is one edition per GPU vendor, and they are separate downloads. Pick the one for your card:</p>
+<table>
+<thead>
+<tr>
+<th>Your GPU</th>
+<th>Installer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>NVIDIA</strong> GeForce RTX 30 / 40 / 50-series</td>
+<td><code>ChitraMaya-install.exe</code> <strong>plus</strong> <code>ChitraMaya-install.7z.001</code> <strong>plus</strong> <code>ChitraMaya-install.7z.002</code> — all three</td>
+</tr>
+<tr>
+<td><strong>AMD</strong> Radeon RX 7000 / 9000 (RDNA 3 / 4)</td>
+<td><code>ChitraMaya-rocm-install.exe</code> — one file</td>
+</tr>
+<tr>
+<td><strong>Intel</strong> Arc A/B-series, Core Ultra iGPU</td>
+<td><code>ChitraMaya-xpu-install.exe</code> — one file</td>
+</tr>
+</tbody>
+</table>
+<p>Downloads: <a href="https://get.chitramaya.org">https://get.chitramaya.org</a>. Every file is listed there with its SHA-256 checksum; a mainland-China mirror line is on the same page. The source code and the issue tracker live at <a href="https://gitlab.com/seatv/chitramaya">https://gitlab.com/seatv/chitramaya</a>.</p>
+<p>The wrong edition tells you so: a startup check probes the GPU before anything loads and, if this edition cannot run on it, shows a message naming the GPUs Windows reports and the edition that matches them. <code>ChitraMaya-cli.exe -self-check</code> gives the full verdict. The title bar always says which edition is running.</p>
+<h3 id="the-nvidia-installer-is-three-files-you-need-all-three">The NVIDIA installer is three files — you need all three</h3>
+<p>The <code>.exe</code> by itself is not the program; it is only the unpacker for the other two parts. Download all three into the same folder, then run <code>ChitraMaya-install.exe</code>. It reassembles the parts and extracts a <code>ChitraMaya</code> folder. The AMD and Intel installers are a single <code>.exe</code> you double-click.</p>
+<p>Pick a <strong>new, empty folder</strong> when asked. Do not extract a new version over an old one, and do not mix editions in one folder.</p>
+<h3 id="what-is-in-the-folder">What is in the folder</h3>
+<p><code>ChitraMaya.exe</code> is the app — a window, no terminal. Its console output goes to the in-app Console panel and to <code>ChitraMaya-console.log</code> next to the exe (the previous run is kept as <code>ChitraMaya-console.prev.log</code>). <code>ChitraMaya-cli.exe</code> is the same app with a console window, for terminal workflows: headless runs, engine compiles, diagnostics. <code>ChitraMaya.cmd</code> launches the app on the AMD and Intel editions. <code>VERSION.txt</code> says which version this folder is. <code>UserGuide.html</code> is this guide. <code>models\</code> is where models and compiled engines go (section 3). <code>presets\</code> holds your saved configurations.</p>
+<h3 id="updating">Updating</h3>
+<p>From one version to the next you do not re-download the multi-gigabyte installer: each release also carries <strong>patch zips</strong> of under 100 MB. Pick the one whose "from" version matches your install (<code>VERSION.txt</code>): a 1.70.00 install takes <code>ChitraMaya-patch-1.70.00-to-1.80.00.zip</code>. Extract it anywhere and run</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File .\Apply-Patch.ps1
+</code></pre>
+<p>It finds your install (or asks), checks that every file it would replace belongs to the version the patch was built from (a mismatch refuses cleanly and changes nothing), backs up what it replaces, applies, and runs the self-check. Your models, compiled engines and settings are never touched, and running a patch twice is safe.</p>
+<p>After updating, <strong>Manage Models</strong> may turn amber: that means a compiled engine no longer matches the new version's expectations and should be rebuilt once (section 3). The old engine still works until you do.</p>
+<h3 id="requirements">Requirements</h3>
+<p>NVIDIA: Windows 10/11, an up-to-date GeForce driver, an RTX card. Native TensorRT support ships for 30-series (Ampere), 40-series (Ada) and 50-series (Blackwell); older cards still work through a slower generic path. Nothing else — CUDA, TensorRT, ffmpeg and Python are all inside the installer.</p>
+<p>AMD: Windows 10/11, <strong>AMD Software Adrenalin 26.2.2 or newer</strong> (earlier drivers lack the runtime the bundled PyTorch stack needs), an RDNA 3 or RDNA 4 card — ROCm on Windows does not support older Radeons.</p>
+<p>Intel: Windows 10/11, a current Intel graphics driver. On discrete Arc cards <strong>Resizable BAR must be on</strong> (BIOS: CSM off, Above 4G Decoding on, ReBAR on) — without it the same card ran twenty times slower in our tests. Integrated Arc (Core Ultra laptops) needs no such setting.</p>
+<p>All editions: a few tens of GB free on the drive you use for temporary files; 16 GB of system RAM is a workable minimum, 32 GB comfortable for 4K.</p>
+<hr />
+<h2 id="3-first-run-models-and-engines">3. First run: models and engines</h2>
+<p>No models ship with the app; you add them once.</p>
+<p><strong>Get Models.</strong> On a fresh install the header button is green and reads <strong>Get Models</strong>. Click it, then <strong>Get standard set</strong> — the detection and restoration models the app is built around are downloaded from Hugging Face into <code>models\</code>. Manual alternative: drop any detection <code>.pt</code> and restoration <code>.pth</code> files into <code>models\</code>. (The Temporal Stability weights are the one exception to "no models ship": they are tiny and bundled, so that feature works from the first run.)</p>
+<p>If a download answers with a <strong>403</strong>, you have hit Hugging Face's anonymous-download limit (about 1,000 requests an hour per address — easy to reach on a day of heavy testing). Wait an hour, or download the files in a browser and drop them into <code>models\</code>.</p>
+<p><strong>Compile (NVIDIA only).</strong> TensorRT engines are specific to your card, so they are built on your machine, once per model. When one is missing for your settings the header button turns amber and reads <strong>Compile Models</strong>. Open <strong>Manage Models</strong>: downloaded models show as <em>Not compiled</em>; click <strong>Select all not-compiled</strong>, set the detector's <strong>Image Size</strong> and <strong>Detection Batch</strong> (640 and 8 are the defaults; <strong>800 if you mostly restore 4K or VR content</strong>, see section 6), and press <strong>Compile</strong>. The log is selectable and has a <strong>Copy</strong> button for bug reports. This takes a few minutes per model and pins the GPU — normal. When it finishes the badges read <em>Compiled</em> and the header button goes grey.</p>
+<p>On a 6 GB card the restoration compile is the one step that can run out of memory; close other GPU programs first.</p>
+<p>AMD and Intel have no compile step: TensorRT does not exist there, and the models run directly in PyTorch. The first run after installing into a new folder is slow once on AMD, while the ROCm math library compiles its kernels and caches them in <code>miopen-cache</code> next to the exe — the first clip can sit for a few minutes with no visible progress (the console says so at start), and the stall watchdog may print a stack dump while it waits; that is a diagnosis, not a crash. Later runs start immediately. Copying <code>miopen-cache</code> from an old install into a new one skips the wait.</p>
+<p><strong>Custom super-resolution models</strong> (section 7) go into <code>models\upscalers\</code>. On NVIDIA they too can be compiled, from a terminal — once per machine:</p>
+<pre><code>ChitraMaya-cli.exe -compile-sr 4xNomos8k_span_otf_strong.pth --secondary --bench
+</code></pre>
+<p>That builds the whole-frame engine and the region engine beside the weights and prints a benchmark of the model with and without the engine. The next run reports <code>TensorRT … ACTIVE</code> for the model at start. Engines are specific to the GPU they were built on; a run on a different card falls back to the un-compiled path and says why. (A Compile button for custom models in Manage Models is planned.)</p>
+<hr />
+<h2 id="4-the-everyday-workflow">4. The everyday workflow</h2>
+<p>The app is an editor that can also batch. The loop you will use most is: load a video, park on a mosaic frame, <strong>Test Frame</strong>, adjust, test again, and only then commit to a full run.</p>
+<ol>
+<li><strong>Load a video</strong> — drag it into the window or use the file picker. The top bar shows the full path of the loaded file, so a long session never leaves you guessing what is on screen. While a run is in progress the app refuses to load another file (the run keeps the file it started with).</li>
+<li><strong>Pick the models</strong> in the Control Panel: a detection model and a restoration model. On NVIDIA, <strong>Use Tensor</strong> uses the compiled engines. Every control has a tooltip; hover to learn what it does.</li>
+<li><strong>Test Frame.</strong> Park the playhead on a mosaic frame and click it. A short window of frames around that one is restored through the full pipeline and each detected region is shown <strong>Mosaic → Restored</strong> side by side. The enlarged view keeps your last five attempts on that frame — flip between them with the ‹ › arrows or the numbered slots (hover a number to see which settings produced it). This is the way to dial in a title: change one thing, test, compare.</li>
+<li><strong>Restore</strong> previews a marked segment without saving; <strong>Save Segment</strong> encodes just the marked range to a file (the way to test a setting on a minute of video before committing hours); <strong>Restore &amp; Save</strong> runs the whole video. Before a full run, the VRAM pre-flight dialog tells you whether the run fits your card (section 10).</li>
+</ol>
+<p>The built-in player plays the result afterwards; <strong>SBS View</strong> (section 6) compares original and restored inside a VR projection.</p>
+<h3 id="the-defaults-are-the-recommended-settings">The defaults are the recommended settings</h3>
+<p>A fresh install starts with Secondary = <strong>RTX Super-Res 4×</strong> (NVIDIA; <strong>Real-ESRGAN 4×</strong> on AMD and Intel), Detection Score 0.20, Detection Batch 8, Temporal Stability 1, Overlap 8 with Crossfade at Max Clip cuts, the Face Swap blend with Feather on auto, Max Clip Length 180, Crop Cap off, Async Encode off, HEVC at preset P5 and QP 18. Most titles need nothing changed.</p>
+<h3 id="the-dials-that-matter">The dials that matter</h3>
+<p><strong>Secondary</strong> (Restoration panel). The restorer works on a fixed-size crop; regions larger than that used to be stretched at paste-back and went soft — worst on close-ups and VR. With a Secondary on, the restored crop is upscaled first so the final resize shrinks instead of stretching; small regions automatically keep the untouched path. <strong>RTX Super-Res</strong> (NVIDIA) gives a smoother look, <strong>Real-ESRGAN 4×</strong> keeps the restorer's texture; neither is more correct — pick by eye with Test Frame. Any community super-resolution model placed in <code>models\upscalers\</code> appears in the dropdown too; <code>4xNomos8k_span_otf_strong</code> is a good one to try (section 7). If RTX Super-Res is selected on a machine without the Maxine runtime, the run falls back to Real-ESRGAN and says so.</p>
+<p><strong>Temporal Stability</strong> (0–3). Removes the frame-to-frame shimmer restoration models produce by smoothing each restored region across a seven-frame window, only where the content agrees — real motion passes through, and only restored pixels are touched. 1 is the default; 3 looks better on some titles and costs about 30 % more restore time. The stabilizer checks its own output; a window it cannot trust keeps its restored pixels unsmoothed and the run ends <em>with warnings</em> saying so.</p>
+<p><strong>Max Clip Length.</strong> The restorer looks at a run of consecutive frames of one region as a single sequence, and this is the longest such sequence. Longer windows let a frame borrow detail from its neighbours and mean fewer joins between consecutive sequences; but the useful reach is about a second of video, and every frame held open costs memory. The rule we measured: <strong>about three times the frame rate</strong> — 90 at 30 fps, 180 at 60 fps. Shorter saves memory (two gigabytes between 180 and 90 on a 4K60 title) at about 5 % more run time and more joins; longer buys almost nothing and, once the card is full, slows the whole run down. On an 8 GB card at 4K, lower this before reaching for Crop Cap.</p>
+<p><strong>Crop Cap</strong> (Restoration panel). The size above which a region's frames are stored downscaled while the run is in progress — the lever for 4K titles on 8 GB cards. Off by default; the pre-flight dialog proposes the value that fits. It costs a little fine texture on the very largest regions and nothing elsewhere.</p>
+<p><strong>Feather and Region Margin</strong> (Restoration panel, Face Swap blend). Region Margin grows the detected region by a number of pixels before restoration; Feather is the width of the soft edge where the restored patch blends into the original frame — 0 means auto, which scales with the frame (about 60 px at 2160p), and is the right setting for 4K, where a fixed small feather shows as a hard line.</p>
+<p><strong>Detection Score and IoU</strong> (Detection panel). Score is the confidence below which a detection is ignored; 0.20 is the default, lower finds more and risks false regions. IoU controls how aggressively overlapping candidate boxes are merged — it is not a sensitivity dial.</p>
+<p><strong>Image Size</strong> (Detection panel). The detector's input resolution, 640–960 in steps of 32. 640 is right for 1080p; <strong>800 for 4K and VR/SBS</strong>, where 640 downscales too far and misses small or faint mosaics. With Use Tensor on, the compiled engine must match this size; if it does not, a dialog at submit time offers to use the engine's size, continue on PyTorch, or open Manage Models.</p>
+<h3 id="the-encoder-panel">The Encoder panel</h3>
+<p><strong>Codec</strong>: HEVC (default), H.264, or AV1 (RTX 40-series or newer; RDNA 3 or newer; Intel Arc). <strong>QP</strong> always uses the HEVC 0–51 scale; for AV1 the app maps it to AV1's finer scale, so QP 18 means the same quality intent on every codec. <strong>Preset</strong> runs from P1 (fastest) to P7 (best); on 8 GB cards stay at P5 or below. <strong>Async Encode</strong> overlaps encoding with restoration for a faster run at the cost of 500–600 MB of VRAM at 4K; it is off by default and the pre-flight's levers turn it off first when memory is short. <strong>Output Upscale</strong> brings the finished frames to 1440p or 2160p — a clip-or-overnight feature; see section 7.</p>
+<h3 id="saved-configurations">Saved configurations</h3>
+<p>The ⚙️ menu's <strong>Save / manage configurations…</strong> stores the complete current settings — every control plus the output and temp folders — under a name; one click loads one and makes it active, and it survives a restart. Files live in <code>presets\</code> next to the exe and can be copied between machines. A built-in <strong>VR 4K</strong> configuration sets Image Size 800, Max Clip 180 and Split SBS in one click.</p>
+<hr />
+<h2 id="5-a-whole-folder">5. A whole folder</h2>
+<p><strong>Process Folder</strong> (Alternate Execution Modes) runs your current settings over every video in a folder. Pick the folder (paths pasted from Explorer work, quotes and all), optionally recursive, and the output location and suffix. The queue dialog lists every file and says which will be skipped and why — usually "output already exists", which is also the resume mechanism after an interruption. Models load once and stay warm for the batch; each file runs isolated, so one failure (even a GPU hang, which the watchdog catches) is logged and the batch moves on. The console log has a per-file summary at the end.</p>
+<p>The pre-flight runs for the largest file in the plan, and a batch that does not fit runs on regardless of the warning — read it before leaving for the night. If the largest file is a 4K title and the card is an 8 GB one, set Crop Cap or a lower Max Clip for the batch.</p>
+<p>Outputs never overwrite: if the name already exists the new file gets a <code>-2</code>, <code>-3</code>, … suffix and the log says so.</p>
+<hr />
+<h2 id="6-vr-and-side-by-side-video">6. VR and side-by-side video</h2>
+<p>For side-by-side (SBS) VR video, enable <strong>Split SBS</strong> in Detection so each eye is detected at full resolution, and set Image Size to 800. Then one more decision:</p>
+<p><strong>VR Projection.</strong> Some studios apply the mosaic to the raw video frame; others apply it in viewing space, so it looks square in a headset but arrives warped and trapezoidal in the raw frame — a pattern the models were never trained on. Open the video in a flat player (PotPlayer, VLC — no VR mode) and look at the mosaic. Blocks in a clean, even grid of squares → leave VR Projection <strong>Off</strong>. Blocks warped — trapezoidal cells, rows that bow or fan out, especially away from the centre → set it to <strong>Fisheye</strong>: each eye is warped so the blocks become square, detection and restoration run in that space, and only the restored regions are warped back onto the untouched frame.</p>
+<p>On warped-mosaic content with the projection off, the run statistics can look perfect while the output still shows mosaic. Judge with your eyes: Test Frame with projection Off and with Fisheye on a mosaic-heavy frame and compare.</p>
+<p><strong>8K VR on cards before the RTX 50-series.</strong> H.264 sources wider than 4096 px exceed the hardware decoder's limit on earlier cards; the app falls back to CPU decode for those files and says so at startup. It works; it is much slower, and that is a hardware limit.</p>
+<p><strong>SBS View</strong> (the button next to the volume control) projects the video the way a headset would and lets you compare original against restored inside that projection. <strong>Eye (L / R)</strong> picks which eye's picture you inspect. <strong>View</strong> picks what fills the screen: Original, Restored (your most recent output), or <strong>Wipe</strong> — both at once, split by a draggable divider, original on the left and restored on the right. Drag the divider across a restored region and watch it flip between mosaic and clean. Drag to look around, wheel to zoom, Space to play, ←/→ to skip, <code>,</code> and <code>.</code> to step a frame, <code>m</code> to unmute, Esc to close. It assumes equirect-180 side-by-side content and is a desktop aid, not a headset mode.</p>
+<hr />
+<h2 id="7-upscaling-and-custom-models">7. Upscaling and custom models</h2>
+<p>Two different things in the app scale pictures, and the <a href="ScalingGuide.html">Scaling Guide</a> has the measurements for both.</p>
+<p>The <strong>Secondary</strong> scales each restored region before paste-back; it costs a few percent of a run and is on by default (section 4).</p>
+<p><strong>Output Upscale</strong> (Encoder panel) scales the whole frame after restoration — 720p or 1080p to 1440p or 2160p — or, in <strong>Upscale</strong> mode under Alternate Execution Modes, does nothing else: decode, scale, encode, no models. It is a clip feature or an overnight one. Measured on an RTX 3060 Ti, a 66-minute 1080p title restored and upscaled to 2160p took 3h42m with RTX Super-Res and 5h04m with a compiled SPAN model; Real-ESRGAN on the same card is hours slower still. On AMD and Intel it is a start-before-bed job for a short title. The console's ETA line after the first 500 frames tells you what you are in for.</p>
+<p>In Upscale mode the folder planner lists your earlier restored outputs as inputs (that is what you upscale), and the output gets <code>-upscaled</code> added to the name. Split SBS and VR Projection do nothing in this mode and are ignored.</p>
+<p><strong>Custom models.</strong> Drop any super-resolution model file into <code>models\upscalers\</code> (or <strong>Manage Models → Custom scalers → Add</strong>) and press <strong>Rescan</strong>; it appears in both scaler dropdowns with its architecture and factor. Some forty architectures are recognised from the file itself. Models the app cannot identify are listed with a reason. Where to find them: OpenModelDB and Philip Hofmann's models repository; check each model's licence, they differ. As a Secondary, none of the community models we measured clearly beat the two built-ins, and <code>4xNomos8k_span_otf_strong</code> came closest — slightly better on skin, and faster on AMD and Intel. As a whole-frame scaler the field is more open. On NVIDIA, compile the model once (section 3) and it runs about twice as fast.</p>
+<hr />
+<h2 id="8-add-mosaic-making-shareable-clips">8. Add Mosaic — making shareable clips</h2>
+<p>The reverse operation: pixelate regions and save, for producing safe-for-work clips. There is a reliable manual way and an experimental automatic way.</p>
+<p><strong>Manual.</strong> Load a video; optionally mark a segment. Click <strong>Add Mosaic</strong>: the player pauses and a crosshair appears — drag rectangles directly on the video (up to three); each shows its size and a ✕ to remove it, and you can still scrub to a better frame while drawing. For SBS video with Split SBS on, draw on either eye and a dashed ghost mirrors it to the other. <strong>Done</strong> opens a dialog with the exact pixel coordinates for fine-tuning; set <strong>Block</strong> for the cell size (16 is the classic look). <strong>Add &amp; Save</strong> encodes to <code>&lt;name&gt;-mosaic.mp4</code> in your output folder; open SBS View and wipe-compare to verify placement.</p>
+<p><strong>Automatic — experimental, and it will miss content.</strong> Pick a detection model (an NSFW detector, for instance) as the Detection model, tick <strong>Add Mosaic</strong> under Alternate Execution Modes, set Block, and Test Frame shows each detected region Original → Censored; Restore &amp; Save writes <code>&lt;name&gt;-censored.mp4</code>. Two techniques from the field: run detection with <strong>Score 0.05 and IoU 1.0</strong> (every candidate region is kept — over-coverage is safe, a miss is not), and afterwards run the same detector <strong>over the censored output</strong>: any frame where it still finds something is a leak candidate to patch by hand. None of this is a guarantee. Review every frame yourself before sharing anything made this way.</p>
+<hr />
+<h2 id="9-what-the-output-files-are">9. What the output files are</h2>
+<p>Beside every finished video you will find, depending on the <strong>Run Files</strong> switch (beside the video, in the Temp folder, or off):</p>
+<ul>
+<li><code>&lt;name&gt;&lt;suffix&gt;.mp4</code> — the result. The suffix is the <strong>🏷️ Suffix</strong> field in the header; <code>-restored</code> is the default. Upscale mode adds <code>-upscaled</code>; Add Mosaic writes <code>-mosaic</code> or <code>-censored</code>.</li>
+<li><code>&lt;name&gt;&lt;suffix&gt;.run.json</code> — the <strong>run report</strong>: what was asked versus what actually ran (which decoder, encoder, scaler, precision, and why), timings per stage, the VRAM ledger, detection and restoration counts, how many regions hit the Max Clip cap, the frames the detector bridged, the frames the guards touched, and the frames the <strong>residual scan</strong> still found mosaic on after the run. When something looks wrong, this is the file to send.</li>
+<li><code>&lt;name&gt;&lt;suffix&gt;.mp4.timecodes.txt</code> — the frame timing of the output, for frame-exact comparisons.</li>
+<li><code>ChitraMaya-console.log</code> next to the exe — the console of the latest launch (<code>.prev.log</code> is the one before). The CLI exe keeps the newest twenty.</li>
+</ul>
+<p>During a run you may see temporary files: <code>&lt;name&gt;.cm120-tsremux.mp4</code> next to a stream-capture source (section 13 explains), the raw bitstream and a <code>*-RECOVER.ps1</code> script beside the output, and an audio sidecar <code>.audio.mka</code>. These are the run's salvage: if the machine loses power in the last minute of a five-hour run, the recovery script turns the bitstream into a playable file without re-running anything. They are deleted once the output has been read back and verified. If a file ever reads back wrong, both the output and the salvage are kept and the console says so.</p>
+<p>A run that stops with a hard error does not lose everything: what was encoded is flushed and packaged, the app says <strong>PARTIAL: encoded M of N frames</strong>, and the file plays up to that point.</p>
+<hr />
+<h2 id="10-memory-the-pre-flight-dialog-and-the-three-levers">10. Memory: the pre-flight dialog and the three levers</h2>
+<p>Video restoration is memory-bound before it is compute-bound, and 4K on an 8 GB card is where it shows. When you press <strong>Restore &amp; Save</strong> (or start a folder), ChitraMaya estimates the run's working set from the frame size and your settings against the VRAM that will be free once the models are loaded — using what this card measured on its last run of the same shape, kept in <code>vram-ledger.json</code> next to the app, or an edition table before that first run; the dialog says which. If it does not fit you get three choices. <strong>Apply levers and run</strong> sets the panel controls that fit, in plain view, and starts. <strong>Run anyway</strong> keeps your settings. <strong>Cancel</strong>.</p>
+<p>The levers, in the order the app tries them: <strong>Crop Cap</strong> to the value that fits; <strong>Async Encode</strong> off; a smaller <strong>Detection Batch</strong>; a shorter <strong>Max Clip Length</strong>; the Secondary off. The biggest single term in a 4K estimate is the scene buffers — the frames of every region currently being restored, held at native size — and they scale with Max Clip Length and with the size of the regions. A 4K60 title with Crop Cap off needs about 5.5 GB for those alone at Max Clip 180.</p>
+<p>What happens if you run past the warning: the card fills, the driver starts paging to system memory over PCIe, and everything slows — not just the restorer; in one measured case detection time doubled. The console prints <code>VRAM PAGING</code> lines and the run report counts the seconds. On an external GPU enclosure the effect is several times worse, because the link is slower. Heed the dialog.</p>
+<p>Older guidance about an "8 GB VRAM rule" and compile-time clip sizes no longer applies: compiled engines are independent of Max Clip Length, and the dial is a runtime setting from 30 to 720.</p>
+<hr />
+<h2 id="11-reading-the-console">11. Reading the console</h2>
+<p>A few lines worth recognising:</p>
+<p><code>[VRAM] preflight …</code> — the same estimate as the dialog, printed after the models load, with the levers it would pull. <code>[Pipeline] frame N/M  avg X fps  elapsed  ETA</code> every 500 frames — the true average since the start (the progress bar shows the instantaneous rate between flushes). <code>[FrameStore] backend: REDECODE</code> — the normal path on NVIDIA: frames are decoded twice rather than held in memory. <code>[Decoder] MPEG-TS source detected … remuxing</code> — a stream capture being made safe to decode (section 13). <code>[Source] ffprobe auto-detection reports 'png_pipe' … forcing -f mpegts</code> — a disguised file being handled (section 13). <code>[Encoder] Audio sidecar: extracting the source audio once</code> — normal; <code>source has no audio stream</code> means the output will be silent on purpose. <code>[Scalers] … TensorRT … ACTIVE</code> — a compiled custom model in use. <code>DONE WITH WARNINGS</code> — the run finished but something was repaired or refused along the way; the Complete panel and the run report list the reasons. <code>Complete!</code> — a clean run. <code>PARTIAL: encoded M of N frames</code> — the run failed partway and the file plays to that point.</p>
+<p>The stall watchdog monitors long runs and calls out a stalled pipeline instead of letting it sit; on external GPUs it also warns if the PCIe link is running below its trained speed under load. The default threshold is 120 seconds; add <code>"watchdogStallSeconds": 300</code> to <code>ChitraMaya-config.json</code> next to the exe if it is too eager for your hardware.</p>
+<p>The machine stays awake while a run is in progress (the display may still turn off) and is released afterwards.</p>
+<hr />
+<h2 id="12-what-to-expect-from-your-card">12. What to expect from your card</h2>
+<p>All figures are measured runs with the full default quality stack unless noted. Your titles will differ; the ETA line after 500 frames is the number to trust.</p>
+<table>
+<thead>
+<tr>
+<th>Card</th>
+<th>Job</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTX 5060 Ti 8 GB</td>
+<td>2h41m 1080p60 feature, restore</td>
+<td>2h31m (TensorRT)</td>
+</tr>
+<tr>
+<td>RTX 3060 12 GB</td>
+<td>the same feature</td>
+<td>3h11m</td>
+</tr>
+<tr>
+<td>RTX 3060 12 GB</td>
+<td>10-minute 4K60 cut, restore, Max Clip 180</td>
+<td>46 min (13 fps)</td>
+</tr>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>66-minute 1080p30 title, restore + upscale to 2160p, RTX Super-Res</td>
+<td>3h42m</td>
+</tr>
+<tr>
+<td>RTX 3060 Ti 8 GB</td>
+<td>the same, with a compiled SPAN model</td>
+<td>5h04m</td>
+</tr>
+<tr>
+<td>RTX 3060 Laptop 6 GB</td>
+<td>4K60 title with Crop Cap 512</td>
+<td>about 23 fps</td>
+</tr>
+<tr>
+<td>RX 9060 XT 16 GB</td>
+<td>2h41m 1080p60 feature, restore (PyTorch)</td>
+<td>6h51m–7h06m</td>
+</tr>
+<tr>
+<td>RX 9060 XT 16 GB</td>
+<td>2h25m 720p title, restore + upscale to 2160p (SPAN)</td>
+<td>10h00m</td>
+</tr>
+<tr>
+<td>Arc 140V laptop iGPU</td>
+<td>2h41m 1080p feature, restore (PyTorch)</td>
+<td>10h08m</td>
+</tr>
+</tbody>
+</table>
+<p>In words: the NVIDIA edition's TensorRT path is two to three times faster than any PyTorch path; a Radeon 9060 XT in PyTorch runs like an RTX 4060 in PyTorch; an Intel laptop is a start-it-before-bed machine. Whole-frame upscaling is hours per hour of video on every card except NVIDIA's RTX Super-Res path, and even there it dominates the run. The <a href="ScalingGuide.html">Scaling Guide</a> has the full tables.</p>
+<hr />
+<h2 id="13-when-something-goes-wrong">13. When something goes wrong</h2>
+<p><strong>The app says this is the wrong edition.</strong> It is. Download the edition the message names.</p>
+<p><strong>Get Models answers with 403.</strong> Hugging Face's anonymous limit; wait an hour or download in a browser and drop the files into <code>models\</code>.</p>
+<p><strong>The header button is amber after an update.</strong> An engine needs rebuilding: Manage Models → Select all not-compiled → Compile.</p>
+<p><strong>Out of memory in the middle of a run</strong> (<code>CUDA out of memory</code>, usually at the title's biggest close-up). The pre-flight warned, or the title's largest region was wider than the estimate assumed. The run flushes what it has as a PARTIAL file. Re-run with Crop Cap set (or a lower Max Clip Length) — the dialog proposes the value.</p>
+<p><strong>The run is very slow and the console shows VRAM PAGING.</strong> The card is full; see section 10. On an external GPU enclosure, expect this at lower settings than on a desktop.</p>
+<p><strong>The output has no sound, or the sound drifts.</strong> Three known causes. A source that is a stream capture (MPEG-TS, often named <code>.mkv</code>): the app remuxes it before decoding since 1.61 — an output made by an older version from such a source cannot be repaired, re-run it. A source whose timeline is "30 fps plus a dropped frame every 33 s": fixed in 1.80 (the console line <code>gap-fill: … output rate</code> shows the correction); older outputs cannot be repaired, re-run. A source wearing a disguise — a small image glued in front of the video so that casual tools see a picture: since 1.80 the app notices (<code>[Source] … forcing -f mpegts</code>) and keeps the audio. If a source really has no audio stream the console says so and the output is silent on purpose.</p>
+<p><strong>A single black, green or magenta frame in an AMD output.</strong> The hardware-decode path occasionally hands over an unfinished frame; the app repairs most of them from the frame before and ends the run with warnings, but not all. The sure fix is <strong>Hardware Decode = Off</strong> (Restoration panel, under Frame Store), about 9 % slower.</p>
+<p><strong>Everything is twenty times slower than the table on an Intel Arc card.</strong> Resizable BAR is off. Turn it on in the BIOS. On an Intel laptop, <code>could not make an engine with allocator</code> in the self-check means the graphics driver is too old for the bundled stack; update it and reboot.</p>
+<p><strong>The machine reboots or powers off mid-run, with no error in the log.</strong> A log that simply stops, with no error line, is the signature of a power cut, not of the software: a failing power supply under hours of GPU load is the usual cause (check Event Viewer for Kernel-Power 41 without a bugcheck). Software failures leave a trace. A box that runs batches overnight deserves a reputable power supply with headroom.</p>
+<p><strong>A watchdog stack dump on the first AMD run.</strong> The kernel cache being built; wait.</p>
+<p><strong>The output still shows mosaic in places.</strong> Look at <code>frames.residual</code> in the run report: the residual scan lists the frames where the detector still finds mosaic on the finished output, with scores. Some are regions the restorer could not fully clean; some are regions the detector never found in the source — a thin sliver at the frame edge whose neighbour was still mosaic is the classic case. Test Frame on one of those frames shows which. A second pass over the flagged ranges is on the roadmap; today, Save Segment over the range with a lower Detection Score is the manual version.</p>
+<p><strong>Where to report.</strong> The issue tracker at <a href="https://gitlab.com/seatv/chitramaya/-/issues">https://gitlab.com/seatv/chitramaya/-/issues</a>. Attach <code>ChitraMaya-console.log</code> and the <code>.run.json</code> beside the output, and state your GPU, driver version and (AMD/Intel) Resizable BAR state; <code>ChitraMaya-cli.exe -self-check</code> output helps. <strong>No explicit content in issues</strong> — frame numbers and the report are enough.</p>
+<hr />
+<h2 id="14-amd-and-intel-in-brief">14. AMD and Intel in brief</h2>
+<p>The product is the same on every edition — editor, Test Frame, Process Folder, Add Mosaic, SBS View, watchdog, keep-awake, crash hardening. What differs:</p>
+<p>AMD: no compile step; the first run in a new folder is slow once (kernel cache); detection runs in FP32 regardless of the toggle (FP16 detection was measured to stop finding mosaic after the first frames); restoration FP16 is fine and about 15 % faster; Temporal Stability runs in fp32 and checks each window; decode is D3D11VA with CPU as the fallback and encode is AMF (HEVC, H.264, AV1 on RDNA 3+); the Secondary is Real-ESRGAN by default; RTX Super-Res and the PCIe monitor are NVIDIA-only. Supported cards: RDNA 3 and 4.</p>
+<p>Intel: no compile step; Quick Sync decode and encode (AV1, HEVC, H.264) with D3D11VA and CPU fallbacks; Resizable BAR effectively required on discrete cards; 8 GB Arc cards handle 4K flat video, 5K/VR is not recommended on 8 GB; on 16 GB laptops the host frame store may not fit 4K and the RAM guard slows the run rather than letting the machine run out. The <code>CM_HW_DECODE</code> environment variable (<code>auto</code>, <code>qsv</code>, <code>d3d11va</code>, <code>d3d12va</code>, <code>off</code>) overrides the Hardware Decode panel setting for A/B tests from a command window.</p>
+<hr />
+<h2 id="15-languages-settings-and-files">15. Languages, settings and files</h2>
+<p>The interface is available in English, Simplified Chinese, Traditional Chinese and Thai (the ⚙️ menu). Settings live in <code>ChitraMaya-config.json</code> next to the exe — Save Settings / Load Settings / Reset Defaults act on it, and a few advanced keys that have no panel control go in there by hand (<code>watchdogStallSeconds</code>, <code>restoreChunkFrames</code>). Saved configurations are in <code>presets\</code>. Two copies of the app can run at once: the second picks the next port and writes its own log.</p>
+<hr />
+<h2 id="16-licence-and-credits">16. Licence and credits</h2>
+<p>ChitraMaya is free software under the GNU AGPL-3.0: you may use, study, share and modify it, and anything built from it must be shared under the same terms. The models it uses carry their own licences — the lada detection and restoration models, the Real-ESRGAN weights (BSD-3-Clause), the vs_temporalfix weights (Apache-2.0) bundled with the app, and any community model you add. The README's acknowledgements name the people whose work this builds on.</p>
+<p class="stamp">Generated from docs/UserGuide.md on 2026-10-14 for ChitraMaya 1.80.00. The Markdown is the source; edit that.</p>
+</main>
+</body>
+</html>

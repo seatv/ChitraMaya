@@ -153,6 +153,17 @@ if ($verMatch) {
   Write-Host ("Stamped VERSION.txt = {0}" -f $verMatch.Matches[0].Groups[1].Value) -ForegroundColor Green
 }
 
+# -- User Guide (CM-248): generated HTML shipped next to the exe for the Help button.
+foreach ($guide in @("UserGuide.html", "ScalingGuide.html")) {
+  $guideSrc = Join-Path (Resolve-Path ".").Path (Join-Path "docs" $guide)
+  if (Test-Path $guideSrc) {
+    Copy-Item -Force $guideSrc (Join-Path $distDir $guide)
+    Write-Host ("Copied {0}" -f $guide) -ForegroundColor Green
+  } else {
+    Write-Warning ("docs\{0} not found - the Help button will have nothing to open. Run python -m tools.build_userguide before packaging." -f $guide)
+  }
+}
+
 # ── Models drop folder (NO engines dir -- TensorRT does not exist here) ──
 New-Item -ItemType Directory -Force -Path (Join-Path $distDir "models") | Out-Null
 ("Place source model files here:" + [Environment]::NewLine +

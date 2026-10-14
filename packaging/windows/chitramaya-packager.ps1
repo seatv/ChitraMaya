@@ -158,6 +158,19 @@ if (Test-Path $compileSrc) {
 } else {
   Write-Warning "Compile-All-Engines.ps1 not found at repo root - fresh installs will have NO way to compile engines. Fix before releasing."
 }
+
+# -- User Guide (CM-248): docs/UserGuide.html + docs/ScalingGuide.html are
+# generated from the Markdown by tools/build_userguide.py and committed; they
+# ship next to the exe, where the app's Help button (/userguide) finds them.
+foreach ($guide in @("UserGuide.html", "ScalingGuide.html")) {
+  $guideSrc = Join-Path (Resolve-Path ".").Path (Join-Path "docs" $guide)
+  if (Test-Path $guideSrc) {
+    Copy-Item -Force $guideSrc (Join-Path $distDir $guide)
+    Write-Host ("Copied {0}" -f $guide) -ForegroundColor Green
+  } else {
+    Write-Warning ("docs\{0} not found - the Help button will have nothing to open. Run python -m tools.build_userguide before packaging." -f $guide)
+  }
+}
 ("Place source model files here:" + [Environment]::NewLine +
  "  *.pt   - YOLO mosaic detection" + [Environment]::NewLine +
  "  *.pth  - BasicVSR++ mosaic restoration" + [Environment]::NewLine +

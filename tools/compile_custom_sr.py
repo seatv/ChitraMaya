@@ -1,9 +1,10 @@
 """T25 (CM-242): compile a custom super-resolution model to TensorRT engine(s).
 
-    python -m tools.compile_custom_sr 4xNomos8k_span_otf_strong.pth
+    ChitraMaya-cli.exe -compile-sr 4xNomos8k_span_otf_strong.pth --secondary --bench   (installed build)
+    python -m tools.compile_custom_sr 4xNomos8k_span_otf_strong.pth                     (from source)
     python -m tools.compile_custom_sr 4xNomos8k_span_otf_strong.pth --secondary
     python -m tools.compile_custom_sr models/upscalers/foo.pth --tile 704 --tile 256 --bench
-    python -m tools.compile_custom_sr foo.pth --bench            # bench only, no compile
+    python -m tools.compile_custom_sr foo.pth --bench --no-compile   # bench existing engines only
 
 The model is a file name inside models\\upscalers (or a path). Default tile
 704 = the whole-frame tiler's 640-px tile + 32-px halo each side; --secondary
@@ -44,8 +45,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-compile", action="store_true", help="skip compiling (bench existing engines)")
     ap.add_argument("--frame", default="1920x1080", help="frame size for the --bench projection, WxH")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--base-dir", default=None, help="app base dir holding models\\upscalers (default: cwd)")
+    ap.add_argument("--base-dir", default=None,
+                    help="app base dir holding models\\upscalers (default: the folder next to the exe in an "
+                         "installed build, else the current directory)")
     a = ap.parse_args(argv)
+    # CM-247: from ChitraMaya-cli.exe the user can be in any folder; the models
+    # live next to the exe, so that is where a bare file name is looked up.
+    if a.base_dir is None and getattr(sys, "frozen", False):
+        a.base_dir = str(Path(sys.executable).resolve().parent)
 
     import torch
     if not torch.cuda.is_available():
